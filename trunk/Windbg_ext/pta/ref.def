@@ -1,0 +1,47 @@
+;--------------------------------------------------------------------
+;
+; Module:
+;    pta.def
+;--------------------------------------------------------------------
+
+EXPORTS
+
+;--------------------------------------------------------------------
+; These are the extensions exported by dll
+;--------------------------------------------------------------------
+    help
+    block
+    heap
+    big
+    tref
+    ref
+    obj
+    shrobj
+    shrobj_level
+    segment
+    pattern
+    decode
+    set_alignment
+    max_ref_level
+    info_local
+    include_free
+    ignore_free
+    include_unknown
+    ignore_unknown
+    block_size
+    set
+    unset
+
+;--------------------------------------------------------------------
+;
+; these are the extension service functions provided for the debugger
+;
+;--------------------------------------------------------------------
+
+;    DebugExtensionNotify
+    DebugExtensionInitialize
+    DebugExtensionUninitialize
+
+;    CheckVersion
+;    WinDbgExtensionDllInit
+;    ExtensionApiVersion
