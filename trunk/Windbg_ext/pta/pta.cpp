@@ -137,7 +137,7 @@ DECLARE_API ( help )
     		"   shrobj [tid0] [tid1] [...] - Find objects that currently referenced from multiple threads\n"
     		"\n"
     		"   block <addr>       - Heap block informatoin for given address\n"
-            "   heap  <addr>       - Walk heap for possible memory corruption, and/or memory layout information\n"
+            "   heap  [addr] [/v] [/leak]  - Walk heap for possible memory corruption, and/or memory layout information\n"
     		"   big   <num>        - Biggest heap memory blocks and their owners\n"
     		"\n"
 			"   segment [addr]     - Print process' virtual address space\n"
@@ -206,18 +206,53 @@ heap(PDEBUG_CLIENT4 Client, PCSTR args)
 		return S_OK;
 	}
 
-    address_t addr;
-    if (!args || strlen(args)==0)
-    	addr = 0;
-    else
-    	addr = GetExpression(args);
-
-    if (addr)
+    address_t addr = 0;
+    CA_BOOL verbose = CA_FALSE;
+    CA_BOOL leak_check = CA_FALSE;
+    if (args)
     {
-    	if (!heap_walk(addr))
+    	// make a local copy
+    	char* buf = strdup(args);
+    	char* buf_orig = buf;
+        while (*buf)
+        {
+    		while (*buf && isspace(*buf))
+    			buf++;
+
+        	if (buf[0] == '/' && buf[1] == 'v')
+        	{
+        		verbose = CA_TRUE;
+        		buf += 2;
+        	}
+        	else if (strcmp(buf, "/leak") == 0)
+        	{
+        		leak_check = CA_TRUE;
+        		break;
+        	}
+        	else
+        	{
+        		// replace rear space with '\0'
+        		char* cursor = buf;
+        		while (*cursor && !isspace(*cursor))
+        			cursor++;
+        		if (*cursor)
+        			*cursor = '\0';
+        		addr = GetExpression(buf);
+        		break;
+        	}
+        }
+    	// clean up
+    	free(buf_orig);
+    }
+
+    if (leak_check)
+    	display_heap_leak_candidates();
+    else if (addr)
+    {
+    	if (!heap_walk(addr, verbose))
     		dprintf("[Error] Failed to show the related arena "PRINT_FORMAT_POINTER"\n", addr);
     }
-    else if (!heap_walk(0))
+    else if (!heap_walk(0, verbose))
     	dprintf("[Error] Failed to walk heap\n");
 
     leave_command();
@@ -848,6 +883,126 @@ NormalExit:
 
 	leave_command();
 	return S_OK;
+}
+
+// special command to print out mstr big memory cache
+typedef struct _CacheBlock
+{
+	struct _CacheBlock*  next;
+	size_t            blockSz;
+} CacheBlock;
+#define MAX_NUM_BANDS 16
+
+HRESULT CALLBACK
+mcache(PDEBUG_CLIENT4 Client, PCSTR args)
+{
+	if (!enter_command(Client))
+		return E_FAIL;
+
+	// read/print global variabls
+	ULONG64 addr;
+
+	unsigned int g_cache_max_free_pages;
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_cache_max_free_pages", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_cache_max_free_pages, sizeof(g_cache_max_free_pages)))
+	{
+		dprintf("Failed to read shsmp64!g_cache_max_free_pages\n");
+		goto McacheExit;
+	}
+	dprintf("Max 64KB small/medium pages to cache: %d\n", g_cache_max_free_pages);
+
+	unsigned int g_cache_free_pages_total;
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_cache_free_pages_total", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_cache_free_pages_total, sizeof(g_cache_free_pages_total)))
+	{
+		dprintf("Failed to read shsmp64!g_cache_free_pages_total\n");
+		goto McacheExit;
+	}
+	dprintf("Currently cached %d pages\n\n", g_cache_free_pages_total);
+
+	size_t g_max_cache_block_size;
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_max_cache_block_size", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_max_cache_block_size, sizeof(g_max_cache_block_size)))
+	{
+		dprintf("Failed to read shsmp64!g_max_cache_block_size\n");
+		goto McacheExit;
+	}
+	dprintf("Max size to cache: %ldKB\n", g_max_cache_block_size/1024);
+
+	unsigned int g_max_cache_blocks_per_band;
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_max_cache_blocks_per_band", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_max_cache_blocks_per_band, sizeof(g_max_cache_blocks_per_band)))
+	{
+		dprintf("Failed to read shsmp64!g_max_cache_blocks_per_band\n");
+		goto McacheExit;
+	}
+	dprintf("Max number of cached blocks per band: %d\n", g_max_cache_blocks_per_band);
+
+	size_t g_max_cache_size;
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_max_cache_size", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_max_cache_size, sizeof(g_max_cache_size)))
+	{
+		dprintf("Failed to read shsmp64!g_max_cache_size\n");
+		goto McacheExit;
+	}
+	dprintf("Max total size to cache: %ldMB\n\n", g_max_cache_size/(1024*1024));
+
+	CacheBlock* g_cache_lists_heads[MAX_NUM_BANDS];
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_cache_lists_heads", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_cache_lists_heads, sizeof(g_cache_lists_heads)))
+	{
+		dprintf("Failed to read shsmp64!g_cache_lists_heads\n");
+		goto McacheExit;
+	}
+	unsigned int g_cache_lists_sizes[MAX_NUM_BANDS];
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_cache_lists_sizes", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_cache_lists_sizes, sizeof(g_cache_lists_sizes)))
+	{
+		dprintf("Failed to read shsmp64!g_cache_lists_sizes\n");
+		goto McacheExit;
+	}
+	size_t g_total_cache_size;
+	if (gDebugSymbols3->GetOffsetByName("shsmp64!g_total_cache_size", &addr) != S_OK
+		|| !inferior_memory_read(addr, &g_total_cache_size, sizeof(g_total_cache_size)))
+	{
+		dprintf("Failed to read shsmp64!g_total_cache_size\n");
+		goto McacheExit;
+	}
+
+	dprintf("Size(KB)\t#Blocks\tTotal_Size(KB)\n");
+	int i;
+	size_t sz, totalSz=0;
+	for (i = 0, sz = 64*1024; i < MAX_NUM_BANDS; i++)
+	{
+		unsigned int listsz = 0;
+		CacheBlock* pblock = g_cache_lists_heads[i];
+		while (pblock)
+		{
+			listsz++;
+			CacheBlock cblock;
+			if (!inferior_memory_read((address_t)pblock, &cblock, sizeof(cblock)))
+			{
+				dprintf("Failed to read CacheBlock at %p\n", pblock);
+				break;
+			}
+			pblock = cblock.next;
+		}
+		if (listsz != g_cache_lists_sizes[i])
+		{
+			dprintf("Band %d list size doesn't match! %d <=> %d\n",
+					i, listsz, g_cache_lists_sizes[i]);
+		}
+		else
+			dprintf("%ld\t\t%d\t\t%ld\n", sz/1024, listsz, sz*listsz/1024);
+		totalSz += (sz - 0x80) * listsz;
+		sz = sz << 1;
+	}
+	dprintf("------------------------------------------\n");
+	dprintf("\t\t\t\t%ld MB\n", totalSz/(1024*1024));
+
+McacheExit:
+	leave_command();
+    return S_OK;
 }
 
 static void print_sym_group(PDEBUG_SYMBOL_GROUP2 symbolGroup2)

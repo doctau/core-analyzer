@@ -28,7 +28,7 @@ static void  sys_free(void* p, size_t sz);
 // Dismantle all segments previously built
 // but keep the buffer for reuse
 /////////////////////////////////////////////////////////
-CA_BOOL release_all_segments()
+CA_BOOL release_all_segments(void)
 {
 	unsigned int i;
 	struct ca_segment* segment;
@@ -183,7 +183,7 @@ add_one_segment(address_t vaddr, size_t size,
 			}
 		}
 		else
-			CA_PRINT("Error: add_one_segment("PRINT_FORMAT_POINTER", "PRINT_FORMAT_POINTER") segment already exists\n",
+			CA_PRINT("Error: add_one_segment("PRINT_FORMAT_POINTER", "PRINT_FORMAT_POINTER") segment is added in wrong order\n",
 					vaddr, vaddr + size);
 	}
 
@@ -226,7 +226,7 @@ struct ca_segment* get_segment(address_t addr, size_t len)
 	return NULL;
 }
 
-CA_BOOL alloc_bit_vec()
+CA_BOOL alloc_bit_vec(void)
 {
 	unsigned int i;
 	char* buffer;
@@ -388,7 +388,7 @@ CA_BOOL set_addressable_bit_vec(struct ca_segment* segment)
 
 		while (next + ptr_sz <= end)
 		{
-			address_t val;
+			address_t val = 0;
 			if (ptr_sz == 8)
 			{
 #ifdef sun
@@ -464,7 +464,7 @@ void unset_value (address_t addr)
 	}
 }
 
-void print_set_values ()
+void print_set_values (void)
 {
 	struct temp_value* pval = g_set_values;
 	if (!pval)
@@ -588,19 +588,6 @@ void* core_to_mmap_addr(address_t vaddr)
 	}
 
 	return NULL;
-}
-
-void print_size(size_t sz)
-{
-	const size_t GB = 1024*1024*1024;
-	const size_t MB = 1024*1024;
-	const size_t KB = 1024;
-	if (sz > GB)
-		CA_PRINT("(%.1fGB)", (double)sz/(double)GB);
-	else if (sz > MB)
-		CA_PRINT("("PRINT_FORMAT_SIZE"MB)", sz/MB);
-	else if (sz > KB)
-		CA_PRINT("("PRINT_FORMAT_SIZE"KB)", sz/KB);
 }
 
 static void* sys_alloc(size_t sz)

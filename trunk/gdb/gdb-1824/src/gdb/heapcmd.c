@@ -10,6 +10,13 @@
 #include "search.h"
 #include "stl_container.h"
 
+static unsigned int g_num_adjacent_blocks = 10;
+
+unsigned int get_num_adjacent_blocks_to_display (void)
+{
+	return g_num_adjacent_blocks;
+}
+
 /***************************************************************************
 * gdb commands
 ***************************************************************************/
@@ -45,18 +52,56 @@ block_command (char *arg, int from_tty)
 }
 
 static void
-heap_command (char *arg, int from_tty)
+heap_command (char *args, int from_tty)
 {
 	address_t addr = 0;
+	CA_BOOL verbose = CA_FALSE;
+	CA_BOOL check_leak = CA_FALSE;
+
+	if (args && *args != '\0')
+	{
+		char *exp = args;
+		char *end = args + strlen(args);
+		while (exp < end)
+		{
+			char* rest;
+			/* Find the 1st optional argument (address).  */
+			while (exp < end && isspace(*exp))
+				exp++;
+			if (exp < end)
+			{
+				rest = exp;
+				while (rest < end && *rest && !isspace(*rest))
+					rest++;
+				*rest = '\0';
+				// argument is either an address or /v or /leak
+				if (strcmp(exp, "/leak") == 0)
+				{
+					check_leak = CA_TRUE;
+					break;
+				}
+				else if (exp[0] == '/' && exp[1] == 'v')
+					verbose = CA_TRUE;
+				else if (addr == 0)
+					addr = parse_and_eval_address (exp);
+				else if (isdigit(*exp))
+				{
+					int n = atoi(exp);
+					if (n > 0)
+						g_num_adjacent_blocks = n;
+				}
+				exp = rest + 1;
+			}
+		}
+	}
 
 	/* We depend on typed segments */
 	if (!update_memory_segments_and_heaps())
 		return;
 
-	if (arg)
-		addr = parse_and_eval_address (arg);
-
-	if (!heap_walk(addr))
+	if (check_leak)
+		display_heap_leak_candidates();
+	else if (!heap_walk(addr, verbose))
 		printf_filtered(_("[Error] Failed to walk heap\n"));
 }
 
@@ -544,7 +589,7 @@ _initialize_heapcmd (void)
 	add_cmd("shrobj", class_info, shrobj_command, _("Find objects that currently referenced from multiple threads\nshrobj [tid0] [tid1] [...]"), &cmdlist);
 
 	add_cmd("block", class_info, block_command, _("Heap block info\nblock <addr>"), &cmdlist);
-	add_cmd("heap", class_info, heap_command, _("Heap walk (all heaps or specified)\nheap <addr>"), &cmdlist);
+	add_cmd("heap", class_info, heap_command, _("Heap walk (all heaps or specified)\nheap [/v] [/leak] [addr] [num_blocks]"), &cmdlist);
 	add_cmd("big", class_info, big_command, _("Display biggest heap memory blocks and their owners\nbig <num_blocks>"), &cmdlist);
 
 	add_cmd("pattern", class_info, pattern_command, _("Reveal memory pattern\npattern <start> <end>"), &cmdlist);

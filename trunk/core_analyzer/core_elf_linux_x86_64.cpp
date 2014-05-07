@@ -95,7 +95,7 @@ bool PrintCoreInfo(MmapFile& irCore)
 							printf("exec_fd=%ld", pauxv->a_un.a_val);
 							break;
 						case AT_PHDR:
-							printf("&phdr[0]=0x%lx", pauxv->a_un.a_ptr);
+							printf("&phdr[0]=0x%lx", pauxv->a_un.a_val);
 							break;
 						case AT_PHENT:
 							printf("sizeof(phdr[0])=%ld", pauxv->a_un.a_val);
@@ -107,13 +107,13 @@ bool PrintCoreInfo(MmapFile& irCore)
 							printf("pagesize=%ld", pauxv->a_un.a_val);
 							break;
 						case AT_BASE:
-							printf("ld.so_base_addr=0x%lx", pauxv->a_un.a_ptr);
+							printf("ld.so_base_addr=0x%lx", pauxv->a_un.a_val);
 							break;
 						case AT_FLAGS:
 							printf("proc_flags=0x%lx", pauxv->a_un.a_val);
 							break;
 						case AT_ENTRY:
-							printf("entry_point=0x%lx", pauxv->a_un.a_ptr);
+							printf("entry_point=0x%lx", pauxv->a_un.a_val);
 							break;
 						case AT_UID:
 							printf("real_uid=%ld", pauxv->a_un.a_val);
@@ -131,7 +131,7 @@ bool PrintCoreInfo(MmapFile& irCore)
 							printf("frequency_of_times()=%ld", pauxv->a_un.a_val);
 							break;
 						case AT_PLATFORM:
-							printf("plat_name=0x%lx", pauxv->a_un.a_ptr);
+							printf("plat_name=0x%lx", pauxv->a_un.a_val);
 							break;
 						case AT_HWCAP:
 							printf("hardware_capability=%ld", pauxv->a_un.a_val);

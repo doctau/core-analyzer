@@ -1302,7 +1302,7 @@ void print_heap_ref(const struct object_reference* ref)
 		CA_PRINT(" FREE");
 }
 
-address_t get_var_addr_by_name(const char* var_name)
+address_t get_var_addr_by_name(const char* var_name, CA_BOOL ask)
 {
 	struct symbol *sym = lookup_symbol (var_name, 0, VAR_DOMAIN, 0, NULL);
 	if (sym)

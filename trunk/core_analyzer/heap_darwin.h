@@ -137,7 +137,7 @@ typedef uint32_t tiny_block_t[4];
 /*
  * Locate the heap base for a pointer known to be within a tiny region.
  */
-#define TINY_REGION_FOR_PTR(_p)		((void *)((uintptr_t)(_p) & ~((1 << TINY_BLOCKS_ALIGN) - 1)))
+#define TINY_REGION_FOR_PTR(_p)		((tiny_region_t)((uintptr_t)(_p) & ~((1 << TINY_BLOCKS_ALIGN) - 1)))
 
 /*
  * Convert between byte and msize units.

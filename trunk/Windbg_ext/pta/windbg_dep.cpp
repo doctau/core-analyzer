@@ -672,15 +672,24 @@ int get_frame_number(const struct ca_segment* segment, address_t addr, int* offs
 	return frame;
 }
 
-address_t get_var_addr_by_name(const char* var_name)
+address_t get_var_addr_by_name(const char* var_name, CA_BOOL ask)
 {
-	char* name = new char[strlen(var_name)+3];
-	sprintf(name, "@$%s", var_name);
+	address_t rs = 0;
 	DEBUG_VALUE val;
 	// get the address
-	if (gDebugControl->Evaluate(name, DEBUG_VALUE_INT64, &val, NULL) == E_FAIL)
-		return 0;
-	return val.I64;
+	if (gDebugControl->Evaluate(var_name, DEBUG_VALUE_INT64, &val, NULL) == S_OK)
+		rs = val.I64;
+	else
+	{
+		size_t len = strlen(var_name)+3;
+		char* namebuf = new char[len];
+		snprintf(namebuf, len, "@$%s", var_name);
+		if (gDebugControl->Evaluate(namebuf, DEBUG_VALUE_INT64, &val, NULL) == S_OK)
+			rs = val.I64;
+		// clenaup
+		delete[] namebuf;
+	}
+	return rs;
 }
 
 void clear_addr_type_map()

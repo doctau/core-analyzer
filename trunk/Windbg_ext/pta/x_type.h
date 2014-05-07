@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <windef.h>
 #include <stdio.h>
+#include <time.h>
 
 //
 // Define KDEXT_64BIT to make all wdbgexts APIs recognize 64 bit addresses

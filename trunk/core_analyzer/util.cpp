@@ -42,14 +42,19 @@ const int min_chars = MIN_CHARS_OF_STRING;
 ////////////////////////////////////////////////////////////////////
 // Helper functions
 ////////////////////////////////////////////////////////////////////
-address_t AskParam(const char* message, const char* env_name)
+address_t AskParam(const char* message, const char* env_name, CA_BOOL ask)
 {
 	if (env_name)
 	{
 		const char* val_str = getenv(env_name);
 		if (val_str)
+		{
+			printf("%s\n", val_str);
 			return String2ULong(val_str);
+		}
 	}
+	else if (!ask)
+		return 0;
 
 	printf("%s ? ", message);
 	char linebuf[LINE_BUFFER_SZ];
@@ -444,10 +449,18 @@ CA_BOOL inferior_memory_read (address_t addr, void* buffer, size_t sz)
 	return CA_FALSE;
 }
 
-address_t get_var_addr_by_name(const char* varname)
+address_t get_var_addr_by_name(const char* varname, CA_BOOL ask)
 {
-	printf("Please input the address of variable %s\n", varname);
-	printf("You can find it by command \"print &%s\"(gdb) or \"? $%s\"(windbg)\n", varname, varname);
+	if (ask)
+	{
+		printf("Please input the address of variable %s\n", varname);
+#ifdef __GNUC__
+		printf("You can find it by command \"(gdb)print &%s\"\n", varname, varname);
+#else
+		printf("You can find it by command \"(windbg)? $%s\"\n", varname, varname);
+#endif
+	}
+
 	char* env_name = strdup(varname);
 	char* cursor = env_name;
 	while (*cursor)
@@ -456,7 +469,7 @@ address_t get_var_addr_by_name(const char* varname)
 			*cursor = toupper(*cursor);
 		cursor++;
 	}
-	address_t rs = AskParam(varname, env_name);
+	address_t rs = AskParam(varname, env_name, ask);
 	free(env_name);
 	return rs;
 }
