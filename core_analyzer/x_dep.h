@@ -33,7 +33,7 @@ extern void print_heap_ref(const struct object_reference* ref);
 extern CA_BOOL known_global_sym(const struct object_reference* ref, address_t* sym_addr, size_t* sym_sz);
 extern CA_BOOL known_stack_sym(const struct object_reference* ref, address_t* sym_addr, size_t* sym_sz);
 
-extern address_t get_var_addr_by_name(const char*);
+extern address_t get_var_addr_by_name(const char*, CA_BOOL);
 
 extern void print_func_locals (void);
 extern void print_type_layout (char*);

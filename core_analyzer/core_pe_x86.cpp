@@ -651,7 +651,7 @@ static bool BuildSegments(MmapFile& irCore)
 	{
 		a_seg = (*seg_itr).second;
 		// bitwise copy
-		struct ca_segment* newseg = add_one_segment (0, 0, true, true, true);
+		struct ca_segment* newseg = add_one_segment (a_seg->m_vaddr, a_seg->m_vsize, true, true, true);
 		memcpy(newseg, a_seg, sizeof(struct ca_segment));
 	}
 

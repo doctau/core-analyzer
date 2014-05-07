@@ -37,7 +37,7 @@
 #include "stl_container.h"
 
 #define CA_VERSION_MAJOR 2
-#define CA_VERSION_MINOR 14
+#define CA_VERSION_MINOR 15
 
 // forward declaration
 static int AskChoice(const char** options);
@@ -52,7 +52,7 @@ CA_BOOL g_debug_core = CA_TRUE;
 static void PrintBanner()
 {
 	printf("******************************************************************\n");
-	printf("** Core Analyzer version %d.%d                                    **\n", CA_VERSION_MAJOR, CA_VERSION_MINOR);
+	printf("** Core Analyzer version %d.%d                                   **\n", CA_VERSION_MAJOR, CA_VERSION_MINOR);
 	printf("** Please report bugs to: Michael Yan (yanqi27@gmail.com)       **\n");
 	printf("******************************************************************\n");
 }
@@ -118,7 +118,7 @@ int main(int argc, char** argv)
 	if (gbBatchMode)
 	{
 		PrintCoreInfo(lCoreMmap);
-		heap_walk(0);
+		heap_walk(0, CA_TRUE);
 		return 0;
 	}
 
@@ -134,8 +134,9 @@ int main(int argc, char** argv)
 		/* 5 */ "Query Heap Memory Block",
 		/* 6 */ "Page Walk (check the integrity of surrounding memory blocks)",
 		/* 7 */ "Heap Walk (check the whole heap for corruption and memory usage stats)",
-		/* 8 */ "Biggest heap memory blocks and their owners",
-		/* 9 */ "Quit",
+		/* 8 */ "Biggest Heap Memory Blocks",
+		/* 9 */ "Heap Memory Leak Candidates",
+		/* 10 */ "Quit",
 		/*   */ NULL
 	};
 
@@ -158,11 +159,11 @@ int main(int argc, char** argv)
 		// Horizonal search of all direct first-level references for given object
 		else if (opt == 1)
 		{
-			lpObjectVirtAddr = AskParam("Object start address");
-			lObjectSize = AskParam("Object size(RETURN to search the address)");
+			lpObjectVirtAddr = AskParam("Object start address", NULL, CA_TRUE);
+			lObjectSize = AskParam("Object size(RETURN to search the address)", NULL, CA_TRUE);
 			if (lObjectSize == 0)
 				lObjectSize = 1;
-			address_t val =  AskParam("Maximum indirection levels(1-32, RETURN for 1)");
+			address_t val =  AskParam("Maximum indirection levels(1-32, RETURN for 1)", NULL, CA_TRUE);
 			if (val == 0)
 				val = 1;
 			unsigned int nLevel = (unsigned int)val;
@@ -186,7 +187,7 @@ int main(int argc, char** argv)
 		// Vertical search, find at least one reference chain that leads a known-type variable to the given object
 		else if (opt == 2)
 		{
-			lpObjectVirtAddr = AskParam("Address value");
+			lpObjectVirtAddr = AskParam("Address value", NULL, CA_TRUE);
 			if (!find_object_type(lpObjectVirtAddr) )
 			{
 				printf("No object associated with 0x%lx is found\n", lpObjectVirtAddr);
@@ -202,8 +203,8 @@ int main(int argc, char** argv)
 		// Analyze the memory content within a given address range
 		else if (opt == 4)
 		{
-			start = AskParam("Start address");
-			end = AskParam("End address");
+			start = AskParam("Start address", NULL, CA_TRUE);
+			end = AskParam("End address", NULL, CA_TRUE);
 			if (start >= end)
 				printf("Invalid input addresses!\n");
 			print_memory_pattern(start, end);
@@ -211,7 +212,7 @@ int main(int argc, char** argv)
 		// Heap memory block
 		else if (opt == 5)
 		{
-			address_t lpBlockAddr = AskParam("Block address");
+			address_t lpBlockAddr = AskParam("Block address", NULL, CA_TRUE);
 			if (!PrintBlockInfo(lpBlockAddr))
 			{
 				//break;
@@ -220,8 +221,8 @@ int main(int argc, char** argv)
 		// Page work
 		else if (opt == 6)
 		{
-			address_t lpPoolAddr = AskParam("Address");
-			if (!heap_walk(lpPoolAddr))
+			address_t lpPoolAddr = AskParam("Address", NULL, CA_TRUE);
+			if (!heap_walk(lpPoolAddr, CA_FALSE))
 			{
 				//break;
 			}
@@ -229,7 +230,7 @@ int main(int argc, char** argv)
 		// Heap walk
 		else if (opt == 7)
 		{
-			if (!heap_walk(0))
+			if (!heap_walk(0, CA_FALSE))
 			{
 				//break;
 			}
@@ -237,13 +238,20 @@ int main(int argc, char** argv)
 		// Top-sized memory blocks
 		else if (opt == 8)
 		{
-			unsigned int num = AskParam("Number of in-use top-sized heap memory blocks");
+			unsigned int num = AskParam("Number of in-use top-sized heap memory blocks", NULL, CA_TRUE);
 			if (!biggest_blocks(num))
 			{
 				//break;
 			}
 		}
 		else if (opt == 9)
+		{
+			if (!display_heap_leak_candidates())
+			{
+				//break;
+			}
+		}
+		else if (opt == 10)
 			break;
 	}
 

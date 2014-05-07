@@ -53,8 +53,6 @@ extern CA_BOOL read_memory_wrapper (struct ca_segment*, address_t, void*, size_t
 
 extern void* core_to_mmap_addr(address_t vaddr);
 
-extern void print_size(size_t sz);
-
 extern void set_value (address_t addr, address_t value);
 
 extern void unset_value (address_t addr);

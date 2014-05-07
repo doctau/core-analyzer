@@ -11,6 +11,10 @@
 #include <pthread.h>
 #include "heap.h"
 
+#ifndef size_t
+typedef long unsigned int size_t;
+#endif
+
 /************************************************************************
 **  Data types used by Ptmalloc
 ************************************************************************/
@@ -44,9 +48,13 @@ typedef struct malloc_chunk* mchunkptr;
 #define fastbin_index_GLIBC_2_3(sz) ((((unsigned int)(sz)) >> 3) - 2)
 #define NFASTBINS_GLIBC_2_3  (fastbin_index_GLIBC_2_3(request2size(MAX_FAST_SIZE_GLIBC_2_3))+1)
 
-#define MAX_FAST_SIZE_GLIBC_2_5     (80 * SIZE_SZ / 4)
-#define fastbin_index_GLIBC_2_5(sz) ((((unsigned int)(sz)) >> (SIZE_SZ == 8 ? 4 : 3)) - 2)
-#define NFASTBINS_GLIBC_2_5  (fastbin_index_GLIBC_2_5(request2size(MAX_FAST_SIZE_GLIBC_2_5))+1)
+#define MAX_FAST_SIZE_GLIBC_2_5     MAX_FAST_SIZE_GLIBC_2_3
+#define fastbin_index_GLIBC_2_5(sz) fastbin_index_GLIBC_2_3(sz)
+#define NFASTBINS_GLIBC_2_5         NFASTBINS_GLIBC_2_3
+
+#define MAX_FAST_SIZE_GLIBC_2_12     (80 * SIZE_SZ / 4)
+#define fastbin_index_GLIBC_2_12(sz) ((((unsigned int)(sz)) >> (SIZE_SZ == 8 ? 4 : 3)) - 2)
+#define NFASTBINS_GLIBC_2_12  (fastbin_index_GLIBC_2_12(request2size(MAX_FAST_SIZE_GLIBC_2_12))+1)
 
 #define NONCONTIGUOUS_BIT (2U)
 #define contiguous(M)     (((M)->flags &  NONCONTIGUOUS_BIT) == 0)
@@ -135,7 +143,7 @@ struct heap_info_GLIBC_2_3 {
 */
 
 /************************************************************************
-**  GNU C Library version 2.3.4
+**  GNU C Library version 2.4
 ************************************************************************/
 struct malloc_state_GLIBC_2_4 {
   int mutex; //mutex_t mutex;
@@ -212,8 +220,6 @@ struct malloc_par_GLIBC_2_5 {
   unsigned long    trim_threshold;
   INTERNAL_SIZE_T  top_pad;
   INTERNAL_SIZE_T  mmap_threshold;
-  INTERNAL_SIZE_T  arena_test;
-  INTERNAL_SIZE_T  arena_max;
 
   /* Memory map support */
   int              n_mmaps;
@@ -253,6 +259,68 @@ struct heap_info_GLIBC_2_5 {
 #define PT_MAIN_ARENA  0x20
 #define PT_DYNAMIC_ARENA 0x30
 
+/************************************************************************
+**  GNU C Library version 2.12.2
+************************************************************************/
+struct malloc_state_GLIBC_2_12 {
+  int mutex; //mutex_t mutex;
+
+  /* Flags (formerly in max_fast).  */
+  int flags;
+
+  /* Fastbins */
+  mfastbinptr      fastbins[NFASTBINS_GLIBC_2_12];
+
+  /* Base of the topmost chunk -- not otherwise kept in a bin */
+  mchunkptr        top;
+
+  /* The remainder from the most recent split of a small request */
+  mchunkptr        last_remainder;
+
+  /* Normal bins packed as described above */
+  mchunkptr        bins[NBINS * 2 - 2];
+
+  /* Bitmap of bins */
+  unsigned int     binmap[BINMAPSIZE];
+
+  /* Linked list */
+  struct malloc_state_GLIBC_2_12 *next;
+
+  /* Linked list for free arenas.  */
+  struct malloc_state_GLIBC_2_12 *next_free;
+
+  /* Memory allocated from the system in this arena.  */
+  INTERNAL_SIZE_T system_mem;
+  INTERNAL_SIZE_T max_system_mem;
+};
+
+struct malloc_par_GLIBC_2_12 {
+  /* Tunable parameters */
+  unsigned long    trim_threshold;
+  INTERNAL_SIZE_T  top_pad;
+  INTERNAL_SIZE_T  mmap_threshold;
+  INTERNAL_SIZE_T  arena_test;
+  INTERNAL_SIZE_T  arena_max;
+
+  /* Memory map support */
+  int              n_mmaps;
+  int              n_mmaps_max;
+  int              max_n_mmaps;
+  int              no_dyn_threshold;
+
+  /* Cache malloc_getpagesize */
+  unsigned int     pagesize;
+
+  /* Statistics */
+  INTERNAL_SIZE_T  mmapped_mem;
+  INTERNAL_SIZE_T  max_mmapped_mem;
+  INTERNAL_SIZE_T  max_total_mem; /* only kept for NO_THREADS */
+
+  /* First address handed out by MORECORE/sbrk.  */
+  char*            sbrk_base;
+};
+
+#define HEAP_MAX_SIZE_GLIBC_2_12    HEAP_MAX_SIZE_GLIBC_2_5
 
 /************************************************************************
 **  32-bit Target
@@ -290,9 +358,13 @@ typedef struct malloc_chunk_32* mchunkptr_32;
 #define fastbin_index_GLIBC_2_3_32(sz) ((((unsigned int)(sz)) >> 3) - 2)
 #define NFASTBINS_GLIBC_2_3_32  (fastbin_index_GLIBC_2_3_32(request2size_32(MAX_FAST_SIZE_GLIBC_2_3_32))+1)
 
-#define MAX_FAST_SIZE_GLIBC_2_5_32     80
-#define fastbin_index_GLIBC_2_5_32(sz) ((((unsigned int)(sz)) >> 3) - 2)
-#define NFASTBINS_GLIBC_2_5_32  (fastbin_index_GLIBC_2_5_32(request2size_32(MAX_FAST_SIZE_GLIBC_2_5_32))+1)
+#define MAX_FAST_SIZE_GLIBC_2_5_32     MAX_FAST_SIZE_GLIBC_2_3_32
+#define fastbin_index_GLIBC_2_5_32(sz) fastbin_index_GLIBC_2_3_32(sz)
+#define NFASTBINS_GLIBC_2_5_32         NFASTBINS_GLIBC_2_3_32
+
+#define MAX_FAST_SIZE_GLIBC_2_12_32     80
+#define fastbin_index_GLIBC_2_12_32(sz) ((((unsigned int)(sz)) >> 3) - 2)
+#define NFASTBINS_GLIBC_2_12_32  (fastbin_index_GLIBC_2_12_32(request2size_32(MAX_FAST_SIZE_GLIBC_2_12_32))+1)
 
 //#define NONCONTIGUOUS_BIT (2U)
 //#define contiguous(M)     (((M)->flags &  NONCONTIGUOUS_BIT) == 0)
@@ -374,7 +446,7 @@ struct heap_info_GLIBC_2_3_32 {
 
 #define HEAP_MAX_SIZE_GLIBC_2_3_32 (1024*1024)
 
-//  GNU C Library version 2.3.4
+//  GNU C Library version 2.4
 struct malloc_state_GLIBC_2_4_32 {
   int mutex; //mutex_t mutex;
 
@@ -448,8 +520,6 @@ struct malloc_par_GLIBC_2_5_32 {
   unsigned int    trim_threshold;
   INTERNAL_SIZE_T_32  top_pad;
   INTERNAL_SIZE_T_32  mmap_threshold;
-  INTERNAL_SIZE_T_32  arena_test;
-  INTERNAL_SIZE_T_32  arena_max;
 
   // Memory map support
   int              n_mmaps;
@@ -479,5 +549,65 @@ struct heap_info_GLIBC_2_5_32 {
 
 #define DEFAULT_MMAP_THRESHOLD_MAX_32 (512 * 1024)
 #define HEAP_MAX_SIZE_GLIBC_2_5_32 (2 * DEFAULT_MMAP_THRESHOLD_MAX_32)
+
+struct malloc_state_GLIBC_2_12_32 {
+  int mutex; //mutex_t mutex;
+
+  // Flags (formerly in max_fast).
+  int flags;
+
+  // Fastbins
+  ptr_t_32      fastbins[NFASTBINS_GLIBC_2_12_32];	//mfastbinptr_32
+
+  // Base of the topmost chunk -- not otherwise kept in a bin
+  ptr_t_32        top;	//mchunkptr_32
+
+  // The remainder from the most recent split of a small request
+  ptr_t_32        last_remainder;	//mchunkptr_32
+
+  // Normal bins packed as described above
+  ptr_t_32        bins[NBINS * 2 - 2];	//mchunkptr_32
+
+  // Bitmap of bins/
+  unsigned int     binmap[BINMAPSIZE];
+
+  // Linked list
+  ptr_t_32 next;	//struct malloc_state_GLIBC_2_12_32 *
+
+  // Linked list for free arenas.
+  ptr_t_32 next_free;	//struct malloc_state_GLIBC_2_12_32 *
+
+  // Memory allocated from the system in this arena.
+  INTERNAL_SIZE_T_32 system_mem;
+  INTERNAL_SIZE_T_32 max_system_mem;
+};
+
+struct malloc_par_GLIBC_2_12_32 {
+  // Tunable parameters
+  unsigned int    trim_threshold;
+  INTERNAL_SIZE_T_32  top_pad;
+  INTERNAL_SIZE_T_32  mmap_threshold;
+  INTERNAL_SIZE_T_32  arena_test;
+  INTERNAL_SIZE_T_32  arena_max;
+
+  // Memory map support
+  int              n_mmaps;
+  int              n_mmaps_max;
+  int              max_n_mmaps;
+  int              no_dyn_threshold;
+
+  // Cache malloc_getpagesize
+  unsigned int     pagesize;
+
+  // Statistics
+  INTERNAL_SIZE_T_32  mmapped_mem;
+  INTERNAL_SIZE_T_32  max_mmapped_mem;
+  INTERNAL_SIZE_T_32  max_total_mem; // only kept for NO_THREADS
+
+  // First address handed out by MORECORE/sbrk.
+  ptr_t_32            sbrk_base;	//char*
+};
+
+#define HEAP_MAX_SIZE_GLIBC_2_12_32    HEAP_MAX_SIZE_GLIBC_2_5_32
 
 #endif /* _MM_PTMALLOC_H */

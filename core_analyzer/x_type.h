@@ -36,6 +36,7 @@
 #include <sys/mman.h>
 #endif
 #include <stdio.h>
+#include <time.h>
 
 #ifdef WIN32
 

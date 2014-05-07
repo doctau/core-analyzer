@@ -27,6 +27,7 @@ UMTYPE=windows
 #MSC_WARNING_LEVEL = /W4 /WX
 
 SOURCES= pta.cpp   \
+		 heap.cpp		\
          heap_mscrt.cpp     \
          search.cpp      \
          segment.cpp \

@@ -1,5 +1,5 @@
 /*
- * heap.cpp
+ * heap_mscrt.cpp
  *
  *  Created on: Dec 13, 2011
  *      Author: myan
@@ -31,11 +31,11 @@ static enum MSCRT_VER g_mscrt_ver = MSCRT_WIN_UNKNOWN;	// runtime type
 static CA_BOOL
 page_walk(address_t, CA_BOOL, struct heap_block*, size_t*, size_t*);
 static CA_BOOL
-page_walk_internal_2003(HEAP_SEGMENT_2003*, address_t, CA_BOOL, struct heap_block*, size_t*, size_t*, unsigned int*, unsigned int*);
+page_walk_internal_2003(HEAP_SEGMENT_2003*, address_t, CA_BOOL, struct heap_block*, size_t*, size_t*, unsigned long*, unsigned long*);
 static CA_BOOL
-page_walk_internal_2008(HEAP_2008*, HEAP_SEGMENT_2008*, address_t, address_t, CA_BOOL, struct heap_block*, size_t*, size_t*, unsigned int*, unsigned int*);
+page_walk_internal_2008(HEAP_2008*, HEAP_SEGMENT_2008*, address_t, address_t, CA_BOOL, struct heap_block*, size_t*, size_t*, unsigned long*, unsigned long*);
 static CA_BOOL
-page_walk_internal_2008_32(HEAP_2008_32*, HEAP_SEGMENT_2008_32*, address_t, address_t, CA_BOOL, struct heap_block*, size_t*, size_t*, unsigned int*, unsigned int*);
+page_walk_internal_2008_32(HEAP_2008_32*, HEAP_SEGMENT_2008_32*, address_t, address_t, CA_BOOL, struct heap_block*, size_t*, size_t*, unsigned long*, unsigned long*);
 
 static CA_BOOL
 page_walk_2003(address_t, CA_BOOL,	struct heap_block*,	size_t*, size_t*);
@@ -44,10 +44,14 @@ page_walk_2008(address_t, CA_BOOL,	struct heap_block*,	size_t*, size_t*);
 static CA_BOOL
 page_walk_2008_32(address_t, CA_BOOL,	struct heap_block*,	size_t*, size_t*);
 
-static CA_BOOL heap_walk_internal(CA_BOOL ibDryRun);
-static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun);
-static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun);
-static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun);
+static CA_BOOL heap_walk_internal(CA_BOOL ibDryRun, CA_BOOL verbose);
+static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun, CA_BOOL verbose);
+static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun, CA_BOOL verbose);
+static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun, CA_BOOL verbose);
+
+static CA_BOOL walk_inuse_blocks_2003(struct block_info*, unsigned long*);
+static CA_BOOL walk_inuse_blocks_2008(struct block_info*, unsigned long*);
+static CA_BOOL walk_inuse_blocks_2008_32(struct block_info*, unsigned long*);
 
 static CA_BOOL get_biggest_blocks_2003(struct heap_block* blks, unsigned int num);
 static CA_BOOL get_biggest_blocks_2008(struct heap_block* blks, unsigned int num);
@@ -66,7 +70,7 @@ CA_BOOL init_heap()
 	int ptr_bit = g_ptr_bit;
 	int ptr_sz = ptr_bit == 64 ? 8 : 4;
 
-	g_peb_vaddr = get_var_addr_by_name("peb");
+	g_peb_vaddr = get_var_addr_by_name("peb", CA_TRUE);
 	if (!g_peb_vaddr)
 		return CA_FALSE;
 	// get the PEB structure
@@ -130,7 +134,7 @@ CA_BOOL init_heap()
 	}
 
 	// Fixup segments that belongs to heaps
-	if (!heap_walk_internal(true))
+	if (!heap_walk_internal(true, false))
 		return CA_FALSE;
 
 	return CA_TRUE;
@@ -153,12 +157,12 @@ CA_BOOL is_heap_block(address_t addr)
 	return rc;
 }
 
-CA_BOOL heap_walk(address_t addr)
+CA_BOOL heap_walk(address_t addr, CA_BOOL verbose)
 {
 	if (addr)
 		return page_walk(addr, CA_TRUE, NULL, NULL, NULL);
 	else
-		return heap_walk_internal(CA_FALSE);
+		return heap_walk_internal(CA_FALSE, verbose);
 }
 
 // Assuming the input buffer is already zeroed, num is non-zero
@@ -180,24 +184,70 @@ CA_BOOL get_biggest_blocks(struct heap_block* blks, unsigned int num)
 	return CA_FALSE;
 }
 
-/////////////////////////////////////////////////////
-// Implementation of heap walk
-/////////////////////////////////////////////////////
-static CA_BOOL heap_walk_internal(CA_BOOL ibDryRun)
+static int compare_block_info( const void *arg1, const void *arg2 )
 {
+	struct block_info* left = (struct block_info*) arg1;
+	struct block_info* right = (struct block_info*) arg2;
+	if (left->addr < right->addr)
+		return -1;
+	else
+		return 1;
+}
+
+CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
+{
+	CA_BOOL rc = CA_FALSE;
+
 	if (g_ptr_bit == 64)
 	{
 		if (g_mscrt_ver == MSCRT_WIN_2003)
-			return heap_walk_2003(ibDryRun);
+			rc = walk_inuse_blocks_2003(opBlocks, opCount);
 		else if (g_mscrt_ver == MSCRT_WIN_2008)
-			return heap_walk_2008(ibDryRun);
+			rc = walk_inuse_blocks_2008(opBlocks, opCount);
 	}
 	else if (g_ptr_bit == 32)
 	{
 		if (g_mscrt_ver == MSCRT_WIN_2008)
-			return heap_walk_2008_32(ibDryRun);
+			rc = walk_inuse_blocks_2008_32(opBlocks, opCount);
 	}
-	return CA_FALSE;
+
+	// sort the array if necessary
+	if (rc && opBlocks && *opCount)
+		qsort(opBlocks, *opCount, sizeof(struct block_info), compare_block_info);
+
+	return rc;
+}
+
+/////////////////////////////////////////////////////
+// Implementation of heap walk
+/////////////////////////////////////////////////////
+static CA_BOOL heap_walk_internal(CA_BOOL ibDryRun, CA_BOOL verbose)
+{
+	CA_BOOL rc = CA_FALSE;
+
+	if (verbose)
+		init_mem_histogram(16);
+
+	if (g_ptr_bit == 64)
+	{
+		if (g_mscrt_ver == MSCRT_WIN_2003)
+			rc = heap_walk_2003(ibDryRun, verbose);
+		else if (g_mscrt_ver == MSCRT_WIN_2008)
+			rc = heap_walk_2008(ibDryRun, verbose);
+	}
+	else if (g_ptr_bit == 32)
+	{
+		if (g_mscrt_ver == MSCRT_WIN_2008)
+			rc = heap_walk_2008_32(ibDryRun, verbose);
+	}
+
+	if (verbose && rc)
+	{
+		CA_PRINT("\n");
+		display_mem_histogram("");
+	}
+
+	return rc;
 }
 
 static CA_BOOL
@@ -234,7 +284,7 @@ page_walk_2008(address_t addr,			// input heap addr
 {
 	CA_BOOL rc = CA_FALSE;
 	size_t inuse_bytes = 0, free_bytes = 0;
-	unsigned int num_inuse = 0, num_free = 0;
+	unsigned long num_inuse = 0, num_free = 0;
 	// loop through all heaps
 	int heap_cnt;
 	CA_BOOL bailout = CA_FALSE;
@@ -274,8 +324,8 @@ page_walk_2008(address_t addr,			// input heap addr
 
 	if (bVerbose)
 	{
-		CA_PRINT("Total %d inuse blocks of "PRINT_FORMAT_SIZE" bytes\n", num_inuse, inuse_bytes);
-		CA_PRINT("Total %d free blocks of "PRINT_FORMAT_SIZE" bytes\n", num_free, free_bytes);
+		CA_PRINT("Total %ld inuse blocks of "PRINT_FORMAT_SIZE" bytes\n", num_inuse, inuse_bytes);
+		CA_PRINT("Total %ld free blocks of "PRINT_FORMAT_SIZE" bytes\n", num_free, free_bytes);
 	}
 	if (rc && opInuseBytes && opFreeBytes)
 	{
@@ -295,7 +345,7 @@ page_walk_2008_32(address_t addr,			// input heap addr
 {
 	CA_BOOL rc = CA_FALSE;
 	size_t inuse_bytes = 0, free_bytes = 0;
-	unsigned int num_inuse = 0, num_free = 0;
+	unsigned long num_inuse = 0, num_free = 0;
 	// loop through all heaps
 	int heap_cnt;
 	CA_BOOL bailout = CA_FALSE;
@@ -335,8 +385,8 @@ page_walk_2008_32(address_t addr,			// input heap addr
 
 	if (bVerbose)
 	{
-		CA_PRINT("Total %d inuse blocks of %ld bytes\n", num_inuse, inuse_bytes);
-		CA_PRINT("Total %d free blocks of %ld bytes\n", num_free, free_bytes);
+		CA_PRINT("Total %ld inuse blocks of %ld bytes\n", num_inuse, inuse_bytes);
+		CA_PRINT("Total %ld free blocks of %ld bytes\n", num_free, free_bytes);
 	}
 	if (rc && opInuseBytes && opFreeBytes)
 	{
@@ -356,7 +406,7 @@ page_walk_2003(address_t addr,			// input heap addr
 {
 	CA_BOOL rc = CA_FALSE;
 	size_t inuse_bytes = 0, free_bytes = 0;
-	unsigned int num_inuse = 0, num_free = 0;
+	unsigned long num_inuse = 0, num_free = 0;
 	// loop through all heaps
 	int heap_cnt;
 	CA_BOOL bailout = CA_FALSE;
@@ -390,8 +440,8 @@ page_walk_2003(address_t addr,			// input heap addr
 
 	if (bVerbose)
 	{
-		CA_PRINT("Total %d inuse blocks of "PRINT_FORMAT_SIZE" bytes\n", num_inuse, inuse_bytes);
-		CA_PRINT("Total %d free blocks of "PRINT_FORMAT_SIZE" bytes\n", num_free, free_bytes);
+		CA_PRINT("Total %ld inuse blocks of "PRINT_FORMAT_SIZE" bytes\n", num_inuse, inuse_bytes);
+		CA_PRINT("Total %ld free blocks of "PRINT_FORMAT_SIZE" bytes\n", num_free, free_bytes);
 	}
 	if (rc && opInuseBytes && opFreeBytes)
 	{
@@ -402,10 +452,10 @@ page_walk_2003(address_t addr,			// input heap addr
 	return rc;
 }
 
-static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun)
+static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun, CA_BOOL verbose)
 {
-	size_t inuse_bytes = 0, free_bytes = 0;
-	unsigned int num_inuse = 0, num_free = 0;
+	size_t total_inuse_bytes = 0, total_free_bytes = 0;
+	unsigned long total_num_inuse = 0, total_num_free = 0;
 	unsigned long err_count = 0;
 
 	// loop through all heaps
@@ -452,7 +502,10 @@ static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun)
 			}
 			else
 			{
-				CA_PRINT("\t\tsegment "PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"\n",
+				size_t inuse_bytes = 0, free_bytes = 0;
+				unsigned long num_inuse = 0, num_free = 0;
+
+				CA_PRINT("\t\tsegment "PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" ",
 						(address_t)heap_seg.BaseAddress, seg_end);
 				if (!page_walk_internal_2008(&heap, &heap_seg, seg_addr, 0, CA_FALSE, NULL, &inuse_bytes, &free_bytes, &num_inuse, &num_free))
 				{
@@ -461,6 +514,20 @@ static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun)
 							(address_t)heap_seg.BaseAddress);
 					//break;
 				}
+				else
+				{
+					print_size(seg_end - (address_t)heap_seg.BaseAddress);
+					CA_PRINT(" in-use %ld(", num_inuse);
+					print_size(inuse_bytes);
+					CA_PRINT(") free %ld(", num_free);
+					print_size(free_bytes);
+					CA_PRINT(")");
+				}
+				CA_PRINT("\n");
+				total_num_inuse += num_inuse;
+				total_num_free  += num_free;
+				total_inuse_bytes += inuse_bytes;
+				total_free_bytes  += free_bytes;
 			}
 			next_list_entry_addr = (address_t) heap_seg.SegmentListEntry.Flink;
 		}
@@ -469,22 +536,161 @@ static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun)
 		CA_PRINT("Find %d heap errors\n", err_count);
 	else if (!ibDryRun)
 	{
-		CA_PRINT("There are %d heaps\n", heap_cnt);
-		CA_PRINT("Total %d busy blocks of "PRINT_FORMAT_SIZE" bytes ", num_inuse, inuse_bytes);
-		print_size(inuse_bytes);
 		CA_PRINT("\n");
-		CA_PRINT("Total %d free blocks of "PRINT_FORMAT_SIZE" bytes ", num_free, free_bytes);
-		print_size(free_bytes);
+		CA_PRINT("There are %d heaps\n", heap_cnt);
+		CA_PRINT("Total %ld busy blocks of ", total_num_inuse);
+		print_size(total_inuse_bytes);
+		CA_PRINT("\n");
+		CA_PRINT("Total %ld free blocks of ", total_num_free);
+		print_size(total_free_bytes);
 		CA_PRINT("\n");
 	}
 
 	return CA_TRUE;
 }
 
-static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun)
+static CA_BOOL walk_inuse_blocks_2008(struct block_info* opBlocks, unsigned long* opCount)
 {
-	size_t inuse_bytes = 0, free_bytes = 0;
-	unsigned int num_inuse = 0, num_free = 0;
+	*opCount = 0;
+	struct block_info* pBlockinfo = opBlocks;
+	// loop through all heaps
+	int heap_cnt;
+	for (heap_cnt = 0; ; heap_cnt++)
+	{
+		address_t heap_vaddr;
+		HEAP_2008 heap;
+		address_t sentinel, next_list_entry_addr;
+
+		if (!read_memory_wrapper(NULL, g_heaps_vaddr + heap_cnt * sizeof(heap_vaddr), &heap_vaddr, sizeof(heap_vaddr)))
+			break;
+		if (heap_vaddr == 0)
+			break;
+		if (!read_memory_wrapper(NULL, heap_vaddr, &heap, sizeof(heap)))
+			continue;
+
+		// segments are on a doubly-linked list
+		// _HEAP.SegmentList is the sentinel LIST_ENTRY
+		sentinel = (address_t) &((HEAP_2008*)heap_vaddr)->SegmentList;
+		next_list_entry_addr = (address_t) heap.SegmentList.Flink;
+		while (next_list_entry_addr != sentinel)
+		{
+			address_t entry_vaddr;
+			address_t seg_end;
+			HEAP_SEGMENT_2008 heap_seg;
+			address_t seg_addr = next_list_entry_addr - (address_t) &((HEAP_2008*)0)->SegmentListEntry;
+
+			if (!read_memory_wrapper(NULL, seg_addr, &heap_seg, sizeof(heap_seg)))
+				break;
+			seg_end = (address_t)heap_seg.BaseAddress + heap_seg.NumberOfPages * g_page_sz;
+
+			// Start walking heap segment
+			entry_vaddr = (address_t) heap_seg.FirstEntry;
+			while (entry_vaddr < seg_end)
+			{
+				address_t user_addr;
+				size_t entry_sz, user_sz;
+				HEAP_ENTRY_2008 entry;
+				CA_BOOL lbUncommitted = CA_FALSE;
+
+				// there are multiple uncommitted ranges, which might be readable or unreadable
+				// they are on a doubly-linked list and they are NOT necessarily sorted by address
+				// 		_HEAP_SEGMENT_2008::NumberOfUnCommittedRanges is also the list size + 1 (sentinel)
+				// 		_HEAP_SEGMENT_2003::UCRSegmentList is the sentinel
+				if (heap_seg.NumberOfUnCommittedRanges > 0)
+				{
+					address_t ucr_sentinel, ucr_next;
+					HEAP_UCR_DESCRIPTOR ucr_descriptor;
+
+					ucr_sentinel = seg_addr + (address_t) &((HEAP_SEGMENT_2008*)0)->UCRSegmentList;
+					ucr_next = (address_t)heap_seg.UCRSegmentList.Flink;
+					while (ucr_next != ucr_sentinel)
+					{
+						ucr_next -= (address_t) &((HEAP_UCR_DESCRIPTOR*)0)->SegmentEntry;
+						if (!read_memory_wrapper(NULL, ucr_next, &ucr_descriptor, sizeof(ucr_descriptor)))
+							break;
+						else if (entry_vaddr >= (address_t)ucr_descriptor.Address && entry_vaddr < (address_t)ucr_descriptor.Address + ucr_descriptor.Size)
+						{
+							// we run into one of the uncommitted ranges
+							// treat the whole range as a free entry
+							lbUncommitted = CA_TRUE;
+							entry_vaddr = (address_t)ucr_descriptor.Address + ucr_descriptor.Size;
+							break;
+						}
+						// Get the next uncommitted range on the list
+						ucr_next = (address_t) ucr_descriptor.SegmentEntry.Flink;
+					}
+				}
+				if (lbUncommitted)
+					continue;
+
+				// The normal block starts with HEAP_ENTRY
+				if (!read_memory_wrapper(NULL, entry_vaddr, &entry, sizeof(entry)))
+					break;
+				else	// We have read HEAP_ENTRY successfully
+				{
+					// Encoding of the HEAP_ENTRY
+					if (heap.EncodeFlagMask)
+					{
+						UCHAR* bytes = (UCHAR*) &entry.Size;
+						*(DWORD*)bytes ^= *(DWORD*)(&heap.Encoding.Size);
+						// check the encoding byte
+						if (entry.SmallTagIndex != (bytes[0] ^ bytes[1] ^ bytes[2]) )
+							break;
+					}
+					entry_sz = entry.Size * sizeof(entry);
+					// HEAP_ENTRY::Size tag is often the victim of memory overrun
+					if (entry_sz == 0
+						|| entry_vaddr + entry_sz > (address_t) heap_seg.LastValidEntry
+						|| entry_vaddr + entry_sz > seg_end)
+						break;
+					// HEAP_ENTRY::UnusedBytes
+					user_addr = entry_vaddr + sizeof(entry);
+					if (entry_sz > entry.UnusedBytes && entry.UnusedBytes >= sizeof(entry))
+						user_sz = entry_sz - entry.UnusedBytes;
+					else
+						user_sz = entry_sz - sizeof(entry);
+					// HEAP_ENTRY::Flags, busy block only
+					if ( (entry.Flags & PROCESS_HEAP_REGION) || (entry.Flags & PROCESS_HEAP_ENTRY_BUSY) )
+					{
+						// A free chunk doesn't have _CrtMemBlockHeader. If an uncommitted page
+						// follows, we can't even read enough bytes sizeof(_CrtMemBlockHeader)
+						if (g_dbgheap && entry_sz - sizeof(entry) >= sizeof(_CrtMemBlockHeader))
+						{
+							_CrtMemBlockHeader pHead;
+							if (!read_memory_wrapper(NULL, user_addr, &pHead, sizeof(pHead)))
+								return CA_FALSE;
+							/* gap is filled with _bNoMansLandFill or 0xfd */
+							if (*(int*)&pHead.gap == 0xfdfdfdfd)
+							{
+								user_addr += sizeof(_CrtMemBlockHeader);
+								user_sz = pHead.nDataSize;
+							}
+						}
+						// Now we know this block
+						(*opCount)++;
+						if (pBlockinfo)
+						{
+							pBlockinfo->addr = user_addr;
+							pBlockinfo->size = user_sz;
+							pBlockinfo->ref_count = 0;
+							pBlockinfo++;
+						}
+					}
+					// calc the next block
+					entry_vaddr = entry_vaddr + entry_sz;
+				}
+			}
+			next_list_entry_addr = (address_t) heap_seg.SegmentListEntry.Flink;
+		}
+	}
+
+	return CA_TRUE;
+}
+
+static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun, CA_BOOL verbose)
+{
+	size_t total_inuse_bytes = 0, total_free_bytes = 0;
+	unsigned long total_num_inuse = 0, total_num_free = 0;
 	unsigned int err_count = 0;
 
 	// loop through all heaps
@@ -531,7 +737,10 @@ static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun)
 			}
 			else
 			{
-				CA_PRINT("\t\tsegment 0x%lx - 0x%lx\n",
+				size_t inuse_bytes = 0, free_bytes = 0;
+				unsigned long num_inuse = 0, num_free = 0;
+
+				CA_PRINT("\t\tsegment 0x%lx - 0x%lx ",
 						(ptr_t_32)heap_seg.BaseAddress, seg_end);
 				if (!page_walk_internal_2008_32(&heap, &heap_seg, seg_addr, 0, CA_FALSE, NULL, &inuse_bytes, &free_bytes, &num_inuse, &num_free))
 				{
@@ -540,6 +749,20 @@ static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun)
 							(ptr_t_32)heap_seg.BaseAddress);
 					//break;
 				}
+				else
+				{
+					print_size(seg_end - (address_t)heap_seg.BaseAddress);
+					CA_PRINT(" in-use %d(", num_inuse);
+					print_size(inuse_bytes);
+					CA_PRINT(") free %d(", num_free);
+					print_size(free_bytes);
+					CA_PRINT(")");
+				}
+				CA_PRINT("\n");
+				total_num_inuse += num_inuse;
+				total_num_free  += num_free;
+				total_inuse_bytes += inuse_bytes;
+				total_free_bytes  += free_bytes;
 			}
 			next_list_entry_addr = (ptr_t_32) heap_seg.SegmentListEntry.Flink;
 		}
@@ -548,13 +771,151 @@ static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun)
 		CA_PRINT("Find %d heap errors\n", err_count);
 	else if (!ibDryRun)
 	{
+		CA_PRINT("\n");
 		CA_PRINT("There are %d heaps\n", heap_cnt);
-		CA_PRINT("Total %d busy blocks of %ld bytes ", num_inuse, inuse_bytes);
-		print_size(inuse_bytes);
+		CA_PRINT("Total %ld busy blocks of ", total_num_inuse);
+		print_size(total_inuse_bytes);
 		CA_PRINT("\n");
-		CA_PRINT("Total %d free blocks of %ld bytes ", num_free, free_bytes);
-		print_size(free_bytes);
+		CA_PRINT("Total %ld free blocks of ", total_num_free);
+		print_size(total_free_bytes);
 		CA_PRINT("\n");
+	}
+
+	return CA_TRUE;
+}
+
+static CA_BOOL walk_inuse_blocks_2008_32(struct block_info* opBlocks, unsigned long* opCount)
+{
+	*opCount = 0;
+	struct block_info* pBlockinfo = opBlocks;
+	// loop through all heaps
+	int heap_cnt;
+	for (heap_cnt = 0; ; heap_cnt++)
+	{
+		ptr_t_32 heap_vaddr;
+		HEAP_2008_32 heap;
+		ptr_t_32 sentinel, next_list_entry_addr;
+
+		if (!read_memory_wrapper(NULL, g_heaps_vaddr + heap_cnt * sizeof(heap_vaddr), &heap_vaddr, sizeof(heap_vaddr)))
+			break;
+		if (heap_vaddr == 0)
+			break;
+		if (!read_memory_wrapper(NULL, heap_vaddr, &heap, sizeof(heap)))
+			continue;
+
+		// segments are on a doubly-linked list
+		// _HEAP.SegmentList is the sentinel LIST_ENTRY
+		sentinel = (ptr_t_32) &((HEAP_2008_32*)heap_vaddr)->SegmentList;
+		next_list_entry_addr = (ptr_t_32) heap.SegmentList.Flink;
+		while (next_list_entry_addr != sentinel)
+		{
+			ptr_t_32 entry_vaddr;
+			ptr_t_32 seg_end;
+			HEAP_SEGMENT_2008_32 heap_seg;
+			ptr_t_32 seg_addr = next_list_entry_addr - (ptr_t_32) &((HEAP_2008_32*)0)->SegmentListEntry;
+			if (!read_memory_wrapper(NULL, seg_addr, &heap_seg, sizeof(heap_seg)))
+				break;
+			seg_end = (ptr_t_32)heap_seg.BaseAddress + heap_seg.NumberOfPages * g_page_sz;
+
+			// Start walking heap segment
+			entry_vaddr = (ptr_t_32) heap_seg.FirstEntry;
+			while (entry_vaddr < seg_end)
+			{
+				ptr_t_32 user_addr;
+				unsigned int entry_sz, user_sz;
+				HEAP_ENTRY_2008_32 entry;
+				CA_BOOL lbUncommitted = CA_FALSE;
+
+				// there are multiple uncommitted ranges, which might be readable or unreadable
+				// they are on a doubly-linked list and they are NOT necessarily sorted by address
+				// 		_HEAP_SEGMENT_2008::NumberOfUnCommittedRanges is also the list size + 1 (sentinel)
+				// 		_HEAP_SEGMENT_2003::UCRSegmentList is the sentinel
+				if (heap_seg.NumberOfUnCommittedRanges > 0)
+				{
+					ptr_t_32 ucr_sentinel, ucr_next;
+					HEAP_UCR_DESCRIPTOR_32 ucr_descriptor;
+
+					ucr_sentinel = seg_addr + (ptr_t_32) &((HEAP_SEGMENT_2008_32*)0)->UCRSegmentList;
+					ucr_next = (ptr_t_32)heap_seg.UCRSegmentList.Flink;
+					while (ucr_next != ucr_sentinel)
+					{
+						ucr_next -= (ptr_t_32) &((HEAP_UCR_DESCRIPTOR_32*)0)->SegmentEntry;
+						if (!read_memory_wrapper(NULL, ucr_next, &ucr_descriptor, sizeof(ucr_descriptor)))
+							break;
+						else if (entry_vaddr >= (ptr_t_32)ucr_descriptor.Address && entry_vaddr < (ptr_t_32)ucr_descriptor.Address + ucr_descriptor.Size)
+						{
+							// we run into one of the uncommitted ranges
+							// treat the whole range as a free entry
+							lbUncommitted = CA_TRUE;
+							entry_vaddr = (ptr_t_32)ucr_descriptor.Address + ucr_descriptor.Size;
+							break;
+						}
+						// Get the next uncommitted range on the list
+						ucr_next = (ptr_t_32) ucr_descriptor.SegmentEntry.Flink;
+					}
+				}
+				if (lbUncommitted)
+					continue;
+
+				// The normal block starts with HEAP_ENTRY
+				if (!read_memory_wrapper(NULL, entry_vaddr, &entry, sizeof(entry)))
+					break;
+				else	// We have read HEAP_ENTRY successfully
+				{
+					// Encoding of the HEAP_ENTRY
+					if (heap.EncodeFlagMask)
+					{
+						UCHAR* bytes = (UCHAR*) &entry.Size;
+						*(DWORD*)bytes ^= *(DWORD*)(&heap.Encoding.Size);
+						// check the encoding byte
+						if (entry.SmallTagIndex != (bytes[0] ^ bytes[1] ^ bytes[2]) )
+							break;
+					}
+					entry_sz = entry.Size * sizeof(entry);
+					// HEAP_ENTRY::Size tag is often the victim of memory overrun
+					if (entry_sz == 0
+						|| entry_vaddr + entry_sz > (ptr_t_32) heap_seg.LastValidEntry
+						|| entry_vaddr + entry_sz > seg_end)
+						break;
+					// HEAP_ENTRY::UnusedBytes
+					user_addr = entry_vaddr + sizeof(entry);
+					if (entry_sz > entry.UnusedBytes && entry.UnusedBytes >= sizeof(entry))
+						user_sz = entry_sz - entry.UnusedBytes;
+					else
+						user_sz = entry_sz - sizeof(entry);
+					// HEAP_ENTRY::Flags, busy block only
+					if ( (entry.Flags & PROCESS_HEAP_REGION) || (entry.Flags & PROCESS_HEAP_ENTRY_BUSY) )
+					{
+						// A free chunk doesn't have _CrtMemBlockHeader. If an uncommitted page
+						// follows, we can't even read enough bytes sizeof(_CrtMemBlockHeader)
+						if (g_dbgheap && entry_sz - sizeof(entry) >= sizeof(_CrtMemBlockHeader_32))
+						{
+							_CrtMemBlockHeader_32 pHead;
+							if (!read_memory_wrapper(NULL, user_addr, &pHead, sizeof(pHead)))
+								break;
+							/* gap is filled with _bNoMansLandFill or 0xfd */
+							if (*(int*)&pHead.gap == 0xfdfdfdfd)
+							{
+								user_addr += sizeof(_CrtMemBlockHeader_32);
+								user_sz = pHead.nDataSize;
+							}
+						}
+						// Now we know this block
+						(*opCount)++;
+						if (pBlockinfo)
+						{
+							pBlockinfo->addr = user_addr;
+							pBlockinfo->size = user_sz;
+							pBlockinfo->ref_count = 0;
+							pBlockinfo++;
+						}
+					}
+					// calc the next block
+					entry_vaddr = entry_vaddr + entry_sz;
+				}
+			}
+			next_list_entry_addr = (ptr_t_32) heap_seg.SegmentListEntry.Flink;
+		}
 	}
 
 	return CA_TRUE;
@@ -636,10 +997,10 @@ static CA_BOOL get_biggest_blocks_2008_32(struct heap_block* blks, unsigned int 
 	return CA_TRUE;
 }
 
-static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun)
+static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun, CA_BOOL verbose)
 {
-	size_t inuse_bytes = 0, free_bytes = 0;
-	unsigned int num_inuse = 0, num_free = 0;
+	size_t total_inuse_bytes = 0, total_free_bytes = 0;
+	unsigned long total_num_inuse = 0, total_num_free = 0;
 	unsigned long err_count = 0;
 
 	// loop through all heaps
@@ -683,7 +1044,10 @@ static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun)
 			}
 			else
 			{
-				CA_PRINT("\t\tsegment "PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"\n",
+				unsigned long num_inuse = 0, num_free = 0;
+				size_t inuse_bytes = 0, free_bytes = 0;
+
+				CA_PRINT("\t\tsegment "PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" ",
 					heap_seg.BaseAddress, seg_end);
 				if (!page_walk_internal_2003(&heap_seg, 0, CA_FALSE, NULL, &inuse_bytes, &free_bytes, &num_inuse, &num_free))
 				{
@@ -692,6 +1056,20 @@ static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun)
 							heap_seg.FirstEntry);
 					//break;
 				}
+				else
+				{
+					print_size(seg_end - (address_t)heap_seg.BaseAddress);
+					CA_PRINT(" in-use %d(", num_inuse);
+					print_size(inuse_bytes);
+					CA_PRINT(") free %d(", num_free);
+					print_size(free_bytes);
+					CA_PRINT(")");
+				}
+				CA_PRINT("\n");
+				total_num_inuse += num_inuse;
+				total_num_free  += num_free;
+				total_inuse_bytes += inuse_bytes;
+				total_free_bytes  += free_bytes;
 			}
 		}
 	}
@@ -699,13 +1077,143 @@ static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun)
 		CA_PRINT("Find %d heap errors\n", err_count);
 	else if (!ibDryRun)
 	{
+		CA_PRINT("\n");
 		CA_PRINT("There are %d heaps\n", heap_cnt);
-		CA_PRINT("Total %d busy blocks of "PRINT_FORMAT_SIZE" bytes ", num_inuse, inuse_bytes);
-		print_size(inuse_bytes);
+		CA_PRINT("Total %ld busy blocks of ", total_num_inuse);
+		print_size(total_inuse_bytes);
 		CA_PRINT("\n");
-		CA_PRINT("Total %d free blocks of "PRINT_FORMAT_SIZE" bytes ", num_inuse, free_bytes);
-		print_size(free_bytes);
+		CA_PRINT("Total %ld free blocks of ", total_num_inuse);
+		print_size(total_free_bytes);
 		CA_PRINT("\n");
+	}
+
+	return CA_TRUE;
+}
+
+static CA_BOOL walk_inuse_blocks_2003(struct block_info* opBlocks, unsigned long* opCount)
+{
+	*opCount = 0;
+	struct block_info* pBlockinfo = opBlocks;
+	// loop through all heaps
+	int heap_cnt;
+	for (heap_cnt = 0; ; heap_cnt++)
+	{
+		address_t heap_vaddr;
+		// g_heaps_vaddr is the beginning of an array of heap addresses.
+		if (!read_memory_wrapper(NULL, g_heaps_vaddr + heap_cnt * sizeof(heap_vaddr), &heap_vaddr, sizeof(heap_vaddr)))
+			return CA_FALSE;
+		// The array ends with address 0
+		if (heap_vaddr == 0)
+			break;
+
+		HEAP_2003 heap;
+		if (!read_memory_wrapper(NULL, heap_vaddr, &heap, sizeof(heap)))
+			return CA_FALSE;
+
+		// loop through all segments(up to 64) for each heap
+		for (int i=0; i<64 && heap.Segments[i]; i++)
+		{
+			HEAP_SEGMENT_2003 heap_seg;
+			address_t seg_end;
+			address_t entry_vaddr;
+			address_t range_vaddr;
+			HEAP_UNCOMMMTTED_RANGE range;
+
+			if (!read_memory_wrapper(NULL, (address_t)heap.Segments[i], &heap_seg, sizeof(heap_seg)) )
+				continue;
+			seg_end = (address_t)heap_seg.BaseAddress + heap_seg.NumberOfPages * g_page_sz;
+			// there may be multiple uncommitted ranges
+			// they are sorted by address, and on a singly-linked list (last one is grounded)
+			// 		_HEAP_SEGMENT_2003::NumberOfUnCommittedRanges is also the list size
+			// 		_HEAP_SEGMENT_2003::UnCommittedRanges is the list head
+			if (heap_seg.NumberOfUnCommittedRanges > 0)
+			{
+				range_vaddr = (address_t) heap_seg.UnCommittedRanges;
+				if (!read_memory_wrapper(NULL, range_vaddr, &range, sizeof(range)))
+					continue;
+			}
+			else
+			{
+				range.Address = (PVOID)seg_end;
+				range.Size = 0;
+			}
+
+			// Start walking heap segment
+			entry_vaddr = (address_t) heap_seg.FirstEntry;
+			while (entry_vaddr < seg_end)
+			{
+				address_t user_addr;
+				size_t entry_sz, user_sz;
+				HEAP_ENTRY_2003 entry;
+
+				// is the next entry falls in an uncommitted range?
+				if (entry_vaddr >= (address_t)range.Address)
+				{
+					if (entry_vaddr >= (address_t)range.Address + range.Size)
+						break;
+					// treat the whole range as a free entry
+					entry_vaddr = (address_t)range.Address + range.Size;
+					// Get the next uncommitted range on the list
+					range_vaddr = (address_t) range.next;
+					if (range_vaddr)
+					{
+						if (!read_memory_wrapper(NULL, range_vaddr, &range, sizeof(range)))
+							break;
+					}
+					else
+					{
+						range.Address = (PVOID)seg_end;
+						range.Size = 0;
+					}
+				}
+				else
+				{
+					// The block starts with HEAP_ENTRY
+					if (!read_memory_wrapper(NULL, entry_vaddr, &entry, sizeof(entry)))
+						break;
+					entry_sz = entry.Size * sizeof(entry);
+					// HEAP_ENTRY::Size tag is often the victim of memory overrun
+					if (entry_vaddr + entry_sz > seg_end)
+						break;
+					// HEAP_ENTRY::UnusedBytes
+					user_addr = entry_vaddr + sizeof(entry);
+					if (entry_sz > entry.UnusedBytes)
+						user_sz = entry_sz - entry.UnusedBytes;
+					else
+						user_sz = entry_sz - sizeof(entry);
+					// HEAP_ENTRY::Flags
+					// check for busy flag
+					if ( (entry.Flags & PROCESS_HEAP_REGION) || (entry.Flags & PROCESS_HEAP_ENTRY_BUSY) )
+					{
+						// An in-use chunk could have no _CrtMemBlockHeader either.
+						// If an uncommitted page follows, we can't read enough bytes sizeof(_CrtMemBlockHeader)
+						if (g_dbgheap && entry_sz - sizeof(entry) >= sizeof(_CrtMemBlockHeader))
+						{
+							_CrtMemBlockHeader pHead;
+							if (!read_memory_wrapper(NULL, user_addr, &pHead, sizeof(pHead)))
+								break;
+							/* gap is filled with _bNoMansLandFill or 0xfd */
+							if (*(int*)&pHead.gap == 0xfdfdfdfd)
+							{
+								user_addr += sizeof(_CrtMemBlockHeader);
+								user_sz = pHead.nDataSize;
+							}
+						}
+						// Now we know this block
+						(*opCount)++;
+						if (pBlockinfo)
+						{
+							pBlockinfo->addr = user_addr;
+							pBlockinfo->size = user_sz;
+							pBlockinfo->ref_count = 0;
+							pBlockinfo++;
+						}
+					}
+					// calc the next block
+					entry_vaddr = entry_vaddr + entry_sz;
+				}
+			}
+		}
 	}
 
 	return CA_TRUE;
@@ -752,11 +1260,11 @@ page_walk_internal_2008(HEAP_2008* heap,			// in => heap
 					struct heap_block* opBlock,		// output the block containing the addr
 					size_t* opInuseBytes,			// output page in-use bytes
 					size_t* opFreeBytes,			// output page free bytes
-					unsigned int* opNumInuse,		// output number inuse blocks
-					unsigned int* opNumFree)		// output number of free blocks
+					unsigned long* opNumInuse,		// output number inuse blocks
+					unsigned long* opNumFree)		// output number of free blocks
 {
 	address_t entry_vaddr;
-	address_t seg_end = (address_t)heap_seg->BaseAddress + heap_seg->NumberOfPages * g_page_sz;;
+	address_t seg_end = (address_t)heap_seg->BaseAddress + heap_seg->NumberOfPages * g_page_sz;
 
 	// Sanity check
 	if (addr)
@@ -834,6 +1342,7 @@ page_walk_internal_2008(HEAP_2008* heap,			// in => heap
 					}
 					if (opFreeBytes)
 						*opFreeBytes += ucr_descriptor.Size;
+					add_block_mem_histogram(ucr_descriptor.Size, CA_FALSE, 1);
 					break;
 				}
 				// Get the next uncommitted range on the list
@@ -953,6 +1462,8 @@ page_walk_internal_2008(HEAP_2008* heap,			// in => heap
 					(*opNumFree)++;
 				}
 			}
+			add_block_mem_histogram(user_sz, busy, 1);
+			// calc the next block
 			entry_vaddr = entry_vaddr + entry_sz;
 		}
 	}
@@ -969,8 +1480,8 @@ page_walk_internal_2008_32(HEAP_2008_32* heap,			// in => heap
 					struct heap_block* opBlock,		// output the block containing the addr
 					size_t* opInuseBytes,			// output page in-use bytes
 					size_t* opFreeBytes,			// output page free bytes
-					unsigned int* opNumInuse,		// output number inuse blocks
-					unsigned int* opNumFree)		// output number of free blocks
+					unsigned long* opNumInuse,		// output number inuse blocks
+					unsigned long* opNumFree)		// output number of free blocks
 {
 	ptr_t_32 entry_vaddr;
 	ptr_t_32 seg_end = (ptr_t_32)heap_seg->BaseAddress + heap_seg->NumberOfPages * g_page_sz;;
@@ -1045,6 +1556,7 @@ page_walk_internal_2008_32(HEAP_2008_32* heap,			// in => heap
 					}
 					if (opFreeBytes)
 						*opFreeBytes += ucr_descriptor.Size;
+					add_block_mem_histogram(ucr_descriptor.Size, CA_FALSE, 1);
 					break;
 				}
 				// Get the next uncommitted range on the list
@@ -1164,6 +1676,8 @@ page_walk_internal_2008_32(HEAP_2008_32* heap,			// in => heap
 					(*opNumFree)++;
 				}
 			}
+			add_block_mem_histogram(user_sz, busy, 1);
+			// calc the next block
 			entry_vaddr = entry_vaddr + entry_sz;
 		}
 	}
@@ -1410,8 +1924,8 @@ page_walk_internal_2003(HEAP_SEGMENT_2003* heap_seg,// in => heap segment
 					struct heap_block* opBlock,		// output the block containing the addr
 					size_t* opInuseBytes,			// output page in-use bytes
 					size_t* opFreeBytes,			// output page free bytes
-					unsigned int* opNumInuse,		// outpout number of inuse blocks
-					unsigned int* opNumFree)		// output number of free blocks
+					unsigned long* opNumInuse,		// outpout number of inuse blocks
+					unsigned long* opNumFree)		// output number of free blocks
 {
 	address_t entry_vaddr;
 	address_t seg_end = (address_t)heap_seg->BaseAddress + heap_seg->NumberOfPages * g_page_sz;
@@ -1491,6 +2005,7 @@ page_walk_internal_2003(HEAP_SEGMENT_2003* heap_seg,// in => heap segment
 			}
 			if (opFreeBytes)
 				*opFreeBytes += range.Size;
+			add_block_mem_histogram(range.Size, CA_FALSE, 1);
 			// Get the next uncommitted range on the list
 			range_vaddr = (address_t) range.next;
 			if (range_vaddr)
@@ -1608,6 +2123,8 @@ page_walk_internal_2003(HEAP_SEGMENT_2003* heap_seg,// in => heap segment
 					(*opNumFree)++;
 				}
 			}
+			add_block_mem_histogram(user_sz, busy, 1);
+			// calc the next block
 			entry_vaddr = entry_vaddr + entry_sz;
 		}
 	}

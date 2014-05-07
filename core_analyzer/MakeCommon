@@ -6,7 +6,7 @@ INC_FILES = $(SRC)/cmd_impl.h
 
 all: core_analyzer
 
-core_analyzer: main.o util.o search.o segment.o stl_container.o $(PLATFORM_OBJ)
+core_analyzer: main.o util.o search.o segment.o stl_container.o heap.o $(PLATFORM_OBJ)
 	$(LINKER) $(EXEC_LDFLAGS) -o $@ $^
 
 %.o: $(SRC)/%.cpp $(INC_FILES)
