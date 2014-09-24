@@ -8,6 +8,7 @@
 #include "heap.h"
 #include "search.h"
 #include "stl_container.h"
+#include "decode.h"
 
 #ifdef linux
 #include <elf.h>
@@ -15,6 +16,7 @@
 
 #include <sys/param.h> // for MAXPATHLEN
 #include "dis-asm.h"
+#include "readline/readline.h"
 
 #ifndef PN_XNUM
 #define PN_XNUM 0xffff
@@ -27,11 +29,11 @@ int g_debug_core = CA_FALSE;
 unsigned int g_ptr_bit = 64;
 
 // Currently seleceted thread/frame
-struct ca_debug_context g_debug_context = {0, 0, 0};
-
-CA_BOOL g_dis_silent = CA_FALSE;
+struct ca_debug_context g_debug_context = {0, 0, 0, NULL};
 
 static int g_rsp_regnum = -1;
+
+static CA_BOOL g_quit = CA_FALSE;
 
 /***************************************************************************
 * Exposed helper
@@ -60,6 +62,7 @@ thread_callback (struct thread_info *info, void *data)
 		{
 			segment->m_type   = ENUM_STACK;
 			segment->m_thread.tid = info->num;
+			segment->m_thread.lwp = info->ptid.lwp;
 			segment->m_thread.context = info;
 			if (info->num == 1 && segment->m_vsize > 2*1024*1024)
 			{
@@ -372,6 +375,9 @@ CA_BOOL update_memory_segments_and_heaps(void)
 	struct cleanup *old_chain;
 	CA_BOOL rc = CA_TRUE;
 
+	// reset internal quit flag
+	g_quit = CA_FALSE;
+
 	// set up thread context
 	{
 		// Get current function's low, pc and high instruction addresses
@@ -434,12 +440,18 @@ int get_frame_number(const struct ca_segment* segment, address_t addr, int* offs
 	fp = get_current_frame ();
 	while (fp)
 	{
+		volatile struct gdb_exception except;
 		sp = get_frame_sp(fp);
 		if (addr < sp)
 			break;
 		frame++;
 		*offset = (int)((long)addr - (long)sp);
-		fp = get_prev_frame(fp);
+		TRY_CATCH (except, RETURN_MASK_ERROR)
+		{
+			fp = get_prev_frame(fp);
+		}
+		if (except.reason < 0)
+			break;
 	}
 
 	return frame;
@@ -605,13 +617,33 @@ static CA_BOOL
 add_addr_type(address_t addr, struct type* type, struct symbol* sym)
 {
 	int i;
-	// check duplicate entry
-	for (i = 0; i< addr_type_map_sz; i++)
-	{
-		if (addr >= addr_type_map[i].addr && addr < addr_type_map[i].addr + addr_type_map[i].size)
-			return CA_FALSE;
-	}
 
+	if (sym)
+		type = SYMBOL_TYPE(sym);
+	if (!type)
+		return CA_FALSE;
+
+	CHECK_TYPEDEF(type);
+	if (TYPE_CODE(type) == TYPE_CODE_PTR || TYPE_CODE(type) == TYPE_CODE_REF)
+		type = TYPE_TARGET_TYPE (type);
+
+	// check duplicate entry
+	for (i = addr_type_map_sz - 1; i >= 0; i--)
+	{
+		// The new type is the sub-type of an existing one
+		if (addr >= addr_type_map[i].addr && addr + TYPE_LENGTH(type) <= addr_type_map[i].addr + addr_type_map[i].size)
+			return CA_TRUE;
+		// The new type is the super-type of an existing one
+		else if (addr_type_map[i].addr >= addr && addr_type_map[i].addr + addr_type_map[i].size <= addr + TYPE_LENGTH(type))
+		{
+			addr_type_map[i].addr = addr;
+			addr_type_map[i].type = type;
+			addr_type_map[i].sym  = sym;
+			addr_type_map[i].size = TYPE_LENGTH(type);
+			return CA_TRUE;
+		}
+	}
+	// expand buffer if necessary
 	if (addr_type_map_sz >= addr_type_map_buf_sz)
 	{
 		if (addr_type_map_buf_sz == 0)
@@ -620,28 +652,13 @@ add_addr_type(address_t addr, struct type* type, struct symbol* sym)
 			addr_type_map_buf_sz = addr_type_map_buf_sz * 2;
 		addr_type_map = realloc(addr_type_map, addr_type_map_buf_sz * sizeof(struct ca_addr_type_pair));
 	}
+	// append the newly-discovered type
 	addr_type_map[addr_type_map_sz].addr = addr;
-	if (sym)
-	{
-		type = SYMBOL_TYPE(sym);
-		CHECK_TYPEDEF(type);
-		if (TYPE_CODE(type) == TYPE_CODE_PTR || TYPE_CODE(type) == TYPE_CODE_REF)
-			type = TYPE_TARGET_TYPE (type);
-		addr_type_map[addr_type_map_sz].type = type;
-		addr_type_map[addr_type_map_sz].sym = sym;
-		addr_type_map[addr_type_map_sz].size = TYPE_LENGTH(type);
-	}
-	else if (type)
-	{
-		CHECK_TYPEDEF(type);
-		addr_type_map[addr_type_map_sz].type = type;
-		addr_type_map[addr_type_map_sz].sym = NULL;
-		addr_type_map[addr_type_map_sz].size = TYPE_LENGTH(type);
-	}
-	else
-		return CA_FALSE;
-
+	addr_type_map[addr_type_map_sz].type = type;
+	addr_type_map[addr_type_map_sz].sym = sym;
+	addr_type_map[addr_type_map_sz].size = TYPE_LENGTH(type);
 	addr_type_map_sz++;
+
 	return CA_TRUE;
 }
 
@@ -659,48 +676,93 @@ lookup_type_by_addr(address_t addr)
 	}
 	return NULL;
 }
-/*static struct type*
-lookup_type_by_addr(const struct object_reference* ref, address_t* type_addr)
+
+// return the type of a struct's sub field, located exactly at offset
+// if nested structs exist, drill down to the last non-struct field
+struct type*
+get_struct_field_type_and_name(struct type *basetype,
+				size_t offset, int lea, char* namebuf, size_t bufsz, int* is_vptr)
 {
-	int i;
-	address_t start, end;
+	*namebuf = '\0';
+	CHECK_TYPEDEF (basetype);
+	// deal with pointer type
+	//if (TYPE_CODE(basetype) == TYPE_CODE_PTR || TYPE_CODE(basetype) == TYPE_CODE_REF)
+	//	basetype = TYPE_TARGET_TYPE(basetype);
 
-	if (ref->storage_type == ENUM_HEAP)
+	if (TYPE_CODE(basetype) == TYPE_CODE_STRUCT || TYPE_CODE(basetype) == TYPE_CODE_UNION)
 	{
-		start = ref->where.heap.addr;
-		end   = ref->where.heap.addr + ref->where.heap.size;
-	}
-	else
-	{
-		start = ref->vaddr;
-		end   = start + 1;
-	}
+		int i, num_fields, vptr_fieldno;
+		struct type *vptr_basetype = NULL;
+		// sanity check of offset
+		if (offset >= TYPE_LENGTH(basetype))
+			return NULL;
 
-	// pick up the latest first
-	for (i=addr_type_map_sz-1; i>=0; i--)
-	{
-		if (addr_type_map[i].addr >= start
-			&& addr_type_map[i].addr + TYPE_LENGTH(addr_type_map[i].type) <= end)
-		//if (ref->vaddr >= addr_type_map[i].addr
-		//	&& ref->vaddr < addr_type_map[i].addr + TYPE_LENGTH(addr_type_map[i].type))
+		num_fields = TYPE_NFIELDS (basetype);
+		vptr_fieldno = get_vptr_fieldno (basetype, &vptr_basetype); // -1 if the struct doesn't have a vptr
+		// The first num_baseclasses fields are base classes, followed by type's data member
+		// Their sum is num_fields
+		// Also make sure all field types are fleshed out
+		for (i = 0; i < num_fields; i++)
 		{
-			*type_addr = addr_type_map[i].addr;
-			return addr_type_map[i].type;
+			CHECK_TYPEDEF(TYPE_FIELD_TYPE (basetype, i));
+		}
+		for (i = 0; i < num_fields; i++)
+		{
+			size_t pos, field_size;
+			struct type* field_type = TYPE_FIELD_TYPE (basetype, i);
+			if (TYPE_FIELD_LOC_KIND(basetype, i) != FIELD_LOC_KIND_BITPOS)	// static member
+				continue;
+			pos = TYPE_FIELD_BITPOS(basetype, i) / 8;
+			field_size = field_type->length;
+			if ( i+1 < num_fields
+				&& field_size == 1
+				&& (TYPE_FIELD_BITPOS(basetype, i+1) / 8) == pos )
+				continue;
+			else if (field_size > 0 && offset >= pos && offset < pos + field_size)
+			{
+				const char* field_name = TYPE_FIELD_NAME(basetype, i);
+				size_t namelen = strlen(field_name);
+				strncpy(namebuf, field_name, bufsz);
+				namebuf += namelen;
+				bufsz   -= namelen;
+				// this is the vptr to "vtable for <basetype>"
+				//*sym_addr += pos;
+				//*sym_sz = field_size;
+				if (offset > pos)
+					return get_struct_field_type_and_name(field_type, offset - pos, lea, namebuf, bufsz, is_vptr);
+				else if (i == vptr_fieldno && basetype == vptr_basetype)
+				{
+					*is_vptr = 1;
+					return basetype;
+				}
+				else if (lea)
+					return field_type;
+				else if (TYPE_CODE(field_type) == TYPE_CODE_STRUCT || TYPE_CODE(field_type) == TYPE_CODE_UNION)
+				{
+					struct type* subfield_type;
+					if (bufsz > 1)
+					{
+						*namebuf++ = '.';
+						bufsz--;
+					}
+					subfield_type = get_struct_field_type_and_name(field_type, 0, lea, namebuf, bufsz, is_vptr);
+					// If _vptr belongs to a nested struct, the vtable should be of the outmost struct
+					if (*is_vptr)
+						return field_type;
+					else
+						return subfield_type;
+				}
+				else
+					return field_type;
+			}
 		}
 	}
-	return NULL;
-}*/
-
-/*static struct type *
-get_struct_field_type(struct type *type, size_t offset, address_t* sym_addr, size_t* sym_sz)
-{
-	CHECK_TYPEDEF (type);
-	if (TYPE_CODE(type) == TYPE_CODE_ARRAY)
+	else if (TYPE_CODE(basetype) == TYPE_CODE_ARRAY)
 	{
-		struct type *target_type = check_typedef (TYPE_TARGET_TYPE (type));
+		struct type *target_type = check_typedef (TYPE_TARGET_TYPE (basetype));
 		struct type *range_type;
-		if (TYPE_NFIELDS (type) == 1
-			&& (TYPE_CODE (range_type = TYPE_INDEX_TYPE (type)) == TYPE_CODE_RANGE))
+		if (TYPE_NFIELDS (basetype) == 1
+			&& (TYPE_CODE (range_type = TYPE_INDEX_TYPE (basetype)) == TYPE_CODE_RANGE))
 		{
 			const LONGEST low_bound = TYPE_LOW_BOUND (range_type);
 			const LONGEST high_bound = TYPE_HIGH_BOUND (range_type);
@@ -708,57 +770,28 @@ get_struct_field_type(struct type *type, size_t offset, address_t* sym_addr, siz
 			unsigned int index = low_bound + offset / elem_sz;
 			if (index <= high_bound)
 			{
-				*sym_addr += index * elem_sz;
-				*sym_sz = elem_sz;
-				if (offset > index * elem_sz)
-					return get_struct_field_type(target_type, offset - index * elem_sz, sym_addr, sym_sz);
+				//*sym_addr += index * elem_sz;
+				//*sym_sz = elem_sz;
+				//if (offset > index * elem_sz)
+				//	return get_struct_field_type(target_type, offset - index * elem_sz);
+				if (offset == index * elem_sz)
+				{
+					sprintf(namebuf, "[%d]", index);
+					return target_type;
+				}
 			}
 		}
-		return target_type;
+		return NULL;
 	}
-	else if (TYPE_CODE(type) != TYPE_CODE_STRUCT && TYPE_CODE(type) != TYPE_CODE_UNION)
+	else if (offset == 0)
 	{
-		*sym_addr = *sym_addr + offset;
-		*sym_sz   = TYPE_LENGTH(type);
-		return type;
-	}
-	else
-	{
-		int i, num_fields;
-		// the type must be STRUCT/UNION
-		num_fields = TYPE_NFIELDS (type);
-		// The first num_baseclasses fields are base classes, followed by type's data member
-		// Their sum is num_fields
-		// Also make sure all field types are fleshed out
-		for (i = 0; i < num_fields; i++)
-		{
-			CHECK_TYPEDEF(TYPE_FIELD_TYPE (type, i));
-		}
-		for (i = 0; i < num_fields; i++)
-		{
-			struct type* field_type = TYPE_FIELD_TYPE (type, i);
-			if (TYPE_FIELD_LOC_KIND(type, i) != FIELD_LOC_KIND_BITPOS)	// static member
-				continue;
-			size_t pos = TYPE_FIELD_BITPOS(type, i) / 8;
-			size_t field_size = field_type->length;
-			if ( i+1 < num_fields
-				&& field_size == 1
-				&& (TYPE_FIELD_BITPOS(type, i+1) / 8) == pos )
-				continue;
-			else if (field_size > 0 && offset >= pos && offset < pos + field_size)
-			{
-				*sym_addr += pos;
-				*sym_sz = field_size;
-				if (offset > pos)
-					return get_struct_field_type(field_type, offset - pos, sym_addr, sym_sz);
-				else
-					return field_type;
-			}
-		}
+		//*sym_addr = *sym_addr + offset;
+		//*sym_sz   = TYPE_LENGTH(type);
+		return basetype;
 	}
 
-	return type;
-}*/
+	return NULL;
+}
 
 void clear_addr_type_map(void)
 {
@@ -768,7 +801,7 @@ void clear_addr_type_map(void)
 /////////////////////////////////////////////////////////////////////////
 // Display a reference
 /////////////////////////////////////////////////////////////////////////
-static void
+void
 print_type_name(struct type *type, const char* field_name, const char* prefix, const char* postfix)
 {
 	int deref_count = 0;
@@ -839,7 +872,7 @@ print_type_name(struct type *type, const char* field_name, const char* prefix, c
 
 // the input type is a struct or union
 // return the first field's type if it is a pointer or ref
-static struct type* first_pointer_field(struct type* type)
+/*static struct type* first_pointer_field(struct type* type)
 {
 	int i, num_fields, num_baseclasses;
 	num_fields = TYPE_NFIELDS (type);
@@ -874,7 +907,7 @@ static struct type* first_pointer_field(struct type* type)
 		}
 	}
 	return NULL;
-}
+}*/
 
 // Display the struct's data member at offset
 static void
@@ -981,17 +1014,16 @@ int get_thread_id (const struct ca_segment* segment)
 
 static struct minimal_symbol* get_global_minimal_sym(const struct object_reference* ref, address_t* sym_addr, size_t* sym_sz)
 {
-	struct minimal_symbol *msymbol;
 	struct objfile *objfile;
 	struct obj_section *osect;
-	address_t sect_addr;
-	unsigned int offset;
 
 	//if (ref->storage_type != ENUM_MODULE_DATA)
 	//	return NULL;
 
 	ALL_OBJSECTIONS (objfile, osect)
 	{
+		address_t sect_addr;
+		struct minimal_symbol *msymbol;
 		/* Only process each object file once, even if there's a separate
 		debug file.  */
 		if (objfile->separate_debug_objfile_backlink)
@@ -1003,7 +1035,6 @@ static struct minimal_symbol* get_global_minimal_sym(const struct object_referen
 			&& sect_addr < obj_section_endaddr (osect)
 			&& (msymbol = lookup_minimal_symbol_by_pc_section (sect_addr, osect).minsym))
 		{
-			//msym_name = SYMBOL_PRINT_NAME (msymbol);
 			if (sym_addr && sym_sz)
 			{
 				*sym_addr = SYMBOL_VALUE_ADDRESS (msymbol);
@@ -1011,6 +1042,22 @@ static struct minimal_symbol* get_global_minimal_sym(const struct object_referen
 			}
 			return msymbol;
 		}
+		/*if (obj_section_addr (osect) <= sect_addr
+			&& sect_addr < obj_section_endaddr (osect))
+		{
+			struct minimal_symbol *msymbol;
+			msymbol = lookup_minimal_symbol_by_pc_section (sect_addr, osect).minsym;
+			if (msymbol)
+			{
+				if (sym_addr && sym_sz)
+				{
+					*sym_addr = SYMBOL_VALUE_ADDRESS (msymbol);
+					*sym_sz   = MSYMBOL_SIZE (msymbol);
+				}
+				return msymbol;
+			}
+			break;
+		}*/
 	}
 
 	return NULL;
@@ -1025,7 +1072,7 @@ struct symbol* get_global_sym(const struct object_reference* ref, address_t* sym
 	unsigned int offset;
 	struct symbol* sym = NULL;
 
-	if (ref->storage_type != ENUM_MODULE_DATA)
+	if (ref->storage_type != ENUM_MODULE_DATA && ref->storage_type != ENUM_MODULE_TEXT)
 		return NULL;
 
 	ALL_OBJSECTIONS (objfile, osect)
@@ -1059,10 +1106,9 @@ struct symbol* get_global_sym(const struct object_reference* ref, address_t* sym
 				old_chain = make_cleanup (xfree, loc_string);
 
 				gdb_assert (osect->objfile && osect->objfile->original_name);
-				//obj_name = osect->objfile->name;
 
 				{
-					sym = lookup_symbol_global (loc_string, 0, VAR_DOMAIN);
+					sym = lookup_symbol (loc_string, 0, VAR_DOMAIN, 0);
 					if (sym)
 					{
 						struct type* type = sym->type;
@@ -1094,13 +1140,13 @@ get_stack_sym(const struct object_reference* ref, address_t* sym_addr, size_t* s
 {
 	struct symbol *sym;
 	CA_BOOL found_local_var = CA_FALSE;
-	if (ref->where.stack.frame >= 0)
+	struct ca_segment*segment = get_segment (ref->vaddr, 1);
+	if (ref->where.stack.frame >= 0 && segment && segment->m_type == ENUM_STACK)
 	{
 		struct frame_info* frame;
 		struct block *block;
 		address_t pc;
 		int i;
-		struct ca_segment*segment = get_segment (ref->vaddr, 1);
 		const struct thread_info *tp = (const struct thread_info*) segment->m_thread.context;
 
 		// switch to the thread/frame
@@ -1293,8 +1339,6 @@ void print_heap_ref(const struct object_reference* ref)
 		// some application put multiple objects on a pre-allocated buffer
 		// make sure we get the type right
 		struct ca_addr_type_pair* addr_type = lookup_type_by_addr(ref->vaddr);
-		//if (!addr_type && ref->vaddr != ref->where.heap.addr)
-		//	addr_type = lookup_type_by_addr(ref->where.heap.addr);
 		if (addr_type)
 		{
 			type = addr_type->type;
@@ -1587,7 +1631,9 @@ void print_type_layout (char* exp)
 // SIGINT or Control-C is pressed
 CA_BOOL user_request_break(void)
 {
-	return immediate_quit != 0;
+	if (check_quit_flag ())	// this call will reset the flag
+		g_quit = CA_TRUE;
+	return g_quit;
 }
 
 /*********************************************************************
@@ -1682,9 +1728,7 @@ static struct ca_x86_register g_reg_infos[] = {
 };
 #define NUM_KNOWN_REGS (sizeof(g_reg_infos)/sizeof(g_reg_infos[0]))
 
-struct ca_reg_value g_regs[TOTAL_REGS];
-
-// return the array index of g_reg_infos[] by name
+// return my internal index (g_reg_infos[]::index) by name
 // -1 when not found
 static int reg_name_to_index(const char* regname)
 {
@@ -1740,103 +1784,6 @@ static CA_BOOL ca_get_frame_register(struct frame_info *frame, int regnum, size_
 		return CA_TRUE;
 }
 
-static int ATTRIBUTE_PRINTF (2, 3)
-fprintf_disasm (void *stream, const char *format, ...)
-{
-  va_list args;
-
-  va_start (args, format);
-  if (!g_dis_silent)
-	  vfprintf_filtered (stream, format, args);
-  va_end (args);
-  /* Something non -ve.  */
-  return 0;
-}
-
-static void
-dis_asm_memory_error (int status, bfd_vma memaddr,
-		      struct disassemble_info *info)
-{
-  memory_error (status, memaddr);
-}
-
-static void
-dis_asm_print_address (bfd_vma addr, struct disassemble_info *info)
-{
-  struct gdbarch *gdbarch = info->application_data;
-
-  if (!g_dis_silent)
-	  print_address (gdbarch, addr, info->stream);
-}
-
-static int
-dis_asm_read_memory (bfd_vma memaddr, gdb_byte *myaddr, unsigned int len,
-		     struct disassemble_info *info)
-{
-  return target_read_memory (memaddr, myaddr, len);
-}
-
-static int
-dump_insns(struct gdbarch *gdbarch, struct ui_out *uiout,
-			struct disassemble_info * di, CORE_ADDR low, CORE_ADDR high,
-			int how_many, int flags)
-{
-	int num_displayed = 0;
-	CORE_ADDR pc;
-
-	/* parts of the symbolic representation of the address */
-	int unmapped;
-	int offset;
-	int line;
-	struct cleanup *ui_out_chain;
-
-	for (pc = low; pc < high;)
-	{
-		char *filename = NULL;
-		char *name = NULL;
-
-		QUIT;
-		if (how_many >= 0)
-		{
-			if (num_displayed >= how_many)
-				break;
-			else
-				num_displayed++;
-		}
-		ui_out_chain = make_cleanup_ui_out_tuple_begin_end(uiout, NULL);
-		if (!g_dis_silent)
-		{
-			ui_out_text(uiout, pc_prefix(pc));
-			ui_out_field_core_addr(uiout, "address", gdbarch, pc);
-
-			if (!build_address_symbolic(gdbarch, pc, 0, &name, &offset, &filename,
-					&line, &unmapped))
-			{
-				ui_out_text(uiout, " <");
-				if ((flags & DISASSEMBLY_OMIT_FNAME) == 0)
-					ui_out_field_string(uiout, "func-name", name);
-				ui_out_text(uiout, "+");
-				ui_out_field_int(uiout, "offset", offset);
-				ui_out_text(uiout, ">:\t");
-			} else
-				ui_out_text(uiout, ":\t");
-
-			if (filename != NULL)
-				xfree(filename);
-			if (name != NULL)
-				xfree(name);
-		}
-
-		{
-			di->disassembler_options = "att"; //att_flavor;
-			pc += ca_print_insn_i386 (pc, di);
-		}
-		do_cleanups(ui_out_chain);
-		//ui_out_text(uiout, "\n");
-	}
-	return num_displayed;
-}
-
 static int sse_class(struct type* type)
 {
 	if (TYPE_CODE(type) == TYPE_CODE_FLT)
@@ -1878,7 +1825,7 @@ static int integer_class(struct type* type)
 #define MAX_FLT_PARAM_BY_REG 8
 
 static CA_BOOL
-validate_and_set_reg_param(const char* cursor)
+validate_and_set_reg_param(const char* cursor, struct ca_reg_value* param_regs)
 {
 	int ptr_bit = g_ptr_bit;
 	int i;
@@ -1893,8 +1840,8 @@ validate_and_set_reg_param(const char* cursor)
 			if (strncmp(cursor, reg_name, len) == 0 && *(cursor + len) == '=')
 			{
 				int index = g_reg_infos[i].index;
-				g_regs[index].known = 1;
-				g_regs[index].value = parse_and_eval_address ((char*)(cursor + len + 1));
+				param_regs[index].has_value = 1;
+				param_regs[index].value = parse_and_eval_address ((char*)(cursor + len + 1));
 				return CA_TRUE;
 			}
 		}
@@ -1902,44 +1849,11 @@ validate_and_set_reg_param(const char* cursor)
 	return CA_FALSE;
 }
 
-#define MAX_NUM_OPTIONS 32
-// End each option with '\0', return number of options
-static int parse_options(char* arg, char** out)
-{
-	int count = 0;
-	char* cursor = arg;
-	char* end    = arg + strlen(arg);
-	while (cursor < end && *cursor)
-	{
-		if (*cursor == ' ' || *cursor == '\t')
-			cursor++;
-		else
-		{
-			char* next = cursor + 1;
-			// push this option to the back of the array
-			out[count] = cursor;
-			count++;
-			if (count > MAX_NUM_OPTIONS)
-			{
-				printf_filtered ("Warning: Too many options > %d\n", MAX_NUM_OPTIONS);
-				return count;
-			}
-			// end this option with '\0'
-			// find the end of this argument
-			while (*next && *next != ' ' && *next != '\t')
-				next++;
-			*next = '\0';
-			cursor = next + 1;
-		}
-	}
-	return count;
-}
-
 /*
  * By x86_64 ABI, the frist six integer parameters are passed through
  *  registers (rdi, rsi, rdx, rcx, r8, r9)
  */
-static void get_function_parameters(struct frame_info *selected_frame)
+static void get_function_parameters(struct gdbarch *gdbarch, struct frame_info *selected_frame, struct ca_reg_value* param_regs)
 {
 	int ptr_bit = g_ptr_bit;
 	struct ui_out *uiout = current_uiout;
@@ -1968,8 +1882,7 @@ static void get_function_parameters(struct frame_info *selected_frame)
 			//old_chain = make_cleanup_ui_out_stream_delete (stb);
 			stb = mem_fileopen ();
 			old_chain = make_cleanup_ui_file_delete (stb);
-			if (!g_dis_silent)
-				printf_filtered (_("\nParameters: "));
+			printf_filtered (_("\nParameters: "));
 			b = SYMBOL_BLOCK_VALUE (func);
 			ALL_BLOCK_SYMBOLS (b, iter, sym)
 			{
@@ -1991,17 +1904,14 @@ static void get_function_parameters(struct frame_info *selected_frame)
 					else
 						sym = nsym;
 				}
-				if (num_params && !g_dis_silent)
+				if (num_params)
 					ui_out_text (uiout, ", ");
 				//ui_out_wrap_hint (uiout, "    "); // if line overflows, start a new line and indent
 				list_chain = make_cleanup_ui_out_tuple_begin_end (uiout, NULL);
-				if (!g_dis_silent)
-				{
-					fprintf_symbol_filtered (stb, SYMBOL_PRINT_NAME (sym),
-											SYMBOL_LANGUAGE (sym),
-											DMGL_PARAMS | DMGL_ANSI);
-					ui_out_field_stream (uiout, "name", stb);
-				}
+				fprintf_symbol_filtered (stb, SYMBOL_PRINT_NAME (sym),
+										SYMBOL_LANGUAGE (sym),
+										DMGL_PARAMS | DMGL_ANSI);
+				ui_out_field_stream (uiout, "name", stb);
 				// find the corresponding register used to pass this parameter
 				{
 					const char* reg_name = NULL;
@@ -2026,16 +1936,22 @@ static void get_function_parameters(struct frame_info *selected_frame)
 						reg_index = g_reg_infos[internal_index].index;
 					}
 					// we have determine a register class parameter and its register
-					if (!g_dis_silent && reg_name)
+					if (reg_name)
 					{
 						fputs_filtered ("(", stb);
 						fputs_filtered (reg_name, stb);
 						fputs_filtered (")", stb);
 						ui_out_field_stream (uiout, "reg", stb);
 					}
+					if (reg_index >= 0)
+					{
+						if (param_regs[reg_index].sym_name)
+							free (param_regs[reg_index].sym_name);
+						param_regs[reg_index].sym_name = strdup(SYMBOL_PRINT_NAME (sym));
+						param_regs[reg_index].type = param_type;
+					}
 				}
-				if (!g_dis_silent)
-					ui_out_text (uiout, "=");
+				ui_out_text (uiout, "=");
 
 				val = read_var_value (sym, selected_frame);
 				if (val)
@@ -2045,45 +1961,45 @@ static void get_function_parameters(struct frame_info *selected_frame)
 					struct value_print_options opts;
 					volatile struct gdb_exception ex;
 
-					if (!g_dis_silent)
+					if (language_mode == language_mode_auto)
+						language = language_def (SYMBOL_LANGUAGE (sym));
+					else
+						language = current_language;
+					get_user_print_options (&opts);
+					opts.deref_ref = 0;
+					opts.summary = summary;
+					TRY_CATCH (ex, RETURN_MASK_ERROR)
 					{
-						if (language_mode == language_mode_auto)
-							language = language_def (SYMBOL_LANGUAGE (sym));
-						else
-							language = current_language;
-						get_user_print_options (&opts);
-						opts.deref_ref = 0;
-						opts.summary = summary;
-						TRY_CATCH (ex, RETURN_MASK_ERROR)
-						{
-							common_val_print (val, stb, 2, &opts, language);
-							ui_out_field_stream (uiout, "value", stb);
-						}
+						common_val_print (val, stb, 2, &opts, language);
+						ui_out_field_stream (uiout, "value", stb);
 					}
-					if (reg_index >= 0 && !g_regs[reg_index].known && !value_optimized_out(val))
+					if (reg_index >= 0 && !param_regs[reg_index].has_value && !value_optimized_out(val))
 					{
 						TRY_CATCH (ex, RETURN_MASK_ERROR)
 						{
 							size_t param_val = (size_t) value_as_long (val);
-							g_regs[reg_index].value = param_val;
+							param_regs[reg_index].value = param_val;
 							if ((TYPE_CODE(param_type) == TYPE_CODE_PTR || TYPE_CODE(param_type) == TYPE_CODE_REF))
 								add_addr_type (param_val, NULL, sym);
 						}
 						if (ex.reason >= 0)
-							g_regs[reg_index].known = 1;
+							param_regs[reg_index].has_value = 1;
 					}
 				}
 				do_cleanups (list_chain);
 				num_params++;
 			}
 			do_cleanups (old_chain);
-			if (!g_dis_silent)
-				printf_filtered (_("\n"));
+			printf_filtered (_("\n"));
 		}
 	}
 }
 
-static void display_saved_registers(struct gdbarch *gdbarch, struct frame_info *selected_frame)
+static void
+display_saved_registers(struct gdbarch *gdbarch,
+					struct frame_info *selected_frame,
+					struct ca_reg_value* param_regs,
+					CA_BOOL verbose)
 {
 	int i, count, numregs;
 	int ptr_bit = g_ptr_bit;
@@ -2106,7 +2022,7 @@ static void display_saved_registers(struct gdbarch *gdbarch, struct frame_info *
 				const char* regname = gdbarch_register_name (gdbarch, i);
 				int my_index = reg_name_to_index(regname);
 				size_t value = 0;
-				if (!g_dis_silent)
+				if (verbose)
 				{
 					if (count > 0)
 						puts_filtered (",");
@@ -2115,20 +2031,19 @@ static void display_saved_registers(struct gdbarch *gdbarch, struct frame_info *
 				count++;
 				if (target_read_memory(addr, (void*)&value, ptr_sz) == 0)
 				{
-					if (my_index >= 0 && my_index != RIP)	// Never roll back RIP from saved value
+					if (param_regs && my_index >= 0)
 					{
 						// the value should have been set previously, set it again anyway
-						g_regs[my_index].saved = 1;
-						g_regs[my_index].value = g_regs[my_index].saved_value = value;
-						g_regs[my_index].known = 1;
+						param_regs[my_index].value = value;
+						param_regs[my_index].has_value = 1;
 					}
-					if (!g_dis_silent)
+					if (verbose)
 						printf_filtered ("(0x%lx)", value);
 				}
 			}
 		}
 	}
-	if (!g_dis_silent && count == 0)
+	if (verbose && count == 0)
 		printf_filtered (_(" none"));
 }
 
@@ -2148,6 +2063,9 @@ void decode_func(char *arg)
 	CA_BOOL multi_frame = CA_FALSE;
 	int frame_lo, frame_hi, frame;
 	struct ca_reg_value user_input_regs[TOTAL_REGS];
+	struct ca_reg_value param_regs[TOTAL_REGS];
+	CA_BOOL verbose = CA_FALSE;
+	CA_BOOL user_regs = CA_FALSE;
 
 	// Get current frame
 	selected_frame = get_selected_frame (_("No frame selected."));
@@ -2158,8 +2076,9 @@ void decode_func(char *arg)
 	gdbarch = get_frame_arch (selected_frame);
 	build_regno_map(gdbarch);
 
-	// clean registers' state
-	memset(g_regs, 0, sizeof(g_regs));
+	// Init registers' state
+	memset(param_regs, 0, REG_SET_SZ);
+	memset(user_input_regs, 0, REG_SET_SZ);
 
 	// initialize type map for heap objects
 	clear_addr_type_map();
@@ -2168,19 +2087,22 @@ void decode_func(char *arg)
 	if (arg)
 	{
 		char* options[MAX_NUM_OPTIONS];
-		int num_options = parse_options(arg, options);
+		int num_options = ca_parse_options(arg, options);
 		for (i = 0; i < num_options; i++)
 		{
 			char* option = options[i];
 			if (*option == '%')
 			{
 				// Take register entry value, such as %rdi=0x12345678
-				if (!validate_and_set_reg_param(option+1))
+				if (!validate_and_set_reg_param(option+1, user_input_regs))
 				{
 					printf_filtered ("Error: unsupported register: %s\n", option);
 					return;
 				}
+				user_regs = CA_TRUE;
 			}
+			else if (strcmp(option, "/v") == 0)
+				verbose = CA_TRUE;
 			else if (strncmp(option, "from=", 5) == 0)
 			{
 				// disassemble from this address instead of function start
@@ -2248,13 +2170,6 @@ void decode_func(char *arg)
 			}
 		}
 	}
-	// if user chooses starting point other than function entry
-	// user input register values take effect when disassembling passes the chosen starting instruction
-	if (user_low)
-	{
-		memcpy(user_input_regs, g_regs, sizeof(g_regs));
-		memset(g_regs, 0, sizeof(g_regs));
-	}
 
 	// if user chooses a frame other than the current frame
 	// get the frame by number
@@ -2277,8 +2192,10 @@ void decode_func(char *arg)
 	{
 		CORE_ADDR pc, dis_lo, dis_hi, sp, func_lo, func_hi;
 		const char *funcname;
-		CA_BOOL dis_in_two_steps = CA_FALSE;
 
+		g_debug_context.frame_level = frame_relative_level(selected_frame);
+		g_debug_context.sp = get_frame_sp (selected_frame);
+		g_debug_context.segment = get_segment(g_debug_context.sp, 1);
 		// Get function's instruction address range
 		pc = get_frame_pc (selected_frame); // include the "call" instr
 		if (frame == 0)
@@ -2290,14 +2207,11 @@ void decode_func(char *arg)
 		dis_lo = func_lo;
 		dis_hi = pc;
 
-		// rsp & rip at function entry
-		g_regs[RSP].known = 1;
-		g_regs[RIP].known = 1;
+		// rsp at function entry
 		sp = get_frame_base (selected_frame);	// sp address before function prologue
-		g_regs[RSP].value = sp - ptr_sz; 		// "CALL" would push return address on stack
-		g_regs[RIP].value = dis_lo;
+		param_regs[RSP].value = sp - ptr_sz; 	// "CALL" would push return address on stack
+		param_regs[RSP].has_value = 1;
 
-		g_dis_silent = CA_FALSE;
 		// For single frame, or the 1st frame of multi-frame disassembling
 		// validate user-input start/end instruction addresses
 		if (!multi_frame || frame == frame_hi)
@@ -2309,16 +2223,9 @@ void decode_func(char *arg)
 					printf_filtered ("Error: input start address 0x%lx is out of the function range\n", user_low);
 					return;
 				}
-				else if (user_low == func_lo)
-					user_low = 0;
-				else
-				{
-					// If user chooses to disassemble from a spot inside the function, we still
-					// do the disassembling from the function start silently until the chosen spot
-					dis_in_two_steps = CA_TRUE;
-					g_dis_silent = CA_TRUE;
-				}
 			}
+			else
+				user_low = func_lo;
 			if (user_high)
 			{
 				if (user_high < func_lo || user_high > func_hi)
@@ -2341,36 +2248,37 @@ void decode_func(char *arg)
 				|| (ptr_bit == 32 && g_reg_infos[i].preserved_x32) )
 			{
 				int index = g_reg_infos[i].index;
-				if (ca_get_frame_register (selected_frame, g_reg_infos[i].gdb_regnum, &g_regs[index].value))
-					g_regs[index].known = 1;
+				if (ca_get_frame_register (selected_frame, g_reg_infos[i].gdb_regnum, &param_regs[index].value))
+					param_regs[index].has_value = 1;
 			}
 		}
 
 		// parameters at function entry
-		get_function_parameters(selected_frame);
+		get_function_parameters(gdbarch, selected_frame, param_regs);
 
 		// Debugger may know better what registers are saved across function call
 		// mark saved registers
-		if (!g_dis_silent)
+		if (verbose)
 			printf_filtered (_("\nSaved registers:"));
-		display_saved_registers(gdbarch, selected_frame);
-		if (!g_dis_silent)
+		display_saved_registers(gdbarch, selected_frame, param_regs, verbose);
+		if (verbose)
 			printf_filtered (_("\n"));
-		g_regs[RSP].saved_value = g_regs[RSP].value;
-		g_regs[RSP].saved = 1;
 
 		// display the registers at function entry
-		if (!g_dis_silent)
+		if (verbose)
 		{
 			printf_filtered (_("\nThe following registers are assumed at the beginning: "));
 			count = 0;
 			for (i=0; i<TOTAL_REGS; i++)
 			{
-				if (g_regs[i].known)
+				// saved RIP is the next instruction address when current function returns
+				if (param_regs[i].has_value && i != RIP)
 				{
 					if (count > 0)
 						printf_filtered (_(", "));
-					printf_filtered (_("%s=0x%lx"), g_reg_infos[i].name, g_regs[i].value);
+					printf_filtered (_("%s=0x%lx"), g_reg_infos[i].name, param_regs[i].value);
+					if (param_regs[i].sym_name)
+						printf_filtered (_("(%s)"), param_regs[i].sym_name);
 					count++;
 				}
 			}
@@ -2379,86 +2287,47 @@ void decode_func(char *arg)
 			printf_filtered (_("\n"));
 		}
 
-		//print_disassembly (gdbarch, name, low, pc, DISASSEMBLY_OMIT_FNAME);
 		printf_filtered ("\nDump of assembler code for function %s:\n", funcname);
-		//gdb_disassembly (gdbarch, uiout, 0, DISASSEMBLY_OMIT_FNAME, -1, low, pc);
 		{
-			//struct ui_stream *stb = ui_out_stream_new (uiout);
-			//struct cleanup *cleanups = make_cleanup_ui_out_stream_delete (stb);
-			struct disassemble_info di;
-			int how_many = -1;
-			int flags = DISASSEMBLY_OMIT_FNAME;
-			//gdb_disassemble_info (gdbarch, stb->stream);
-			{
-				struct ui_file *file = gdb_stdout; //stb->stream;
-				init_disassemble_info (&di, file, fprintf_disasm);
-				di.flavour = bfd_target_unknown_flavour;
-				di.memory_error_func = dis_asm_memory_error;
-				di.print_address_func = dis_asm_print_address;
-				di.read_memory_func = dis_asm_read_memory;
-				di.arch = gdbarch_bfd_arch_info (gdbarch)->arch;
-				di.mach = gdbarch_bfd_arch_info (gdbarch)->mach;
-				di.endian = gdbarch_byte_order (gdbarch);
-				di.endian_code = gdbarch_byte_order_for_code (gdbarch);
-				di.application_data = gdbarch;
-				disassemble_init_for_target (&di);
-			}
+			int num_displayed = 0;
+			struct cleanup *ui_out_chain;
+			struct decode_control_block decode_cb;
 
-			//do_assembly_only (gdbarch, uiout, &di, low, high, how_many, flags, stb);
-			{
-				int num_displayed = 0;
-				struct cleanup *ui_out_chain;
+			ui_out_chain = make_cleanup_ui_out_list_begin_end (uiout, "asm_insns");
 
-				ui_out_chain = make_cleanup_ui_out_list_begin_end (uiout, "asm_insns");
+			decode_cb.gdbarch = gdbarch;
+			decode_cb.uiout   = uiout;
+			decode_cb.low     = user_low;
+			decode_cb.high    = dis_hi;
+			decode_cb.current = pc;
+			decode_cb.func_start = func_lo;
+			decode_cb.func_end   = func_hi;
+			//decode_cb.how_many = how_many;
+			//decode_cb.flags    = flags;
+			decode_cb.param_regs = param_regs;
+			if (user_regs)
+				decode_cb.user_regs = user_input_regs;
+			else
+				decode_cb.user_regs = NULL;
+			decode_cb.verbose    = verbose ? 1:0;
+			decode_cb.innermost_frame = frame == 0 ? 1:0;
 
-				if (dis_in_two_steps)
-				{
-					CORE_ADDR tmp_hi = dis_hi;
-					// First disassemble silently the first part of the function from beginning
-					dis_hi = user_low;
-					num_displayed = dump_insns (gdbarch, uiout, &di, dis_lo, dis_hi, how_many,
-											flags/*, stb*/);
-					// update register values with user inputs
-					dis_lo = user_low;
-					dis_hi = tmp_hi;
-					for (i = 0; i < TOTAL_REGS; i++)
-					{
-						if (user_input_regs[i].known)
-						{
-							g_regs[i].known = 1;
-							g_regs[i].value = user_input_regs[i].value;
-						}
-					}
-					// Then continue disassembling from the user-chosen start point
-					dis_in_two_steps = CA_FALSE;
-					g_dis_silent = CA_FALSE;
-					num_displayed += dump_insns (gdbarch, uiout, &di, dis_lo, dis_hi, how_many,
-											flags/*, stb*/);
-				}
-				else
-				{
-					num_displayed = dump_insns (gdbarch, uiout, &di, dis_lo, dis_hi, how_many,
-											flags/*, stb*/);
-				}
-				//do_cleanups (ui_out_chain);
-			}
-
-			//do_cleanups (cleanups);
+			num_displayed = decode_insns(&decode_cb);
 		}
 		printf_filtered ("End of assembler dump.\n");
 
 		// display registers at the call site if this is not the innermost function
-		if (frame > 0)
+		if (frame > 0 && verbose)
 		{
 			printf_filtered (_("\nThe following registers are known at the call: "));
 			count = 0;
 			for (i=0; i<TOTAL_REGS; i++)
 			{
-				if (g_regs[i].known)
+				if (param_regs[i].has_value)
 				{
 					if (count > 0)
 						printf_filtered (_(", "));
-					printf_filtered (_("%s=0x%lx"), g_reg_infos[i].name, g_regs[i].value);
+					printf_filtered (_("%s=0x%lx"), g_reg_infos[i].name, param_regs[i].value);
 					count++;
 				}
 			}
@@ -2476,31 +2345,26 @@ void decode_func(char *arg)
 		else
 		{
 			// if there is a next frame, get the saved registers to collaborate our deduced values
-			if (frame_relative_level(selected_frame) > 0)
+			if (verbose && frame_relative_level(selected_frame) > 0)
 			{
-				memset(g_regs, 0, sizeof(g_regs));
 				selected_frame = get_next_frame(selected_frame);
 				printf_filtered (_("\nRegisters saved by the next frame:"));
-				display_saved_registers(gdbarch, selected_frame);
+				display_saved_registers(gdbarch, selected_frame, NULL, verbose);
 				printf_filtered (_("\n"));
 				count = 0;
-				printf_filtered (_("\nRegisters preserved by callees:"));
+				printf_filtered (_("\nRegisters preserved by callee:"));
 				for (i = 0; i < NUM_KNOWN_REGS; i++)
 				{
 					if ( (ptr_bit == 64 && g_reg_infos[i].preserved_x64)
 						|| (ptr_bit == 32 && g_reg_infos[i].preserved_x32) )
 					{
-						int index = g_reg_infos[i].index;
-						//if (!g_regs[index].saved)
+						size_t value;
+						if (ca_get_frame_register (selected_frame, g_reg_infos[i].gdb_regnum, &value))
 						{
-							size_t value;
-							if (ca_get_frame_register (selected_frame, g_reg_infos[i].gdb_regnum, &value))
-							{
-								if (count > 0)
-									printf_filtered (_(", "));
-								count++;
-								printf_filtered (_(" %s=0x%lx"), g_reg_infos[i].name, value);
-							}
+							if (count > 0)
+								printf_filtered (_(", "));
+							count++;
+							printf_filtered (_(" %s=0x%lx"), g_reg_infos[i].name, value);
 						}
 					}
 				}
@@ -2511,6 +2375,17 @@ void decode_func(char *arg)
 			break;
 		}
 	} while (1);
+
+	// scrub and clean register values
+	for (i = 0; i < TOTAL_REGS; i++)
+	{
+		if (param_regs[i].sym_name)
+			free(param_regs[i].sym_name);
+		if (user_input_regs[i].sym_name)
+			free(user_input_regs[i].sym_name);
+	}
+	memset(param_regs, 0, REG_SET_SZ);
+	memset(user_input_regs, 0, REG_SET_SZ);
 
 	// flush output
 	gdb_flush (gdb_stdout);
@@ -2540,14 +2415,14 @@ void print_op_value_context(size_t op_value, int op_size, address_t loc, int off
 		if ( (aref.storage_type == ENUM_MODULE_TEXT || aref.storage_type == ENUM_MODULE_DATA)
 			&& known_global_sym(&aref, NULL, NULL) )
 		{
-			// stack symbol
+			// global symbol
 			printf_filtered (" ");
 			print_ref(&aref, 0, CA_FALSE, CA_TRUE);
 			return;
 		}
 		else if (aref.storage_type == ENUM_STACK && known_stack_sym(&aref, NULL, NULL))
 		{
-			// global symbol
+			// stack symbol
 			printf_filtered (" ");
 			print_ref(&aref, 0, CA_FALSE, CA_TRUE);
 			return;
@@ -2612,4 +2487,138 @@ void print_op_value_context(size_t op_value, int op_size, address_t loc, int off
 	}
 
 	printf_filtered ("\n");
+}
+
+void calc_heap_usage(char *exp)
+{
+	struct expression *expr;
+	struct cleanup *old_chain = make_cleanup (null_cleanup, NULL);
+	struct value *val;
+
+	expr = parse_expression (exp);
+	make_cleanup (free_current_contents, &expr);
+	val = evaluate_expression (expr);
+	if (val && value_type(val))
+	{
+		struct type *type = value_type (val);
+		enum lval_type val_type;
+		size_t var_len;
+		size_t ptr_sz = g_ptr_bit >> 3;
+
+		CHECK_TYPEDEF(type);
+		var_len = TYPE_LENGTH(type);
+		val_type = value_lval_const (val);
+
+		// treat all integer (short,int,long), e.g. 0x100, as pointer
+		if (TYPE_CODE(type) == TYPE_CODE_INT)
+			var_len = ptr_sz;
+
+		if (var_len >= ptr_sz)
+		{
+			struct object_reference ref;
+			ref.vaddr = 0;
+			ref.value = 0;
+
+			if (TYPE_CODE(type) == TYPE_CODE_INT)
+			{
+				ref.vaddr = value_as_address(val);
+				fill_ref_location(&ref);
+				if (ref.storage_type != ENUM_HEAP || !ref.where.heap.inuse)
+					ref.vaddr = 0;
+			}
+			else if (val_type == lval_memory)
+			{
+				ref.vaddr = value_address (val);
+				fill_ref_location(&ref);
+			}
+			else if (val_type == lval_register)
+			{
+				ref.storage_type = ENUM_REGISTER;
+				ref.vaddr = value_as_address(val);
+				ref.value = ref.vaddr;
+				ref.where.reg.tid = pid_to_thread_id (inferior_ptid);
+				ref.where.reg.reg_num = VALUE_REGNUM(val);
+				ref.where.reg.name = NULL;
+			}
+			else
+				printf_filtered("Expect input expression is associated with a register or memory\n");
+
+			// we understand the input expression enough
+			if (ref.vaddr)
+			{
+				struct inuse_block *inuse_blocks = NULL;
+				unsigned long num_inuse_blocks;
+
+				// First, create and populate an array of all in-use blocks
+				inuse_blocks = build_inuse_heap_blocks(&num_inuse_blocks);
+				if (!inuse_blocks || num_inuse_blocks == 0)
+				{
+					printf_filtered("Failed: no in-use heap block is found\n");
+				}
+				else
+				{
+					unsigned long aggr_count = 0;
+					size_t aggr_size = 0;
+					if (calc_aggregate_size(&ref, var_len, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count))
+					{
+						print_ref(&ref, 0, CA_FALSE, CA_FALSE);
+						CA_PRINT("    |--> ");
+						print_size(aggr_size);
+						CA_PRINT(" (%ld blocks)\n", aggr_count);
+					}
+					else
+						CA_PRINT("Failed to calculate heap usage\n");
+					// remember to cleanup
+					free_inuse_heap_blocks (inuse_blocks, num_inuse_blocks);
+				}
+			}
+		}
+		else
+			printf_filtered("Input expression doesn't reference any heap memory(type_len=%ld)\n", var_len);
+	}
+	else
+		printf_filtered("Can't understand the input expression\n");
+
+	do_cleanups (old_chain);
+}
+
+/*
+ * A simple progress bar for commands taking long time
+ */
+#define DEFAULT_WIDTH 80
+static unsigned long pb_total = 0;
+static int screen_width;
+static int scrren_height;
+static int pb_cur_pos;
+void init_progress_bar(unsigned long total)
+{
+	pb_total = total;
+
+	screen_width = 0;
+	scrren_height = 0;
+	rl_get_screen_size(&scrren_height, &screen_width);
+	if (screen_width == 0)
+		screen_width = DEFAULT_WIDTH;
+	pb_cur_pos = 0;
+}
+
+void set_current_progress(unsigned long val)
+{
+	int pos = val * screen_width / pb_total;
+	while (pos > pb_cur_pos)
+	{
+		CA_PRINT(".");
+		pb_cur_pos++;
+	}
+	fflush (stdout);
+}
+
+void end_progress_bar(void)
+{
+	CA_PRINT("\n");
+}
+
+address_t ca_eval_address(const char* expr)
+{
+	return parse_and_eval_address(expr);
 }

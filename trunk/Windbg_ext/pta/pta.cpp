@@ -8,14 +8,20 @@
 #include "search.h"
 #include "heap.h"
 #include "stl_container.h"
-#include "ca_i386.h"
+#include "decode.h"
 
 extern size_t g_align;
+
+static unsigned int g_num_adjacent_blocks = 10;
+
+unsigned int get_num_adjacent_blocks_to_display (void)
+{
+	return g_num_adjacent_blocks;
+}
 
 /////////////////////////////////////////////////////
 // Forwarded functions
 /////////////////////////////////////////////////////
-static void print_segment(struct ca_segment*);
 static bool enter_command(PDEBUG_CLIENT4);
 static void leave_command();
 static void print_sym_group(PDEBUG_SYMBOL_GROUP2);
@@ -130,165 +136,37 @@ DebugExtensionUninitialize(void)
 /////////////////////////////////////////////////////
 DECLARE_API ( help )
 {
-    dprintf("Help for extension ref.dll\n"
-			"   ref <addr> [size] [level] - Search references to object at <addr>; optional object size and levels of indirect reference\n"
-			"   tref <addr> [size] [level] - Similar to <ref> command except references are searched in thread contexts only\n"
-			"   obj <expr> - Extended function of Windbg \"s -v <Range> <Object>\" command - Search for object and reference to object of the same type as the input expression\n"
-    		"   shrobj [tid0] [tid1] [...] - Find objects that currently referenced from multiple threads\n"
-    		"\n"
-    		"   block <addr>       - Heap block informatoin for given address\n"
-            "   heap  [addr] [/v] [/leak]  - Walk heap for possible memory corruption, and/or memory layout information\n"
-    		"   big   <num>        - Biggest heap memory blocks and their owners\n"
-    		"\n"
-			"   segment [addr]     - Print process' virtual address space\n"
-			"   pattern <start> <end> - Reveal the data pattern within the given range\n"
-    		"   decode [reg=<val>] [from=<addr>] [to=<addr>|end] - Disassemble current function with detail annotation of object context\n"
-    		"\n"
-    		"   shrobj_level [n]   - Set/Show the indirection level of shared-object search\n"
-    		"   max_ref_level [n]  - Set/Show the maximum levels of indirection"
-    		"   set <addr> <val>   - Set a pseudo value at address"
-    		"   unset <addr>       - Undo the pseudo value at address"
-            "   help               - Shows this help\n"
-            );
+	dprintf(ca_help_msg);
+}
+DECLARE_API ( ca_help )
+{
+	dprintf(ca_help_msg);
 }
 
 //////////////////////////////////////////////////////////////
 // Interfaces to Windbg
 //////////////////////////////////////////////////////////////
 HRESULT CALLBACK
-block(PDEBUG_CLIENT4 Client, PCSTR args)
-{
-	if (!args || strlen(args)==0)
-	{
-		dprintf("Please see help for this command's usage\n");
-		return E_FAIL;
-	}
-
-	if (!enter_command(Client))
-		return E_FAIL;
-
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
-
-	address_t addr = GetExpression(args);
-
-	struct heap_block heap_block;
-	if (addr && get_heap_block_info(addr, &heap_block))
-	{
-		if (heap_block.inuse)
-			dprintf("\t[In-use]\n");
-		else
-			dprintf("\t[Free]\n");
-
-		dprintf("\t[Address] "PRINT_FORMAT_POINTER"\n", heap_block.addr);
-		dprintf("\t[Size]    "PRINT_FORMAT_SIZE"\n", heap_block.size);
-		dprintf("\t[Offset] +"PRINT_FORMAT_SIZE"\n", addr - heap_block.addr);
-	}
-	else
-		dprintf("[Error] Failed to query the memory block "PRINT_FORMAT_POINTER"\n", addr);
-
-	leave_command();
-    return S_OK;
-}
-
-HRESULT CALLBACK
 heap(PDEBUG_CLIENT4 Client, PCSTR args)
 {
 	if (!enter_command(Client))
 		return E_FAIL;
 
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
+	char* args_buf = NULL;
+	if (args && strlen(args))
+		args_buf = strdup(args);
 
-    address_t addr = 0;
-    CA_BOOL verbose = CA_FALSE;
-    CA_BOOL leak_check = CA_FALSE;
-    if (args)
-    {
-    	// make a local copy
-    	char* buf = strdup(args);
-    	char* buf_orig = buf;
-        while (*buf)
-        {
-    		while (*buf && isspace(*buf))
-    			buf++;
+	CA_BOOL rc = heap_command_impl(args_buf);
 
-        	if (buf[0] == '/' && buf[1] == 'v')
-        	{
-        		verbose = CA_TRUE;
-        		buf += 2;
-        	}
-        	else if (strcmp(buf, "/leak") == 0)
-        	{
-        		leak_check = CA_TRUE;
-        		break;
-        	}
-        	else
-        	{
-        		// replace rear space with '\0'
-        		char* cursor = buf;
-        		while (*cursor && !isspace(*cursor))
-        			cursor++;
-        		if (*cursor)
-        			*cursor = '\0';
-        		addr = GetExpression(buf);
-        		break;
-        	}
-        }
-    	// clean up
-    	free(buf_orig);
-    }
-
-    if (leak_check)
-    	display_heap_leak_candidates();
-    else if (addr)
-    {
-    	if (!heap_walk(addr, verbose))
-    		dprintf("[Error] Failed to show the related arena "PRINT_FORMAT_POINTER"\n", addr);
-    }
-    else if (!heap_walk(0, verbose))
-    	dprintf("[Error] Failed to walk heap\n");
+	if (args_buf)
+		free(args_buf);
 
     leave_command();
-    return S_OK;
-}
 
-HRESULT CALLBACK
-big(PDEBUG_CLIENT4 Client, PCSTR args)
-{
-	if (!args || strlen(args)==0)
-	{
-		dprintf("Please see help for this command's usage\n");
-		return E_FAIL;
-	}
-
-	if (!enter_command(Client))
-		return E_FAIL;
-
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
-
-	unsigned int n = (unsigned int) GetExpression(args);
-	if (n == 0)
-	{
-		dprintf ("Input number of biggest heap memory blocks to display");
-		leave_command();
-		return S_OK;
-	}
-
-	biggest_blocks(n);
-
-	leave_command();
-    return S_OK;
+    if (rc)
+    	return S_OK;
+    else
+    	return E_FAIL;
 }
 
 /////////////////////////////////////////////////////
@@ -297,164 +175,85 @@ big(PDEBUG_CLIENT4 Client, PCSTR args)
 HRESULT CALLBACK
 ref (PDEBUG_CLIENT4 Client, PCSTR args)
 {
-	if (!args || strlen(args)==0)
-	{
-		dprintf("Please see help for this command's usage\n");
-		return E_FAIL;
-	}
-
 	if (!enter_command(Client))
 		return E_FAIL;
 
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
+	char* args_buf = NULL;
+	if (args && strlen(args))
+		args_buf = strdup(args);
 
-	// Get input
-	int argc = 0;
-	address_t addr;
-	size_t size = 1;
-	int level = 1;
-	ULONG64 val;
+	CA_BOOL rc = ref_command_impl(args_buf);
 
-	PCSTR remainder = NULL;
-	if (!GetExpressionEx(args, (ULONG64*) &addr, &remainder) || addr == 0)
-	{
-		dprintf("Error: Invalid address argument\n");
-		leave_command();
-		return E_INVALIDARG;
-	}
-	else
-		argc++;
-
-	PCSTR  remainder2 = NULL;
-	if (remainder && GetExpressionEx(remainder, (ULONG64*) &size, &remainder2))
-	{
-		if (size > 0)
-		{
-			argc++;
-			PCSTR  remainder3 = NULL;
-			if (remainder2 && GetExpressionEx(remainder2, (ULONG64*)&val, &remainder3))
-			{
-				argc++;
-				level = static_cast<int>(val);
-				if (level<1 || level>1024)
-				{
-					dprintf("Error: invalid levels of indirection\n");
-					leave_command();
-					return E_INVALIDARG;
-				}
-			}
-		}
-		else
-		{
-			dprintf("Error: Invalid size argument\n");
-			leave_command();
-			return E_INVALIDARG;
-		}
-	}
-
-	bool rc;
-	if (argc == 1)
-		rc = find_object_type(addr);
-	else
-		rc = find_object_refs(addr, size, level);
-
-	if (!rc )
-		dprintf("Couldn't find requested references\n");
+	if (args_buf)
+		free(args_buf);
 
 	leave_command();
-	return S_OK;
+
+	if (rc)
+    	return S_OK;
+    else
+    	return E_FAIL;
+}
+
+/////////////////////////////////////////////////////
+//  Process info (address map, threads, etc.)
+/////////////////////////////////////////////////////
+HRESULT CALLBACK
+segment(PDEBUG_CLIENT4 Client, PCSTR args)
+{
+	if (!enter_command(Client))
+		return E_FAIL;
+
+	char* args_buf = NULL;
+	if (args && strlen(args))
+		args_buf = strdup(args);
+
+	CA_BOOL rc = segment_command_impl(args_buf);
+
+	if (args_buf)
+		free(args_buf);
+
+	leave_command();
+
+	if (rc)
+    	return S_OK;
+    else
+    	return E_FAIL;
 }
 
 HRESULT CALLBACK
-tref (PDEBUG_CLIENT4 Client, PCSTR args)
+pattern (PDEBUG_CLIENT4 Client, PCSTR args)
 {
-	if (!args || strlen(args)==0)
-	{
-		dprintf("Please see help for this command's usage\n");
-		return E_FAIL;
-	}
-
 	if (!enter_command(Client))
 		return E_FAIL;
 
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
+	char* args_buf = NULL;
+	if (args && strlen(args))
+		args_buf = strdup(args);
 
-	// Get input
-	int argc = 0;
-	address_t addr;
-	size_t size = 1;
-	int level = 1;
-	ULONG64 val;
+	CA_BOOL rc = pattern_command_impl(args_buf);
 
-	PCSTR remainder = NULL;
-	if (!GetExpressionEx(args, (ULONG64*) &addr, &remainder) || addr == 0)
-	{
-		dprintf("Error: Invalid address argument\n");
-		leave_command();
-		return E_INVALIDARG;
-	}
-	else
-		argc++;
-
-	PCSTR  remainder2 = NULL;
-	if (remainder && GetExpressionEx(remainder, (ULONG64*) &size, &remainder2))
-	{
-		if (size > 0)
-		{
-			argc++;
-			PCSTR  remainder3 = NULL;
-			if (remainder2 && GetExpressionEx(remainder2, (ULONG64*)&val, &remainder3))
-			{
-				argc++;
-				level = static_cast<int>(val);
-				if (level<1 || level>1024)
-				{
-					dprintf("Error: invalid levels of indirection\n");
-					leave_command();
-					return E_INVALIDARG;
-				}
-			}
-		}
-		else
-		{
-			dprintf("Error: Invalid size argument\n");
-			leave_command();
-			return E_INVALIDARG;
-		}
-	}
-
-	bool rc = find_object_refs_on_threads (addr, size, level);
-	if (!rc )
-		dprintf("Couldn't find requested references\n");
+	if (args_buf)
+		free(args_buf);
 
 	leave_command();
-	return S_OK;
+
+	if (rc)
+    	return S_OK;
+    else
+    	return E_FAIL;
 }
 
 HRESULT CALLBACK
 obj(PDEBUG_CLIENT4 Client, PCSTR args)
 {
+	if (!enter_command(Client))
+		return E_FAIL;
+
 	if (!args || strlen(args)==0)
 	{
 		dprintf("Please see help for this command's usage\n");
 		return E_FAIL;
-	}
-
-	if (!enter_command(Client))
-		return E_FAIL;
-
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
 	}
 
 	search_cplusplus_objects_with_vptr (args);
@@ -471,43 +270,30 @@ shrobj(PDEBUG_CLIENT4 Client, PCSTR args)
 	if (!enter_command(Client))
 		return E_FAIL;
 
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
-
 	struct CA_LIST* threads = ca_list_new();
 	int* p;
 
-	if (args)
+	if (args && strlen(args))
 	{
-		const char* exp = args;
-		while(*exp)
+    	char* buf = strdup(args);
+		char* options[MAX_NUM_OPTIONS];
+		int num_options = ca_parse_options(buf, options);
+		int i;
+
+		for (i = 0; i < num_options; i++)
 		{
-			const char* remainder;
-			// skip blanks
-			while (*exp && IS_BLANK(*exp))
-				exp++;
-			// get the remainder
-			remainder = exp;
-			while (*remainder && !IS_BLANK(*remainder))
-				remainder++;
-			// record thread id
-			if (*exp)
+			char* option = options[i];
+			int tid = atoi(option);
+			if (tid >= 0)
 			{
-				int tid = atoi(exp);
-				if (tid >= 0)
-				{
-					p = (int*) malloc(sizeof(int));
-					*p = tid;
-					ca_list_push_front(threads, p);
-				}
+				p = (int*) malloc(sizeof(int));
+				*p = tid;
+				ca_list_push_front(threads, p);
 			}
-			// move on
-			exp = remainder;
 		}
+    	free(buf);
 	}
+
 	find_shared_objects_by_threads(threads);
 	// cleanup thread list
 	if (!ca_list_empty(threads))
@@ -540,119 +326,20 @@ shrobj_level(PDEBUG_CLIENT4 Client, PCSTR args)
     return S_OK;
 }
 
-/////////////////////////////////////////////////////
-//  Process info (address map, threads, etc.)
-/////////////////////////////////////////////////////
-HRESULT CALLBACK
-segment(PDEBUG_CLIENT4 Client, PCSTR args)
-{
-	if (!enter_command(Client))
-		return E_FAIL;
-
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
-
-	address_t addr;
-    if (!args || strlen(args)==0)
-    	addr = 0;
-    else
-    	addr = GetExpression(args);
-
-	if (addr)
-	{
-		struct ca_segment* seg = get_segment(addr, 1);
-		if (seg)
-		{
-			dprintf("Address 0x%lx belongs to segment:\n", addr);
-			print_segment(seg);
-		}
-		else
-			dprintf("Address 0x%lx doesn't belong to any segment\n", addr);
-	}
-	else
-	{
-		unsigned int i;
-		dprintf("vaddr                         size      perm     name\n");
-		dprintf("=====================================================\n");
-		for (i=0; i<g_segment_count; i++)
-		{
-			dprintf("[%4d] ", i);
-			print_segment(&g_segments[i]);
-		}
-	}
-
-	leave_command();
-    return S_OK;
-}
-
-HRESULT CALLBACK
-pattern (PDEBUG_CLIENT4 Client, PCSTR args)
-{
-	if (!args || strlen(args)==0)
-	{
-		dprintf("Please see help for this command's usage\n");
-		return E_FAIL;
-	}
-
-	if (!enter_command(Client))
-		return E_FAIL;
-
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
-
-	// Get input
-	int argc = 0;
-	address_t lo, hi;
-	ULONG64 val;
-
-	PCSTR remainder = NULL;
-	if (GetExpressionEx(args, (ULONG64*) &val, &remainder))
-	{
-		argc++;
-		lo = val;
-	}
-	PCSTR  remainder2 = NULL;
-	if (remainder && GetExpressionEx(remainder, (ULONG64*) &val, &remainder2))
-	{
-		argc++;
-		hi = val;
-	}
-
-	if (argc != 2 || lo >=  hi)
-	{
-		dprintf("Error: invalid arguments\n");
-		leave_command();
-		return E_INVALIDARG;
-	}
-
-	print_memory_pattern(lo, hi);
-
-	leave_command();
-	return S_OK;
-}
-
 HRESULT CALLBACK
 decode (PDEBUG_CLIENT4 Client, PCSTR args)
 {
 	if (!enter_command(Client))
 		return E_FAIL;
 
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
+	char* dup_args = NULL;
+	if (args && strlen(args))
+		dup_args = _strdup(args);
 
-	char* dup_args = _strdup(args);
-	if (!decode_func(dup_args))
-		dprintf("Failed to decode current function\n");
-	free(dup_args);
+	decode_func(dup_args);
+
+	if (dup_args)
+		free(dup_args);
 
 	leave_command();
 	return S_OK;
@@ -779,21 +466,14 @@ ignore_unknown(PDEBUG_CLIENT4 Client, PCSTR args)
 HRESULT CALLBACK
 block_size(PDEBUG_CLIENT4 Client, PCSTR args)
 {
+	if (!enter_command(Client))
+		return E_FAIL;
+
 	if (!args || strlen(args)==0)
 	{
 		dprintf("0");
 		return E_FAIL;
 	}
-
-	if (!enter_command(Client))
-		return E_FAIL;
-
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
-
 	address_t addr = GetExpression(args);
 
 	struct heap_block heap_block;
@@ -807,7 +487,7 @@ block_size(PDEBUG_CLIENT4 Client, PCSTR args)
 }
 
 HRESULT CALLBACK
-max_ref_level(PDEBUG_CLIENT4 Client, PCSTR args)
+max_indirection_level(PDEBUG_CLIENT4 Client, PCSTR args)
 {
 	int value;
     if (!args || strlen(args)==0)
@@ -825,12 +505,6 @@ info_local(PDEBUG_CLIENT4 Client, PCSTR args)
 {
 	if (!enter_command(Client))
 		return E_FAIL;
-
-	if (!update_memory_segments_and_heaps())
-	{
-		leave_command();
-		return S_OK;
-	}
 
 	HRESULT hr;
 	DEBUG_STACK_FRAME frames[MAX_FRAMES];
@@ -1051,26 +725,6 @@ static void print_sym_group(PDEBUG_SYMBOL_GROUP2 symbolGroup2)
 	}
 }
 
-static void
-print_segment(struct ca_segment* segment)
-{
-	dprintf("["PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"] %6ldK  %c%c%c ",
-		segment->m_vaddr, segment->m_vaddr+segment->m_vsize,
-		segment->m_vsize/1024,
-		segment->m_read?'r':'-', segment->m_write?'w':'-', segment->m_exec?'x':'-');
-	if (g_debug_core && segment->m_fsize != segment->m_vsize)
-		dprintf(" (fsize=%ldK)", segment->m_fsize/1024);
-	if (segment->m_type == ENUM_MODULE_TEXT)
-		dprintf("[.text/.rodata] [%s]", segment->m_module_name);
-	else if (segment->m_type == ENUM_MODULE_DATA)
-		dprintf("[.data/.bss] [%s]", segment->m_module_name);
-	else if (segment->m_type == ENUM_STACK)
-		dprintf("[stack] [tid=%d]", segment->m_thread.tid);
-	else if (segment->m_type == ENUM_HEAP)
-		dprintf("[heap]");
-	dprintf("\n");
-}
-
 static ULONG64 intr;
 static DEBUG_STACK_FRAME stack_frame;
 static CONTEXT context;
@@ -1103,10 +757,6 @@ static bool enter_command(PDEBUG_CLIENT4 Client)
 		&& Client->QueryInterface(__uuidof(IDebugRegisters2), (void **)&gDebugRegisters2) != S_OK)
 		return false;
 
-	// Get the current thread
-	if (gDebugSystemObjects->GetCurrentThreadId(&engine_tid) != S_OK)
-		return false;
-
 	// Get the current scope
 	if (gDebugSymbols3->GetScope(&intr, &stack_frame, &context, sizeof(context)) != S_OK)
 		return false;
@@ -1115,10 +765,13 @@ static bool enter_command(PDEBUG_CLIENT4 Client)
 	g_debug_context.frame_level = stack_frame.FrameNumber;
 	g_debug_context.sp = stack_frame.StackOffset;
 
+	if (!update_memory_segments_and_heaps())
+		return false;
+
 	return true;
 }
 
-void restore_context()
+static void restore_context()
 {
 	ULONG cur_engine_tid;
 	// reset the current thread if changed

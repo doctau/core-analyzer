@@ -49,9 +49,9 @@ static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun, CA_BOOL verbose);
 static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun, CA_BOOL verbose);
 static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun, CA_BOOL verbose);
 
-static CA_BOOL walk_inuse_blocks_2003(struct block_info*, unsigned long*);
-static CA_BOOL walk_inuse_blocks_2008(struct block_info*, unsigned long*);
-static CA_BOOL walk_inuse_blocks_2008_32(struct block_info*, unsigned long*);
+static CA_BOOL walk_inuse_blocks_2003(struct inuse_block*, unsigned long*);
+static CA_BOOL walk_inuse_blocks_2008(struct inuse_block*, unsigned long*);
+static CA_BOOL walk_inuse_blocks_2008_32(struct inuse_block*, unsigned long*);
 
 static CA_BOOL get_biggest_blocks_2003(struct heap_block* blks, unsigned int num);
 static CA_BOOL get_biggest_blocks_2008(struct heap_block* blks, unsigned int num);
@@ -186,15 +186,15 @@ CA_BOOL get_biggest_blocks(struct heap_block* blks, unsigned int num)
 
 static int compare_block_info( const void *arg1, const void *arg2 )
 {
-	struct block_info* left = (struct block_info*) arg1;
-	struct block_info* right = (struct block_info*) arg2;
+	struct inuse_block* left = (struct inuse_block*) arg1;
+	struct inuse_block* right = (struct inuse_block*) arg2;
 	if (left->addr < right->addr)
 		return -1;
 	else
 		return 1;
 }
 
-CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
+CA_BOOL walk_inuse_blocks(struct inuse_block* opBlocks, unsigned long* opCount)
 {
 	CA_BOOL rc = CA_FALSE;
 
@@ -213,7 +213,7 @@ CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
 
 	// sort the array if necessary
 	if (rc && opBlocks && *opCount)
-		qsort(opBlocks, *opCount, sizeof(struct block_info), compare_block_info);
+		qsort(opBlocks, *opCount, sizeof(struct inuse_block), compare_block_info);
 
 	return rc;
 }
@@ -549,10 +549,10 @@ static CA_BOOL heap_walk_2008(CA_BOOL ibDryRun, CA_BOOL verbose)
 	return CA_TRUE;
 }
 
-static CA_BOOL walk_inuse_blocks_2008(struct block_info* opBlocks, unsigned long* opCount)
+static CA_BOOL walk_inuse_blocks_2008(struct inuse_block* opBlocks, unsigned long* opCount)
 {
 	*opCount = 0;
-	struct block_info* pBlockinfo = opBlocks;
+	struct inuse_block* pBlockinfo = opBlocks;
 	// loop through all heaps
 	int heap_cnt;
 	for (heap_cnt = 0; ; heap_cnt++)
@@ -672,7 +672,6 @@ static CA_BOOL walk_inuse_blocks_2008(struct block_info* opBlocks, unsigned long
 						{
 							pBlockinfo->addr = user_addr;
 							pBlockinfo->size = user_sz;
-							pBlockinfo->ref_count = 0;
 							pBlockinfo++;
 						}
 					}
@@ -784,10 +783,10 @@ static CA_BOOL heap_walk_2008_32(CA_BOOL ibDryRun, CA_BOOL verbose)
 	return CA_TRUE;
 }
 
-static CA_BOOL walk_inuse_blocks_2008_32(struct block_info* opBlocks, unsigned long* opCount)
+static CA_BOOL walk_inuse_blocks_2008_32(struct inuse_block* opBlocks, unsigned long* opCount)
 {
 	*opCount = 0;
-	struct block_info* pBlockinfo = opBlocks;
+	struct inuse_block* pBlockinfo = opBlocks;
 	// loop through all heaps
 	int heap_cnt;
 	for (heap_cnt = 0; ; heap_cnt++)
@@ -906,7 +905,6 @@ static CA_BOOL walk_inuse_blocks_2008_32(struct block_info* opBlocks, unsigned l
 						{
 							pBlockinfo->addr = user_addr;
 							pBlockinfo->size = user_sz;
-							pBlockinfo->ref_count = 0;
 							pBlockinfo++;
 						}
 					}
@@ -1090,10 +1088,10 @@ static CA_BOOL heap_walk_2003(CA_BOOL ibDryRun, CA_BOOL verbose)
 	return CA_TRUE;
 }
 
-static CA_BOOL walk_inuse_blocks_2003(struct block_info* opBlocks, unsigned long* opCount)
+static CA_BOOL walk_inuse_blocks_2003(struct inuse_block* opBlocks, unsigned long* opCount)
 {
 	*opCount = 0;
-	struct block_info* pBlockinfo = opBlocks;
+	struct inuse_block* pBlockinfo = opBlocks;
 	// loop through all heaps
 	int heap_cnt;
 	for (heap_cnt = 0; ; heap_cnt++)
@@ -1205,7 +1203,6 @@ static CA_BOOL walk_inuse_blocks_2003(struct block_info* opBlocks, unsigned long
 						{
 							pBlockinfo->addr = user_addr;
 							pBlockinfo->size = user_sz;
-							pBlockinfo->ref_count = 0;
 							pBlockinfo++;
 						}
 					}
@@ -1416,8 +1413,12 @@ page_walk_internal_2008(HEAP_2008* heap,			// in => heap
 
 			if (bVerbose)
 			{
-				CA_PRINT("\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size="PRINT_FORMAT_SIZE" %s [USER SPACE]\n",
-					user_addr, user_addr+user_sz, user_sz, busy?"busy":"free");
+				if (busy)
+					CA_PRINT("\t\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size="PRINT_FORMAT_SIZE" busy [USER SPACE]\n",
+						user_addr, user_addr+user_sz, user_sz);
+				else
+					CA_PRINT("\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size="PRINT_FORMAT_SIZE" free [USER SPACE]\n",
+						user_addr, user_addr+user_sz, user_sz);
 				if (user_addr+user_sz < entry_vaddr+entry_sz)
 					CA_PRINT("\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" [Unused Bytes]\n",
 							user_addr+user_sz, entry_vaddr+entry_sz);
@@ -1630,8 +1631,12 @@ page_walk_internal_2008_32(HEAP_2008_32* heap,			// in => heap
 
 			if (bVerbose)
 			{
-				CA_PRINT("\t0x%lx - 0x%lx size=%ld %s [USER SPACE]\n",
-					user_addr, user_addr+user_sz, user_sz, busy?"busy":"free");
+				if (busy)
+					CA_PRINT("\t\t0x%lx - 0x%lx size=%ld busy [USER SPACE]\n",
+						user_addr, user_addr+user_sz, user_sz);
+				else
+					CA_PRINT("\t0x%lx - 0x%lx size=%ld free [USER SPACE]\n",
+						user_addr, user_addr+user_sz, user_sz);
 				if (user_addr+user_sz < entry_vaddr+entry_sz)
 					CA_PRINT("\t0x%lx - 0x%lx [Unused Bytes]\n",
 							user_addr+user_sz, entry_vaddr+entry_sz);
@@ -2077,8 +2082,12 @@ page_walk_internal_2003(HEAP_SEGMENT_2003* heap_seg,// in => heap segment
 
 			if (bVerbose)
 			{
-				CA_PRINT("\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size="PRINT_FORMAT_SIZE" %s [USER SPACE]\n",
-					user_addr, user_addr+user_sz, user_sz, busy?"busy":"free");
+				if (busy)
+					CA_PRINT("\t\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size="PRINT_FORMAT_SIZE" busy [USER SPACE]\n",
+						user_addr, user_addr+user_sz, user_sz);
+				else
+					CA_PRINT("\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size="PRINT_FORMAT_SIZE" free [USER SPACE]\n",
+						user_addr, user_addr+user_sz, user_sz);
 				if (user_addr+user_sz < entry_vaddr+entry_sz)
 					CA_PRINT("\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" [Unused Bytes]\n",
 							user_addr+user_sz, entry_vaddr+entry_sz);

@@ -10,10 +10,8 @@ EXPORTS
 ; These are the extensions exported by dll
 ;--------------------------------------------------------------------
     help
-    block
+    ca_help
     heap
-    big
-    tref
     ref
     obj
     shrobj
@@ -22,7 +20,7 @@ EXPORTS
     pattern
     decode
     set_alignment
-    max_ref_level
+    max_indirection_level
     info_local
     include_free
     ignore_free
@@ -31,6 +29,7 @@ EXPORTS
     block_size
     set
     unset
+    mcache
 
 ;--------------------------------------------------------------------
 ;

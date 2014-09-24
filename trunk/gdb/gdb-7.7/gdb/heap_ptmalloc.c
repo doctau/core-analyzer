@@ -528,10 +528,10 @@ CA_BOOL get_biggest_blocks(struct heap_block* blks, unsigned int num)
 	return CA_TRUE;
 }
 
-CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
+CA_BOOL walk_inuse_blocks(struct inuse_block* opBlocks, unsigned long* opCount)
 {
 	unsigned int heap_index;
-	struct block_info* pBlockinfo = opBlocks;
+	struct inuse_block* pBlockinfo = opBlocks;
 
 	int ptr_bit = g_ptr_bit;
 	size_t size_t_sz = ptr_bit == 64 ? sizeof(INTERNAL_SIZE_T) : sizeof(INTERNAL_SIZE_T_32);
@@ -556,7 +556,6 @@ CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
 			{
 				pBlockinfo->addr = heap->mStartAddr + size_t_sz;
 				pBlockinfo->size = ca_chunksize(ptr_bit, &achunk) - size_t_sz*2;
-				pBlockinfo->ref_count = 0;
 				pBlockinfo++;
 			}
 		}
@@ -593,7 +592,6 @@ CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
 						{
 							pBlockinfo->addr = chunk_addr + size_t_sz*2;
 							pBlockinfo->size = chunksz - size_t_sz;
-							pBlockinfo->ref_count = 0;
 							pBlockinfo++;
 						}
 					}
@@ -1781,8 +1779,12 @@ static CA_BOOL traverse_heap_blocks(struct ca_heap* heap,
 		// print if desired
 		if (bDisplayBlocks)
 		{
-			CA_PRINT("\t\t["PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"] "PRINT_FORMAT_SIZE" bytes %s\n",
-				cursor+size_t_sz*2, cursor+chunksz+size_t_sz, chunksz-size_t_sz, lbFreeBlock?"free":"inuse");
+			if (lbFreeBlock)
+				CA_PRINT("\t\t["PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"] "PRINT_FORMAT_SIZE" bytes free\n",
+						cursor+size_t_sz*2, cursor+chunksz+size_t_sz, chunksz-size_t_sz);
+			else
+				CA_PRINT("\t\t\t["PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"] "PRINT_FORMAT_SIZE" bytes inuse\n",
+						cursor+size_t_sz*2, cursor+chunksz+size_t_sz, chunksz-size_t_sz);
 		}
 
 		// walk to next chunk

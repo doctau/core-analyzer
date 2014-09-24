@@ -27,13 +27,21 @@ extern CA_BOOL get_biggest_blocks(struct heap_block* blks, unsigned int num);
 extern void print_size(size_t sz);
 
 /*
- * Memory leak check
+ * Memory usage/leak
+ * Aggregated memory is the collection of memory blocks that are reachable from a variable
  */
-struct block_info
+struct reachable
+{
+	size_t        aggr_size;	// cached reachable count/size by me (solely)
+	unsigned long aggr_count;
+	unsigned int* index_map;	// cached indexes of all sub in-use blocks
+};
+
+struct inuse_block
 {
 	address_t addr;
 	size_t    size;
-	unsigned int ref_count;
+	struct reachable reachable;
 };
 
 /*
@@ -41,9 +49,25 @@ struct block_info
  * 	If param opBlocks is NULL, return number of in-use only,
  * 	otherwise, populate the array with all in-use block info
  */
-extern CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount);
+extern CA_BOOL walk_inuse_blocks(struct inuse_block* opBlocks, unsigned long* opCount);
+
+extern struct inuse_block* build_inuse_heap_blocks(unsigned long*);
+extern void free_inuse_heap_blocks(struct inuse_block*, unsigned long);
+
+extern struct inuse_block* find_inuse_block(address_t, struct inuse_block*, unsigned long);
 
 extern CA_BOOL display_heap_leak_candidates(void);
+
+extern CA_BOOL biggest_blocks(unsigned int num);
+extern CA_BOOL biggest_heap_owners_generic(unsigned int num);
+
+extern CA_BOOL
+calc_aggregate_size(const struct object_reference *ref,
+					size_t var_len,
+					struct inuse_block *inuse_blocks,
+					unsigned long num_inuse_blocks,
+					size_t *aggr_size,
+					unsigned long *count);
 
 /*
  * Histogram of heap blocks

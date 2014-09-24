@@ -51,6 +51,7 @@ static void print_string(address_t str);
 static void print_wstring(address_t str);
 static void print_ref_chain (struct CA_LIST*);
 static void init_shared_objects(void);
+static void empty_shared_objects(void);
 static void print_shared_objects_by_threads(void);
 static struct shared_object* add_one_shared_object(address_t, CA_BOOL, unsigned int);
 static CA_BOOL has_multiple_thread_owners(struct shared_object* shrobj);
@@ -516,7 +517,6 @@ CA_BOOL find_object_refs_on_threads(address_t obj_vaddr, size_t obj_sz, unsigned
 			int nread = read_registers (segment, g_regs_buf, g_nregs);
 
 			memset(&ref, 0, sizeof(ref));
-			ref.where.reg.tid = get_thread_id (segment);
 			for (k=0; k<nread; k++)
 			{
 				if (g_regs_buf[k].reg_width == ptr_sz
@@ -524,6 +524,7 @@ CA_BOOL find_object_refs_on_threads(address_t obj_vaddr, size_t obj_sz, unsigned
 				{
 					rc = CA_TRUE;
 					ref.storage_type = ENUM_REGISTER;
+					ref.where.reg.tid = get_thread_id (segment);
 					ref.where.reg.reg_num = k;
 					ref.value = g_regs_buf[k].value;
 					CA_PRINT("------------------------ %d ------------------------\n", ++g_output_count);
@@ -542,6 +543,7 @@ CA_BOOL find_object_refs_on_threads(address_t obj_vaddr, size_t obj_sz, unsigned
 						cursor = rsp;
 				}
 				ref.storage_type = ENUM_STACK;
+				ref.where.stack.tid = get_thread_id (segment);
 				ref.level = 1;
 				while (cursor + ptr_sz <= end)
 				{
@@ -983,6 +985,17 @@ CA_BOOL find_object_type(address_t obj_vaddr)
 	return lbFound;
 }
 
+#ifdef CA_USE_SPLAY_TREE
+static int address_comp_func(splay_tree_key a, splay_tree_key b)
+{
+	if (a > b)
+		return 1;
+	else if (a == b)
+		return 0;
+	else
+		return -1;
+}
+#else
 static CA_BOOL address_comp_func(void *lhs, void *rhs)
 {
 	if ((address_t)lhs < (address_t)rhs)
@@ -990,6 +1003,7 @@ static CA_BOOL address_comp_func(void *lhs, void *rhs)
 	else
 		return CA_FALSE;
 }
+#endif
 
 /////////////////////////////////////////////////////////////////////////
 // Return a list of C++ objects with _vptr to the type of the input expression
@@ -1032,7 +1046,11 @@ struct CA_LIST* search_cplusplus_objects_with_vptr(const char* exp)
 					address_t var_addr;
 					size_t    var_size;
 
+#ifdef CA_USE_SPLAY_TREE
+					ca_set_insert_key_and_val(unique_refs, (void*)obj_addr, (void*)obj_addr);
+#else
 					ca_set_insert(unique_refs, (void*)obj_addr);
+#endif
 					// ignore register object
 					if (ref->storage_type == ENUM_REGISTER)
 					{
@@ -1127,7 +1145,11 @@ CA_BOOL search_cplusplus_objects_and_references(const char* exp)
 				if (ca_set_find(unique_refs, (void*)obj_addr))
 					continue;
 				else
+#ifdef CA_USE_SPLAY_TREE
+					ca_set_insert_key_and_val(unique_refs, (void*)obj_addr, (void*)obj_addr);
+#else
 					ca_set_insert(unique_refs, (void*)obj_addr);
+#endif
 
 				// ignore register object
     			if (ref->storage_type == ENUM_REGISTER)
@@ -1138,7 +1160,7 @@ CA_BOOL search_cplusplus_objects_and_references(const char* exp)
     					&& !known_global_sym(ref, NULL, NULL)) )
     			{
     			}*/
-    			// ignore all globals to avoid read herrings, e.g. gcc compiler generates global object of "VTT for some_class"
+    			// ignore all globals to avoid red herrings, e.g. gcc compiler generates global object of "VTT for some_class"
     			else if (ref->storage_type == ENUM_MODULE_TEXT || ref->storage_type == ENUM_MODULE_DATA)
     			{
     			}
@@ -1219,8 +1241,7 @@ find_shared_objects_one_thread(struct ca_segment* segment, CA_BOOL ignore_new_sh
 	int k, nread;
 	struct shared_object* shrobj;
 	struct object_reference* aref;
-	address_t cursor = get_rsp(segment);
-	address_t end    = segment->m_vaddr + segment->m_fsize;
+	address_t cursor, end;
 
 	// static buffer for all register values
 	if (g_nregs == 0)
@@ -1250,6 +1271,10 @@ find_shared_objects_one_thread(struct ca_segment* segment, CA_BOOL ignore_new_sh
 	}
 
 	// stack memory
+	cursor = get_rsp(segment);
+	end    = segment->m_vaddr + segment->m_fsize;
+	if (cursor < segment->m_vaddr || cursor >= segment->m_vaddr + segment->m_vsize)
+		cursor = segment->m_vaddr;
 	while (cursor + ptr_sz <= end)
 	{
 		address_t value = 0;
@@ -1368,7 +1393,7 @@ static CA_BOOL shared_objects_internal(struct CA_LIST* threads, CA_BOOL verbose)
 	else
 		memset(input_tid_map, 1, max_tid + 1);	// empty thread list means all threads
 
-	// set shared object depository to initial state
+	// set shared object repository to initial state
 	init_shared_objects ();
 
 	// First search all input threads' registers/stacks, record all found shared objects
@@ -1671,104 +1696,40 @@ void print_memory_pattern(address_t lo, address_t hi)
 	}
 }
 
-// Find the top n memory blocks in term of size
-// then search for their references
-CA_BOOL biggest_blocks(unsigned int num)
+/*
+ * Given a string of command options, end each option with '\0',
+ * 		and store in an array
+ * Return number of options
+ */
+int ca_parse_options(char* arg, char** out)
 {
-	CA_BOOL rc = CA_TRUE;
-	struct heap_block* blocks;
-
-	if (num == 0)
-		return CA_TRUE;
-	else if (num > 1024 * 1024)
+	int count = 0;
+	char* cursor = arg;
+	char* end    = arg + strlen(arg);
+	while (cursor < end && *cursor)
 	{
-		CA_PRINT("The number %d is too big, I am not sure I can do it\n", num);
-		return CA_FALSE;
-	}
-
-	blocks = (struct heap_block*) malloc (sizeof(struct heap_block) * num);
-	if (!blocks)
-		return CA_FALSE;
-	memset(blocks, 0, sizeof(struct heap_block) * num);
-
-	if (get_biggest_blocks (blocks, num))
-	{
-		unsigned int i;
-		//const CA_BOOL target_is_ptr = CA_TRUE;
-		//struct CA_LIST* targets;
-		//struct object_range* target;
-		//struct object_reference* ref;
-		//struct CA_LIST* ref_list;
-
-		// display big blocks
-		CA_PRINT("Top %d biggest in-use heap memory blocks:\n", num);
-		for (i=0; i<num; i++)
+		if (*cursor == ' ' || *cursor == '\t')
+			cursor++;
+		else
 		{
-			CA_PRINT("\taddr="PRINT_FORMAT_POINTER"  size="PRINT_FORMAT_SIZE" ",
-					blocks[i].addr, blocks[i].size);
-			print_size (blocks[i].size);
-			CA_PRINT("\n");
-		}
-		// references to these blocks
-		/*
-		targets = ca_list_new();
-		for (i=0; i<num && blocks[i].addr; i++)
-		{
-			target = (struct object_range*) malloc(sizeof(struct object_range));
-			target->low = blocks[i].addr;
-			target->high = blocks[i].addr + blocks[i].size;
-			ca_list_push_front(targets, target);
-		}
-		// invoke full-core memory search of multiple targets
-		CA_PRINT("Search references to these memory blocks...\n");
-		ref_list = ca_list_new();
-		if (search_value_internal(targets, target_is_ptr, ENUM_UNKNOWN, ref_list) )
-		{
-			clear_addr_type_map();
-			for (i=0; i<num; i++)
+			char* next = cursor + 1;
+			// push this option to the back of the array
+			out[count] = cursor;
+			count++;
+			if (count > MAX_NUM_OPTIONS)
 			{
-				//struct object_reference aref;
-				unsigned int ref_cnt = 0;
-				// print reference to blocks[i]
-				CA_PRINT("----------------- [%d] references to heap block "PRINT_FORMAT_POINTER" -----------------\n",
-						i+1, blocks[i].addr);
-				ca_list_traverse_start(ref_list);
-				while ( (ref = (struct object_reference*) ca_list_traverse_next(ref_list)) )
-				{
-					if (ref->value >= blocks[i].addr && ref->value < blocks[i].addr + blocks[i].size)
-					{
-						// no arrow, verbose
-						if (ref_cnt < 16)
-							print_ref(ref, 0, CA_FALSE, CA_TRUE);
-						ref_cnt++;
-					}
-				}
-				if (ref_cnt >= 16)
-					CA_PRINT("... %d more references\n", ref_cnt - 15);
-				else if (ref_cnt == 0)
-					CA_PRINT("No reference found\n");
+				CA_PRINT ("Warning: Too many options > %d\n", MAX_NUM_OPTIONS);
+				return count;
 			}
+			// end this option with '\0'
+			// find the end of this argument
+			while (*next && *next != ' ' && *next != '\t')
+				next++;
+			*next = '\0';
+			cursor = next + 1;
 		}
-		// cleanup
-		// target list
-		ca_list_traverse_start(targets);
-		while ( (target = (struct object_range*) ca_list_traverse_next(targets)) )
-			free (target);
-		ca_list_delete(targets);
-		// ref list
-		ca_list_traverse_start(ref_list);
-		while ( (ref = (struct object_reference*) ca_list_traverse_next(ref_list)) )
-			free(ref);
-		ca_list_delete(ref_list);
-		*/
 	}
-	else
-		rc = CA_FALSE;
-
-	// cleanup
-	free (blocks);
-
-	return rc;
+	return count;
 }
 
 /***************************************************************************
@@ -1878,6 +1839,9 @@ print_wstring(address_t str)
 /***************************************************************************
 * Helper functions for shared objects
 ***************************************************************************/
+#ifdef CA_USE_SPLAY_TREE
+#define shared_object_comp_func address_comp_func
+#else
 static CA_BOOL shared_object_comp_func(void *lhs, void *rhs)
 {
 	struct shared_object* shrobj1 = (struct shared_object*)lhs;
@@ -1887,8 +1851,9 @@ static CA_BOOL shared_object_comp_func(void *lhs, void *rhs)
 	else
 		return CA_FALSE;
 }
+#endif
 
-static void empty_shared_objects()
+static void empty_shared_objects(void)
 {
 	struct shared_object* shrobj;
 
@@ -1910,16 +1875,15 @@ static void empty_shared_objects()
 		// free shared object itself
 		free(shrobj);
 	}
-	// remove all nodes, but keep the set structure for next use
-	ca_set_clear(g_shared_objects);
+	// remove all nodes
+	ca_set_delete(g_shared_objects);
+	g_shared_objects = NULL;
 }
 
-static void init_shared_objects()
+static void init_shared_objects(void)
 {
-	if (g_shared_objects)
-		empty_shared_objects ();
-	else
-		g_shared_objects = ca_set_new (shared_object_comp_func);
+	empty_shared_objects ();
+	g_shared_objects = ca_set_new (shared_object_comp_func);
 }
 
 /*
@@ -1935,7 +1899,11 @@ find_or_insert_object(address_t obj_start, size_t obj_size, CA_BOOL ignore_new_s
 
 	anobj.start = obj_start;
 	anobj.end   = obj_start + obj_size;
+#ifdef CA_USE_SPLAY_TREE
+	shrobj = (struct shared_object* ) ca_set_find (g_shared_objects, (void*)obj_start);
+#else
 	shrobj = (struct shared_object* ) ca_set_find (g_shared_objects, &anobj);
+#endif
 	if (!shrobj && !ignore_new_shrobj)
 	{
 		// This is a new shared object
@@ -1944,7 +1912,11 @@ find_or_insert_object(address_t obj_start, size_t obj_size, CA_BOOL ignore_new_s
 		shrobj->end   = anobj.end;
 		shrobj->thread_owners = ca_list_new();
 		shrobj->parent_shrobjs = ca_list_new();
+#ifdef CA_USE_SPLAY_TREE
+		ca_set_insert_key_and_val(g_shared_objects, (void*)shrobj->start, shrobj);
+#else
 		ca_set_insert (g_shared_objects, shrobj);
+#endif
 	}
 
 	return shrobj;
@@ -1959,7 +1931,11 @@ get_all_parents(struct CA_SET* parents, struct shared_object* shrobj, unsigned i
 		ca_list_traverse_start(shrobj->parent_shrobjs);
 		while ( (parent = (struct shared_object*) ca_list_traverse_next(shrobj->parent_shrobjs) ) )
 		{
+#ifdef CA_USE_SPLAY_TREE
+			ca_set_insert_key_and_val(parents, (void*)parent->start, parent);
+#else
 			ca_set_insert(parents, parent);
+#endif
 			if (level+1 < g_shrobj_level)
 				get_all_parents(parents, parent, level+1);
 		}
@@ -2092,7 +2068,7 @@ print_one_shared_object(struct shared_object* shrobj, struct CA_LIST* child_chai
 	}
 }
 
-static void print_shared_objects_by_threads()
+static void print_shared_objects_by_threads(void)
 {
 	int count = 0;
 	struct shared_object* shrobj;

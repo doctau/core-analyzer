@@ -11,6 +11,7 @@
 #include <windef.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdarg.h>
 
 //
 // Define KDEXT_64BIT to make all wdbgexts APIs recognize 64 bit addresses
@@ -106,7 +107,19 @@ extern IDebugClient4* gDebugClient4;
 extern IDebugSystemObjects* gDebugSystemObjects;
 extern void restore_context();
 
-extern bool decode_func(char* args);
+// For decode function
+struct win_type
+{
+	ULONG   type_id;
+	ULONG64 mod_base;
+};
+
+extern enum SymTagEnum get_type_code(struct win_type type, ULONG64 addr);
+extern void print_type_name(struct win_type type);
+extern void print_func_address(address_t addr, char* buf, int buf_sz);
+extern void get_stack_sym_and_type(address_t addr, const char** symname, struct win_type* ptype);
+extern struct win_type
+get_struct_field_type_and_name(struct win_type, ULONG, address_t*, size_t*, char*, size_t);
 extern void print_op_value_context(size_t op_value, int op_size, address_t loc, int offset, int lea);
 #endif
 

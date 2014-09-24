@@ -1,5 +1,5 @@
 /************************************************************************
-** FILE NAME..... util.h
+** FILE NAME..... x_type.h
 **
 ** (c) COPYRIGHT
 **
@@ -34,6 +34,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <limits.h>
 #endif
 #include <stdio.h>
 #include <time.h>

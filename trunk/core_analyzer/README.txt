@@ -11,19 +11,7 @@ Windows
 $core_analyzer [-b] <core>
 
 
-Features
-=====================================================
-Core analyzer is driven by a console menu.
-[0] Print General Core Information
-[1] Find References to an Object (horizontal search)
-[2] What Is This Address and Underlying Object Type (vertical search)
-[3] Memory Pattern Analysis
-[4] Query Heap Memory Block
-[5] Page Walk (check the integrity of surrounding memory blocks)
-[6] Heap Walk (check the whole heap for corruption and memory usage stats)
-[7] Quit
-
-Description of these functions may be found in the project's website: http://core-analyzer.sourceforge.net/
+Description of features may be found at the project's website: http://core-analyzer.sourceforge.net/
 
 How to Build
 =====================================================

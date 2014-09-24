@@ -48,13 +48,15 @@
 #endif
 
 #include "search.h"
+#include "segment.h"
+#include "decode.h"
 
 #include <setjmp.h>
 
+static int print_insn(bfd_vma, struct decode_control_block*);
 static int fetch_data(struct disassemble_info *, bfd_byte *);
 static void ckprefix(void);
 static const char *prefix_name(int, int);
-static int print_insn( bfd_vma, disassemble_info *);
 static void dofloat(int);
 static void OP_ST(int, int);
 static void OP_STi(int, int);
@@ -2183,238 +2185,23 @@ static char close_char;
 static char separator_char;
 static char scale_char;
 
-int ca_print_insn_i386(bfd_vma pc, disassemble_info *info) {
+int ca_print_insn_i386(bfd_vma pc, struct decode_control_block* decode_cb)
+{
 	intel_syntax = -1;
 
-	return print_insn(pc, info);
+	return print_insn(pc, decode_cb);
 }
 
-/* myan */
-enum ca_operand_type {
-	CA_OP_UNSET, CA_OP_REGISTER, CA_OP_IMMEDIATE, CA_OP_MEMORY,
-};
-
-struct ca_op_register {
-	const char* name;
-	int size;
-	int index;
-};
-
-struct ca_op_immediate {
-	bfd_vma immediate;
-};
-
-struct ca_op_memory {
-	struct ca_op_register base_reg;
-	struct ca_op_register index_reg;
-	struct ca_op_immediate disp;
-	int scale;
-};
-
-struct ca_operand {
-	enum ca_operand_type type;
-	union {
-		struct ca_op_register reg;
-		struct ca_op_immediate immed;
-		struct ca_op_memory mem;
-	};
-};
-
+/*
+ *  myan
+*/
 static int g_num_operand;
 static struct ca_operand g_operands[MAX_OPERANDS];
 static int g_op_size;
 
-// return the virtual address of memory operand,
-//        0 if it has unknown base or index register value
-static bfd_vma get_address(struct ca_operand* op) {
-	if (op->type == CA_OP_MEMORY) {
-		bfd_vma base, index, mem_addr;
-		if (op->mem.base_reg.name) {
-			if (g_regs[op->mem.base_reg.index].known)
-				base = g_regs[op->mem.base_reg.index].value;
-			else
-				return 0;
-		} else
-			base = 0;
-		if (op->mem.index_reg.name) {
-			if (g_regs[op->mem.index_reg.index].known)
-				index = g_regs[op->mem.index_reg.index].value;
-			else
-				return 0;
-		} else
-			index = 0;
-		mem_addr = base + index * (1 << op->mem.scale) + op->mem.disp.immediate;
-		return mem_addr;
-	}
-	return 0;
-}
-
-// return the operand in the form of [base_reg + offset]
-static void get_location(struct ca_operand* op, address_t* location,
-		int* offset) {
-	if (op->type == CA_OP_MEMORY) {
-		if (op->mem.base_reg.name && g_regs[op->mem.base_reg.index].known
-				&& !op->mem.index_reg.name) {
-			*location = g_regs[op->mem.base_reg.index].value;
-			*offset = op->mem.disp.immediate;
-		}
-	}
-}
-
-// return true if the operand's value is known
-static int known_value(struct ca_operand* op, disassemble_info *info) {
-	int rc = 0;
-
-	if (op->type == CA_OP_REGISTER)
-		rc = g_regs[op->reg.index].known;
-	else if (op->type == CA_OP_IMMEDIATE)
-		rc = 1;
-	else if (op->type == CA_OP_MEMORY) {
-		bfd_vma mem_addr = get_address(op);
-		if (mem_addr) {
-			char val;
-			if ((*info->read_memory_func)(mem_addr, (bfd_byte*) &val,
-					sizeof(val), info) == 0)
-				rc = 1;
-		}
-	}
-	return rc;
-}
-
-// return true if the operand's value is on stack and known
-static int known_stack_value(struct ca_operand* op, disassemble_info *info) {
-	int rs = 0;
-
-	if (op->type == CA_OP_MEMORY) {
-		bfd_vma mem_addr = get_address(op);
-		if (mem_addr) {
-			struct object_reference aref;
-			memset(&aref, 0, sizeof(aref));
-			aref.vaddr = mem_addr;
-			aref.value = 0;
-			aref.target_index = -1;
-			fill_ref_location(&aref);
-			if (aref.storage_type == ENUM_STACK)
-				rs = 1;
-		}
-	}
-	return rs;
-}
-
-// mark the operand is unknown from now on
-static void set_unknown(struct ca_operand* op, disassemble_info *info) {
-	if (op->type == CA_OP_REGISTER) {
-		if (g_regs[op->reg.index].known) {
-			g_regs[op->reg.index].known = 0;
-			//g_regs[op->reg.index].sym = NULL;
-			//g_regs[op->reg.index].type = NULL;
-			(*info->fprintf_func)(info->stream, "%s?", op->reg.name);
-		}
-	}
-	/*else if (op->type == CA_OP_IMMEDIATE)
-	 else if (op->type == CA_OP_MEMORY)*/
-}
-
-// return the operand's value, assuming it is known or can be computed
-static size_t get_value(struct ca_operand* op, disassemble_info *info) {
-	size_t rs = 0;
-	unsigned int sz = sizeof(rs);
-
-	if (g_op_size > 0)
-		sz = g_op_size;
-
-	if (op->type == CA_OP_REGISTER) {
-		size_t mask = (size_t)(-1);
-		mask = mask >> ((sz - 8) * 8);
-		rs = g_regs[op->reg.index].value & mask;
-	} else if (op->type == CA_OP_IMMEDIATE)
-		rs = (size_t) op->immed.immediate;
-	else if (op->type == CA_OP_MEMORY) {
-		bfd_vma mem_addr = get_address(op);
-		if (g_ptr_bit == 32)
-			sz = 4;
-		(*info->read_memory_func)(mem_addr, (bfd_byte*) &rs, sz, info);
-	}
-	return rs;
-}
-
-static int set_value(struct ca_operand* op, size_t val) {
-	if (op->type == CA_OP_REGISTER) {
-		if (g_regs[op->reg.index].saved)
-			g_regs[op->reg.index].saved_value = g_regs[op->reg.index].value;
-		g_regs[op->reg.index].value = val;
-		g_regs[op->reg.index].known = 1;
-		//g_regs[op->reg.index].sym = NULL;
-		//g_regs[op->reg.index].type = NULL;
-	}
-	/*else if (op->type == CA_OP_IMMEDIATE)
-	 return 0;
-	 else if (op->type == CA_OP_MEMORY)
-	 {
-	 // remember values of local (stack) variables ?
-	 }*/
-	return 1;
-}
-
-static void print_one_operand(struct ca_operand* op, disassemble_info *info,
-		CA_BOOL printval) {
-	if (op->type == CA_OP_REGISTER) {
-		(*info->fprintf_func)(info->stream, "%s", op->reg.name);
-	} else if (op->type == CA_OP_IMMEDIATE) {
-		print_displacement(scratchbuf, op->immed.immediate);
-		(*info->fprintf_func)(info->stream, "%s", scratchbuf);
-	} else if (op->type == CA_OP_MEMORY) {
-		int need_addition_sign = 0;
-		(*info->fprintf_func)(info->stream, "[");
-		if (op->mem.base_reg.name) {
-			(*info->fprintf_func)(info->stream, "%s", op->mem.base_reg.name);
-			need_addition_sign = 1;
-		}
-		if (op->mem.index_reg.name) {
-			if (need_addition_sign)
-				(*info->fprintf_func)(info->stream, "+");
-			need_addition_sign = 1;
-			(*info->fprintf_func)(info->stream, "%s*%d", op->mem.index_reg.name,
-					1 << op->mem.scale);
-		}
-		if (op->mem.disp.immediate != 0) {
-			print_displacement(scratchbuf, op->mem.disp.immediate);
-			if ((bfd_signed_vma) op->mem.disp.immediate > 0)
-				(*info->fprintf_func)(info->stream, "+");
-			(*info->fprintf_func)(info->stream, "%s", scratchbuf);
-		}
-		(*info->fprintf_func)(info->stream, "]");
-	}
-	// print operand's value
-	if (printval && op->type != CA_OP_IMMEDIATE && known_value(op, info)) {
-		size_t val = get_value(op, info);
-		(*info->fprintf_func)(info->stream, "(0x%lx)", val);
-	}
-}
-
-enum rotate_direction {
-	ROTATE_RIGHT, ROTATE_LEFT
-};
-
-static size_t rotate(size_t val, size_t nbits, enum rotate_direction dir,
-		int size) {
-	int bits_travel = size * 8 - 1;
-	for (; nbits > 0; nbits--) {
-		size_t tmp;
-		if (dir == ROTATE_RIGHT) {
-			tmp = (val & 1) << bits_travel;
-			val = val >> 1;
-			val |= tmp;
-		} else if (dir == ROTATE_LEFT) {
-			tmp = (val & (1 << bits_travel)) >> bits_travel;
-			val = val << 1;
-			val |= tmp;
-		}
-	}
-	return val;
-}
-
-static int print_insn(bfd_vma pc, disassemble_info *info) {
+static int print_insn(bfd_vma pc, struct decode_control_block* decode_cb)
+{
+	disassemble_info *info = decode_cb->di;
 	const struct dis386 *dp;
 	int i;
 	char *op_txt[MAX_OPERANDS];
@@ -2425,10 +2212,8 @@ static int print_insn(bfd_vma pc, disassemble_info *info) {
 	const char *p;
 	struct dis_private priv;
 	unsigned char op;
-	int num_op, inexcutable = 0, twobyte_opcode = 0, annotated = 0;
+	int num_op, twobyte_opcode = 0;
 	unsigned char opcode_val = 0xff;
-	int ptr_bit = g_ptr_bit;
-	size_t ptr_sz = ptr_bit >> 3;
 
 	if (info->mach == bfd_mach_x86_64_intel_syntax
 			|| info->mach == bfd_mach_x86_64)
@@ -2803,8 +2588,6 @@ static int print_insn(bfd_vma pc, disassemble_info *info) {
 		}
 
 	// myan
-	g_regs[RIP].value += codep - priv.the_buffer; // update program counter
-
 	num_op = 0;
 	if (dp) {
 		for (i = 0; i < MAX_OPERANDS; ++i) {
@@ -2812,470 +2595,40 @@ static int print_insn(bfd_vma pc, disassemble_info *info) {
 				num_op++;
 		}
 	}
-
-	// ignore some instructions
-	// nop is alias to "xchg eax,eax"
-	if (dp->name == NULL && dp->op[0].bytemode == FLOATCODE)
-		inexcutable = 1;
-	else if (strncmp(dp->name, "xchg", 4) == 0
-			&& (g_num_operand == 0
-					|| (g_num_operand == 2
-							&& g_operands[0].type == CA_OP_REGISTER
-							&& g_operands[1].type == CA_OP_REGISTER
-							&& g_operands[0].reg.index == RAX
-							&& g_operands[1].reg.index == RAX)))
-		inexcutable = 1;
-
-	annotated = 0;
-#define MAX_SPACING 24
-	if (!inexcutable) {
-		int pos = 0;
-		int skip_verbose_print = 0;
-		// calc the current stream position
+	if (num_op != g_num_operand)
+		(*info->fprintf_func)(info->stream, "  ## Internal error: %d operand is expected instead of %d", num_op, g_num_operand);
+	else if (dp->name)
+	{
+		struct ca_dis_insn* insn = decode_cb->insn;
+		// opcode name
+		strncpy(insn->opcode_name, dp->name, MAX_OPCODE_NAME_SZ);
+		// number of operands
+		insn->num_operand = g_num_operand;
+		// op size, it could be 0 if unknown
+		if (twobyte_opcode)
+			insn->op_size = twobyte_size_map[opcode_val];
+		else
+			insn->op_size = onebyte_size_map[opcode_val];
+		if (insn->op_size == 0)
 		{
-			needcomma = 0;
-			for (i = 0; i < MAX_OPERANDS; ++i)
-				if (*op_txt[i]) {
-					if (needcomma)
-						pos++;
-					if (op_index[i] != -1 && !op_riprel[i]) {
-						// An absolute address, let gdb print it
-						skip_verbose_print = 1;
-						pos = MAX_SPACING;
-					} else
-						pos += strlen(op_txt[i]);
-					needcomma = 1;
-				}
-
-			for (i = 0; i < MAX_OPERANDS; i++)
-				if (op_index[i] != -1 && op_riprel[i]) {
-					// A rip-relative address
-					pos = MAX_SPACING;
-					break;
-				}
-		}
-		if (num_op != g_num_operand)
-			(*info->fprintf_func)(info->stream,
-					"  ## Internal error: %d operand is expected instead of %d",
-					num_op, g_num_operand);
-		else {
-			size_t val;
-			int print_val = 0;
-			int op_size;
-			size_t mask = (size_t)(-1);
-			int offset = 0;
-			address_t location = 0;
-			int islea = 0;
-			struct ca_operand* dest_op = NULL;
-
-			// set operand size if the opcode tells
-			if (twobyte_opcode)
-				op_size = twobyte_size_map[opcode_val];
-			else
-				op_size = onebyte_size_map[opcode_val];
-			if (op_size)
-				g_op_size = op_size;
-			else {
-				for (i = 0; i < g_num_operand; i++) {
-					if (g_operands[i].type == CA_OP_REGISTER) {
-						// take the smallest register size of all operands
-						if (g_op_size < 0 || g_op_size > g_operands[i].reg.size)
-							g_op_size = g_operands[i].reg.size;
-					}
-				}
-			}
 			if (g_op_size > 0)
-				mask = mask >> ((g_op_size - 8) * 8);
-
-			for (i = pos; i < MAX_SPACING; i++)
-				(*info->fprintf_func)(info->stream, " ");
-			(*info->fprintf_func)(info->stream, " ## ");
-
-			// op_code
-			// roughly in the order of most popular to least likely
-			// 1st operand(g_operands[0]) is the destination (and source) for most instructions
-			if (strncmp(dp->name, "mov", 3) == 0
-					|| strncmp(dp->name, "cvt", 3) == 0) {
-				// include
-				//   "movd"  move doubleword or quadword
-				//   "movnti" move non-temporal doubleword or quadword
-				//   "movs" "movs[b/w/d/q] move string
-				//   "movsx" move with sign-extension
-				//   "movsxd" move with sign-extend doubleword
-				//   "movzx" move with zero-extension
-
-				dest_op = &g_operands[0];
-				// value propagation rules
-				if (g_operands[1].type == CA_OP_IMMEDIATE
-						|| (g_operands[1].type == CA_OP_MEMORY
-								&& known_value(&g_operands[1], info))) {
-					// source is an immediate or readable memory
-					get_location(&g_operands[1], &location, &offset);
-					print_val = 1;
-					val = get_value(&g_operands[1], info);
-					set_value(&g_operands[0], val);
-				} else if (g_operands[0].type == CA_OP_MEMORY
-						&& known_stack_value(&g_operands[0], info)) {
-					// destination is readable stack memory
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-					set_value(&g_operands[1], val); // source operand deduced from destination
-				} else if (known_value(&g_operands[1], info)) {
-					// source is known register
-					print_val = 1;
-					val = get_value(&g_operands[1], info);
-					set_value(&g_operands[0], val);
-				} else if (g_operands[0].type == CA_OP_MEMORY
-						&& known_value(&g_operands[0], info)) {
-					// destination is readable non-stack memory
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-					set_value(&g_operands[1], val);
-				} else {
-					// can't deduce the value moved into destination
-					set_unknown(&g_operands[0], info);
-				}
-			} else if (strncmp(dp->name, "test", 4) == 0) {
-				if (g_operands[0].type == CA_OP_REGISTER
-						&& g_operands[1].type == CA_OP_REGISTER
-						&& g_operands[0].reg.index == g_operands[1].reg.index) {
-					// test zero
-					print_one_operand(&g_operands[1], info, CA_TRUE);
-					(*info->fprintf_func)(info->stream, "==0");
-				} else if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_one_operand(&g_operands[1], info, CA_TRUE);
-					(*info->fprintf_func)(info->stream, "==");
-					print_one_operand(&g_operands[0], info, CA_TRUE);
-				}
-			} else if (strncmp(dp->name, "cmp", 3) == 0) {
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_one_operand(&g_operands[1], info, CA_TRUE);
-					(*info->fprintf_func)(info->stream, "<=>");
-					print_one_operand(&g_operands[0], info, CA_TRUE);
-				}
-			} else if (strncmp(dp->name, "leave", 5) == 0) {
-				// this has to be before "lea" instr to avoid ambiguity
-				// it is equivelent to two instruction
-				//     mov rbp, rsp
-				//     pop rbp
-			} else if (strncmp(dp->name, "lea", 3) == 0) {
-				// load effective address
-				// source must be memory and destination must be register
-				islea = 1;
-				dest_op = &g_operands[0];
-				val = get_address(&g_operands[1]);
-				if (val) {
-					print_val = 1;
-					get_location(&g_operands[1], &location, &offset);
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "call", 4) == 0) {
-				if (known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-				// rax is used for return value most of the time
-				g_regs[RAX].known = 0;
-				// when the function returns, all volatile registers may have been changed
-				//
-				// In a second thought, even if the called function does chagne a volatile register,
-				// the code after the "call" should reload it before using it.
-				// The code following "call" instruction could be the destination of branch/jmp instruction,
-				// which skips "call". If we set all volatile regsiters unknown, we will lose them in that case.
-				/*g_regs[RCX].known = 0;
-				 g_regs[RDX].known = 0;
-				 g_regs[RSI].known = 0;
-				 g_regs[RDI].known = 0;
-				 g_regs[R8].known = 0;
-				 g_regs[R9].known = 0;
-				 g_regs[R10].known = 0;
-				 g_regs[R11].known = 0;*/
-			} else if (strncmp(dp->name, "push", 4) == 0) {
-				g_regs[RSP].value -= ptr_sz;
-				val = 0;
-				(*info->read_memory_func)(g_regs[RSP].value, (bfd_byte*) &val,
-						ptr_sz, info);
-				set_value(&g_operands[0], val);
-				print_val = 1;
-			} else if (strncmp(dp->name, "pop", 3) == 0) {
-				val = 0;
-				(*info->read_memory_func)(g_regs[RSP].value, (bfd_byte*) &val,
-						ptr_sz, info);
-				set_value(&g_operands[0], val);
-				g_regs[RSP].value += ptr_sz;
-				print_val = 1;
-			} else if (strncmp(dp->name, "cmov", 4) == 0) {
-				// conditional move
-				set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "add", 3) == 0
-					|| strncmp(dp->name, "adc", 3) == 0) {
-				dest_op = &g_operands[0];
-				// value propagation
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[1], info)
-							+ get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (g_operands[0].type == CA_OP_MEMORY
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			} else if (strncmp(dp->name, "sub", 3) == 0
-					|| strncmp(dp->name, "sbb", 3) == 0) {
-				dest_op = &g_operands[0];
-				// value propagation
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info)
-							- get_value(&g_operands[1], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else if (g_operands[0].type == CA_OP_REGISTER
-						&& g_operands[1].type == CA_OP_REGISTER
-						&& g_operands[0].reg.index == g_operands[1].reg.index) {
-					print_val = 1;
-					val = 0;
-					set_value(&g_operands[0], 0);
-				} else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			} else if (strncmp(dp->name, "inc", 3) == 0) {
-				// value propagation
-				if (known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info) + 1;
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "dec", 3) == 0) {
-				// value propagation
-				if (known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info) - 1;
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "imul", 4) == 0) {
-				// value propagation
-				if (g_num_operand == 2 && known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[1], info)
-							* get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else if (g_num_operand == 3
-						&& known_value(&g_operands[1], info)
-						&& known_value(&g_operands[2], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[1], info)
-							* get_value(&g_operands[2], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else if (g_num_operand == 1
-						&& known_value(&g_operands[0], info)
-						&& g_regs[RAX].known) {
-					// rax instead of g_operands[0] is the destination
-					//print_val = 1;
-					val = g_regs[RAX].value * get_value(&g_operands[0], info);
-					val &= mask;
-					g_regs[RAX].value = val;
-				} else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			} else if (strncmp(dp->name, "idiv", 4) == 0) {
-				// value propagation
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[1], info)
-							/ get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			} else if (strncmp(dp->name, "and", 3) == 0) {
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[1], info)
-							& get_value(&g_operands[0], info);
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "or", 2) == 0) {
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[1], info)
-							| get_value(&g_operands[0], info);
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "not", 3) == 0) {
-				if (known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = ~get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "xor", 3) == 0) {
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[1], info)
-							^ get_value(&g_operands[0], info);
-					set_value(&g_operands[0], val);
-				} else if (g_operands[0].type == CA_OP_REGISTER
-						&& g_operands[1].type == CA_OP_REGISTER
-						&& g_operands[0].reg.index == g_operands[1].reg.index) {
-					print_val = 1;
-					val = 0;
-					set_value(&g_operands[0], 0);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "shr", 3) == 0
-					|| strncmp(dp->name, "sar", 3) == 0) {
-				// shift right
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info)
-							>> get_value(&g_operands[1], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "shl", 3) == 0
-					|| strncmp(dp->name, "sal", 3) == 0) {
-				// shift left
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = get_value(&g_operands[0], info)
-							<< get_value(&g_operands[1], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "rol", 3) == 0) {
-				// rotate left
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = rotate(get_value(&g_operands[0], info),
-							get_value(&g_operands[1], info), ROTATE_LEFT,
-							g_op_size);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "ror", 3) == 0) {
-				// rotate right
-				if (known_value(&g_operands[1], info)
-						&& known_value(&g_operands[0], info)) {
-					print_val = 1;
-					val = rotate(get_value(&g_operands[0], info),
-							get_value(&g_operands[1], info), ROTATE_RIGHT,
-							g_op_size);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				} else
-					set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "rcl", 3) == 0
-					|| strncmp(dp->name, "rcr", 3) == 0) {
-				// rotate through carry left/right
-				set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "set", 3) == 0) {
-				// conditional set instruction
-				if (g_operands[0].type == CA_OP_MEMORY
-						&& known_value(&g_operands[0], info)) {
-					val = get_value(&g_operands[0], info);
-					print_val = 1;
-				}
-				set_unknown(&g_operands[0], info);
-			} else if (strncmp(dp->name, "ret", 3) == 0) {
-				int my_regno;
-				// in case the "ret" instruction is not the last instrunction of the function
-				// or there are multiple exits, we need to roll back saved registers popped by epilogue
-				for (my_regno = 0; my_regno < TOTAL_REGS; my_regno++) {
-					if (my_regno != RIP && g_regs[my_regno].saved)
-						g_regs[my_regno].value = g_regs[my_regno].saved_value;
-				}
-				g_regs[RAX].known = 0; // return register is likely set to something
-			} else if (strncmp(dp->name, "enter", 5) == 0) {
-				// it is equivelent to three instructions
-				//     push rbp
-				//     mov rbp, rsp
-				//     sub nbytes, rsp
-				if (g_operands[0].type == CA_OP_IMMEDIATE) {
-					val = get_value(&g_operands[0], info);
-					g_regs[RSP].value -= val;
-				} else
-					(*info->fprintf_func)(info->stream,
-							"internal error: unexpected operand");
-			}
-
-			// annotation of object context
-			if (print_val && !skip_verbose_print && !g_dis_silent) {
-				annotated = 1;
-				print_one_operand(&g_operands[0], info, CA_FALSE); // destination
-				if (g_operands[0].type == CA_OP_MEMORY) {
-					// if the destination is a known local variable, print it out
-					address_t addr = get_address(&g_operands[0]);
-					struct object_reference aref;
-					memset(&aref, 0, sizeof(aref));
-					aref.vaddr = addr;
-					aref.value = 0;
-					aref.target_index = -1;
-					fill_ref_location(&aref);
-					if (aref.storage_type == ENUM_STACK
-							&& known_stack_sym(&aref, NULL, NULL)) {
-						(*info->fprintf_func)(info->stream, "(");
-						print_stack_ref(&aref);
-						(*info->fprintf_func)(info->stream, ")");
+				insn->op_size = g_op_size;
+			else
+			{
+				for (i=0; i<g_num_operand; i++)
+				{
+					if (g_operands[i].type == CA_OP_REGISTER)
+					{
+						// take the smallest register size of all operands
+						if (insn->op_size == 0 || insn->op_size > g_operands[i].reg.size)
+							insn->op_size = g_operands[i].reg.size;
 					}
 				}
-				(*info->fprintf_func)(info->stream, "=0x%lx", val);
-				if (dest_op && dest_op->type == CA_OP_REGISTER
-						&& dest_op->reg.index == RSP)
-					(*info->fprintf_func)(info->stream,
-							" End of function prologue\n");
-				else
-					print_op_value_context(val,
-							g_op_size > 0 ? g_op_size : ptr_sz, location,
-							offset, islea);
 			}
 		}
+		// operands' value
+		memcpy(insn->operands, g_operands, g_num_operand * sizeof(struct ca_operand));
 	}
-	if (!annotated)
-		(*info->fprintf_func)(info->stream, "\n");
 
 	return codep - priv.the_buffer;
 }
@@ -3970,8 +3323,8 @@ static void OP_E(int bytemode, int sizeflag) {
 	if (modrm.mod == 3)
 	{
 		int reg = modrm.rm + add;
-		const char **names;
-		int reg_size;
+		const char **names = names64;
+		int reg_size = 8;
 
 		switch (bytemode) {
 		case b_mode:
@@ -4467,7 +3820,7 @@ static void set_op(bfd_vma op, int riprel) {
 static void OP_REG(int code, int sizeflag) {
 	const char *s;
 	int add;
-	int reg_size, reg_index;
+	int reg_size = 8, reg_index = 0;
 	USED_REX(REX_B);
 	if (rex & REX_B)
 		add = 8;
@@ -4572,7 +3925,7 @@ static void OP_REG(int code, int sizeflag) {
 
 static void OP_IMREG(int code, int sizeflag) {
 	const char *s;
-	int reg_size, reg_index;
+	int reg_size = 8, reg_index = 0;
 
 	switch (code) {
 	case indir_dx_reg:

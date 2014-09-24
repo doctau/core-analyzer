@@ -36,9 +36,6 @@
 #include "heap.h"
 #include "stl_container.h"
 
-#define CA_VERSION_MAJOR 2
-#define CA_VERSION_MINOR 15
-
 // forward declaration
 static int AskChoice(const char** options);
 static CA_BOOL PrintBlockInfo(address_t addr);
@@ -53,7 +50,7 @@ static void PrintBanner()
 {
 	printf("******************************************************************\n");
 	printf("** Core Analyzer version %d.%d                                   **\n", CA_VERSION_MAJOR, CA_VERSION_MINOR);
-	printf("** Please report bugs to: Michael Yan (yanqi27@gmail.com)       **\n");
+	printf("** Please report bugs to: Michael Yan (myan@gmail.com)          **\n");
 	printf("******************************************************************\n");
 }
 
@@ -135,9 +132,10 @@ int main(int argc, char** argv)
 		/* 6 */ "Page Walk (check the integrity of surrounding memory blocks)",
 		/* 7 */ "Heap Walk (check the whole heap for corruption and memory usage stats)",
 		/* 8 */ "Biggest Heap Memory Blocks",
-		/* 9 */ "Heap Memory Leak Candidates",
-		/* 10 */ "Quit",
-		/*   */ NULL
+		/* 9 */ "Biggest Heap Memory Owners(variables)",
+		/* 10 */ "Heap Memory Leak Candidates",
+		/* 11 */ "Quit",
+		/*    */ NULL
 	};
 
 	// CLI menu driven services
@@ -244,14 +242,23 @@ int main(int argc, char** argv)
 				//break;
 			}
 		}
+		// Variables/owners that reference most heap memory
 		else if (opt == 9)
+		{
+			unsigned int num = AskParam("Number of top users(variables) of heap memory", NULL, CA_TRUE);
+			if (!biggest_heap_owners_generic(num))
+			{
+				//break;
+			}
+		}
+		else if (opt == 10)
 		{
 			if (!display_heap_leak_candidates())
 			{
 				//break;
 			}
 		}
-		else if (opt == 10)
+		else if (opt == 11)
 			break;
 	}
 
