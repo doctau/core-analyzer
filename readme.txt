@@ -1,6 +1,8 @@
 This project is compressed in a 7z file. You need the tool (http://www.7-zip.org/) to uncompress it.
 Please refer to the project's web site http://core-analyzer.sourceforge.net/ for detail.
 
+Version 2.16 adds functions to display top variables that consume the most heap memory, and how much heap memory a variable references directly or indirectly, which helps identify memory hogs in a program. Function "decode" is rewritten to enhance relationship of symbols and types with a register table. Commands are streamlined for easier use, e.g., "tref" is replaced by "ref /t" and "block" is now "heap /b".
+
 Version 2.15 adds functions to display memory histogram and memory leaks, as well as miscellaneous buf fixes.
 
 Version 2.14 supports MacOSX platform. It also enhances "decode" command for multiple frames.
