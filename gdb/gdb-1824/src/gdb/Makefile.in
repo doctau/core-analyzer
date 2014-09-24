@@ -583,7 +583,7 @@ SFILES = ada-exp.y ada-lang.c ada-typeprint.c ada-valprint.c  \
 	objc-exp.y objc-lang.c \
 	objfiles.c osabi.c observer.c \
 	p-exp.y p-lang.c p-typeprint.c p-valprint.c parse.c printcmd.c \
-	heapcmd.c segment.c search.c stl_container.c heap.c heap_darwin.c gdb_dep.c i386-decode.c \
+	heapcmd.c segment.c search.c stl_container.c heap.c heap_darwin.c gdb_dep.c i386-decode.c decode.c \
 	regcache.c reggroups.c remote.c remote-fileio.c \
 	scm-exp.c scm-lang.c scm-valprint.c \
 	sentinel-frame.c \
@@ -952,7 +952,7 @@ BASE_OBS = \
 	blockframe.o breakpoint.o findvar.o regcache.o \
 	charset.o disasm.o dummy-frame.o \
 	source.o value.o eval.o valops.o valarith.o valprint.o printcmd.o \
-	heapcmd.o segment.o search.o stl_container.o heap.o heap_darwin.o gdb_dep.o i386-decode.o \
+	heapcmd.o segment.o search.o stl_container.o heap.o heap_darwin.o gdb_dep.o i386-decode.o decode.o \
 	block.o symtab.o symfile.o symmisc.o linespec.o dictionary.o \
 	infcall.o \
 	infcmd.o infrun.o \

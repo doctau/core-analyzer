@@ -108,8 +108,12 @@ CA_BOOL heap_walk(address_t addr, CA_BOOL verbose)
 				int inuse = block_inuse(regionp->start);
 				address_t addr = block_addr(regionp->start);
 				size_t size = regionp->end - addr;
-				CA_PRINT("\tlarge block "PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size=%ld %s\n",
-						addr, addr + size, size, inuse ? "in-use" : "cached");
+				if (inuse)
+					CA_PRINT("\t\tlarge block "PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size=%ld in-use\n",
+							addr, addr + size, size);
+				else
+					CA_PRINT("\tlarge block "PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size=%ld cached\n",
+							addr, addr + size, size);
 			}
 			if (regionp->type == ENUM_TINY_REGION || regionp->type == ENUM_SMALL_REGION)
 			{
@@ -306,10 +310,10 @@ CA_BOOL get_biggest_blocks(struct heap_block* blks, unsigned int num)
 	return CA_TRUE;
 }
 
-CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
+CA_BOOL walk_inuse_blocks(struct inuse_block* opBlocks, unsigned long* opCount)
 {
 	unsigned int i;
-	struct block_info* pBlockinfo = opBlocks;
+	struct inuse_block* pBlockinfo = opBlocks;
 	*opCount = 0;
 
 	if (!g_heap_initialized)
@@ -334,7 +338,6 @@ CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
 					{
 						pBlockinfo->addr = block_addr(regionp->blocks[blk_index]);
 						pBlockinfo->size = block_addr(regionp->blocks[blk_index+1])	- block_addr(regionp->blocks[blk_index]);
-						pBlockinfo->ref_count = 0;
 						pBlockinfo++;
 					}
 				}
@@ -349,7 +352,6 @@ CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
 				{
 					pBlockinfo->addr = block_addr(regionp->start);
 					pBlockinfo->size = regionp->end - block_addr(regionp->start);
-					pBlockinfo->ref_count = 0;
 					pBlockinfo++;
 				}
 			}
@@ -364,10 +366,10 @@ CA_BOOL walk_inuse_blocks(struct block_info* opBlocks, unsigned long* opCount)
 }
 
 /*
-CA_BOOL walk_inuse_blocks_old(struct block_info* opBlocks, unsigned long* opCount)
+CA_BOOL walk_inuse_blocks_old(struct inuse_block* opBlocks, unsigned long* opCount)
 {
 	unsigned int zone_index;
-	struct block_info* pBlockinfo = opBlocks;
+	struct inuse_block* pBlockinfo = opBlocks;
 	*opCount = 0;
 
 	if (!g_heap_initialized)
@@ -844,7 +846,7 @@ static CA_BOOL small_region_walk(szone_t* szonep,
 			}
 			if (display_each_block)
 			{
-				CA_PRINT("\t\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size=%d in-use\n",
+				CA_PRINT("\t\t\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size=%d in-use\n",
 						ptr, ptr + SMALL_BYTES_FOR_MSIZE(msize),
 						SMALL_BYTES_FOR_MSIZE(msize));
 			}
@@ -919,9 +921,9 @@ static CA_BOOL small_region_walk(szone_t* szonep,
 
 	if (!display_each_block)
 	{
-		CA_PRINT(" In-use %ld(", num_inuse);
+		CA_PRINT(" In-use %d(", num_inuse);
 		print_size(inuse_bytes);
-		CA_PRINT(") Free %ld(", num_free);
+		CA_PRINT(") Free %d(", num_free);
 		print_size(free_bytes);
 		CA_PRINT(")\n");
 	}
@@ -1090,7 +1092,7 @@ tiny_region_walk(szone_t* szonep, region_t region, CA_BOOL display_each_block, s
 			}
 			if (display_each_block)
 			{
-				CA_PRINT("\t\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size=%d in-use\n",
+				CA_PRINT("\t\t\t"PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER" size=%d in-use\n",
 						ptr, ptr + TINY_BYTES_FOR_MSIZE(msize),
 						TINY_BYTES_FOR_MSIZE(msize));
 			}
@@ -1179,9 +1181,9 @@ tiny_region_walk(szone_t* szonep, region_t region, CA_BOOL display_each_block, s
 
 	if (!display_each_block)
 	{
-		CA_PRINT(" In-use %ld(", num_inuse);
+		CA_PRINT(" In-use %d(", num_inuse);
 		print_size(inuse_bytes);
-		CA_PRINT(") Free %ld(", num_free);
+		CA_PRINT(") Free %d(", num_free);
 		print_size(free_bytes);
 		CA_PRINT(")\n");
 	}

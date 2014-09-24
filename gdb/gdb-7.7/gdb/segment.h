@@ -13,6 +13,7 @@
 struct ca_thread
 {
 	int    tid;
+	long   lwp;
 	void*  context;
 };
 

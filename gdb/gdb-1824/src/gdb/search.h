@@ -30,8 +30,6 @@ extern void set_shared_objects_indirection_level(unsigned int);
 
 extern void print_memory_pattern(address_t lo, address_t hi);
 
-extern CA_BOOL biggest_blocks(unsigned int num);
-
 extern void print_ref(const struct object_reference*, unsigned int, CA_BOOL, CA_BOOL);
 
 extern void fill_ref_location(struct object_reference*);

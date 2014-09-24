@@ -178,7 +178,8 @@ unsigned long GetULong(void* ipData)
 	return value;
 }
 #endif
-#define GetUInt(p) (*(p))
+
+#define GetUInt(p) (*(unsigned int*)(p))
 
 #define PN_XNUM 0xffff
 
@@ -589,7 +590,7 @@ static bool InitLinkMap(MmapFile& irExec, MmapFile& irCore)
 	}
 
 #ifdef CA_DEBUG
-	struct link_map * linkmap = gLinkMap;
+	linkmap = gLinkMap;
 	for (int i=0; linkmap; i++)
 	{
 		char* name = (char*) core_to_mmap_addr((address_t)GetULong(&linkmap->l_name));
@@ -615,7 +616,6 @@ static bool InitLinkMap(MmapFile& irExec, MmapFile& irCore)
 	return true;
 }
 
-#ifdef linux
 static bool InitLinkMap_32(MmapFile& irExec, MmapFile& irCore)
 {
 	char* lpExecStart = irExec.GetStartAddr();
@@ -626,8 +626,11 @@ static bool InitLinkMap_32(MmapFile& irExec, MmapFile& irCore)
 
 	// search for .dynamic section
 	Elf32_Dyn* dyn = NULL;
+#if defined(linux)
 	Elf32_Xword dyn_size = 0;
-
+#elif defined(sun)
+	Elf32_Word dyn_size = 0;
+#endif
 	Elf32_Shdr* shdr = (Elf32_Shdr*)(lpExecStart + elfhdr->e_shoff);
 	Elf32_Shdr* shstrtbl = shdr + elfhdr->e_shstrndx;
 	char* shstr = lpExecStart + shstrtbl->sh_offset;
@@ -706,7 +709,11 @@ static bool InitLinkMap_32(MmapFile& irExec, MmapFile& irCore)
 
 		for (; (char*)dyn >lpCoreStart && (char*)dyn < lpCoreEnd; dyn++)
 		{
+#if defined(linux)
 			Elf32_Xword tag = GetUInt(&dyn->d_tag);
+#elif defined(sun)
+			Elf32_Sword tag = GetUInt(&dyn->d_tag);
+#endif
 			if (tag == DT_NULL)
 				break;
 #ifdef linux
@@ -750,7 +757,7 @@ static bool InitLinkMap_32(MmapFile& irExec, MmapFile& irCore)
 	}
 
 #ifdef CA_DEBUG
-	struct link_map_32 * linkmap = gLinkMap_32;
+	linkmap = gLinkMap_32;
 	for (int i=0; linkmap; i++)
 	{
 		char* name = (char*) core_to_mmap_addr((address_t)GetUInt(&linkmap->l_name));
@@ -765,7 +772,7 @@ static bool InitLinkMap_32(MmapFile& irExec, MmapFile& irCore)
 			dyn++;
 		};
 
-		printf("[%d] base=[0x%lx] name=%s .dyn=0x%lx\n", i, GetUint(&linkmap->l_addr), name, GetUInt(&linkmap->l_ld));
+		printf("[%d] base=[0x%lx] name=%s .dyn=0x%lx\n", i, GetUInt(&linkmap->l_addr), name, GetUInt(&linkmap->l_ld));
 		if (linkmap->l_next == 0)
 			break;
 		linkmap = (struct link_map_32*) core_to_mmap_addr((address_t)GetUInt(&linkmap->l_next));
@@ -775,7 +782,6 @@ static bool InitLinkMap_32(MmapFile& irExec, MmapFile& irCore)
 #endif
 	return true;
 }
-#endif
 
 //////////////////////////////////////////////////////////////
 // First parse of the core file
@@ -798,11 +804,7 @@ bool InitCoreAnalyzer(MmapFile& irExec, MmapFile& irCore)
 	if (ptr_bit == 64)
 		rc = InitLinkMap (irExec, irCore);
 	else
-#ifdef linux
 		rc = InitLinkMap_32 (irExec, irCore);
-#else
-		rc = false;
-#endif
 
 	return rc;
 }
@@ -858,10 +860,11 @@ static bool VerifyELFHeader_32(Elf32_Ehdr* elfhdr )
 	if (elfhdr->e_machine != EM_IA_32)
 #else
 	if (elfhdr->e_machine != EM_386
-		&& elfhdr->e_machine != EM_SPARC)
+		&& elfhdr->e_machine != EM_SPARC
+		&& elfhdr->e_machine != EM_SPARC32PLUS)
 #endif
 	{
-		printf("[Error] acceptable architectures: 386, sparc, ia32\n");
+		printf("[Error] acceptable architectures: 386, sparc, sparc32plus, ia32\n");
 		return false;
 	}
 	return true;

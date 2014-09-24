@@ -1,7324 +1,1376 @@
 /*
- * decode.cpp
+ * decode.c
  *
- *  Created on: May 15, 2013
+ *  Created on: Aug 22, 2014
  *      Author: myan
  */
-#include <setjmp.h>
-#include <map>
-#include "segment.h"
+#include "decode.h"
 #include "search.h"
-#include "heap.h"
-#include "ca_i386.h"
+#include "segment.h"
 
-#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
-#define STRING_COMMA_LEN(STR) (STR), (sizeof(STR)-1)
-#define CONST_STRNEQ(STR1,STR2) (strncmp((STR1), (STR2), sizeof(STR2)-1) == 0)
+#ifdef _WIN32	// wrapper of gdb utilities
 
-#ifndef OPCODE_I386_H
-#define OPCODE_I386_H
+typedef void bfd_byte;
+typedef void gdb_byte;
 
-#ifndef SYSV386_COMPAT
-/* Set non-zero for broken, compatible instructions.  Set to zero for
-   non-broken opcodes at your peril.  gcc generates SystemV/386
-   compatible instructions.  */
-#define SYSV386_COMPAT 1
+static void ui_out_message(void* uiout, int, const char* format, ...)
+{
+	static char msg_buf[NAME_BUF_SZ];
+	va_list args;
+	va_start (args, format);
+	vsprintf(msg_buf, format, args);
+	dprintf(msg_buf);
+	va_end (args);
+}
+
+static void ui_out_text(void* uiout, const char* text)
+{
+	dprintf(text);
+}
+
+static void ui_out_spaces(void* uiout, int nspace)
+{
+	int i;
+	for (i = 0; i < nspace; i++)
+		dprintf(" ");
+}
+
+static void ui_out_field_core_addr(void* uiout, const char* field_name, void* gdbarch, CORE_ADDR addr)
+{
+	return;
+}
+
+static void ui_out_field_int(void* uiout, const char* field_name, int offset)
+{
+	dprintf("%d", offset);
+}
+
+static const char* pc_prefix(CORE_ADDR addr)
+{
+	static char pc_buf[32];
+	snprintf(pc_buf, 32, "%p", addr);
+	return pc_buf;
+}
+
+static int build_address_symbolic(void* gdbarch, CORE_ADDR addr,
+		int, char**name, int* offset, char**filename, int* line, int*unmapped)
+{
+	// Not implemented
+	return -1;
+}
+
 #endif
 
-#define MOV_AX_DISP32 0xa0
-#define POP_SEG_SHORT 0x07
-#define JUMP_PC_RELATIVE 0xeb
-#define INT_OPCODE  0xcd
-#define INT3_OPCODE 0xcc
-/* The opcode for the fwait instruction, which disassembler treats as a
-   prefix when it can.  */
-#define FWAIT_OPCODE 0x9b
-
-/* Instruction prefixes.
-   NOTE: For certain SSE* instructions, 0x66,0xf2,0xf3 are treated as
-   part of the opcode.  Other prefixes may still appear between them
-   and the 0x0f part of the opcode.  */
-#define ADDR_PREFIX_OPCODE 0x67
-#define DATA_PREFIX_OPCODE 0x66
-#define LOCK_PREFIX_OPCODE 0xf0
-#define CS_PREFIX_OPCODE 0x2e
-#define DS_PREFIX_OPCODE 0x3e
-#define ES_PREFIX_OPCODE 0x26
-#define FS_PREFIX_OPCODE 0x64
-#define GS_PREFIX_OPCODE 0x65
-#define SS_PREFIX_OPCODE 0x36
-#define REPNE_PREFIX_OPCODE 0xf2
-#define REPE_PREFIX_OPCODE  0xf3
-#define XACQUIRE_PREFIX_OPCODE 0xf2
-#define XRELEASE_PREFIX_OPCODE 0xf3
-
-#define TWO_BYTE_OPCODE_ESCAPE 0x0f
-#define NOP_OPCODE (char) 0x90
-
-/* register numbers */
-#define EAX_REG_NUM 0
-#define ECX_REG_NUM 1
-#define EDX_REG_NUM 2
-#define EBX_REG_NUM 3
-#define ESP_REG_NUM 4
-#define EBP_REG_NUM 5
-#define ESI_REG_NUM 6
-#define EDI_REG_NUM 7
-
-/* modrm_byte.regmem for twobyte escape */
-#define ESCAPE_TO_TWO_BYTE_ADDRESSING ESP_REG_NUM
-/* index_base_byte.index for no index register addressing */
-#define NO_INDEX_REGISTER ESP_REG_NUM
-/* index_base_byte.base for no base register addressing */
-#define NO_BASE_REGISTER EBP_REG_NUM
-#define NO_BASE_REGISTER_16 6
-
-/* modrm.mode = REGMEM_FIELD_HAS_REG when a register is in there */
-#define REGMEM_FIELD_HAS_REG 0x3/* always = 0x3 */
-#define REGMEM_FIELD_HAS_MEM (~REGMEM_FIELD_HAS_REG)
-
-/* Extract fields from the mod/rm byte.  */
-#define MODRM_MOD_FIELD(modrm) (((modrm) >> 6) & 3)
-#define MODRM_REG_FIELD(modrm) (((modrm) >> 3) & 7)
-#define MODRM_RM_FIELD(modrm)  (((modrm) >> 0) & 7)
-
-/* Extract fields from the sib byte.  */
-#define SIB_SCALE_FIELD(sib) (((sib) >> 6) & 3)
-#define SIB_INDEX_FIELD(sib) (((sib) >> 3) & 7)
-#define SIB_BASE_FIELD(sib)  (((sib) >> 0) & 7)
-
-/* x86-64 extension prefix.  */
-#define REX_OPCODE	0x40
-
-/* Non-zero if OPCODE is the rex prefix.  */
-#define REX_PREFIX_P(opcode) (((opcode) & 0xf0) == REX_OPCODE)
-
-/* Indicates 64 bit operand size.  */
-#define REX_W	8
-/* High extension to reg field of modrm byte.  */
-#define REX_R	4
-/* High extension to SIB index field.  */
-#define REX_X	2
-/* High extension to base field of modrm or SIB, or reg field of opcode.  */
-#define REX_B	1
-
-/* max operands per insn */
-#define MAX_OPERANDS 5
-
-/* max immediates per insn (lcall, ljmp, insertq, extrq) */
-#define MAX_IMMEDIATE_OPERANDS 2
-
-/* max memory refs per insn (string ops) */
-#define MAX_MEMORY_OPERANDS 2
-
-/* max size of insn mnemonics.  */
-#define MAX_MNEM_SIZE 20
-
-/* max size of register name in insn mnemonics.  */
-#define MAX_REG_NAME_SIZE 8
-
-#endif /* OPCODE_I386_H */
-
-typedef int (*fprintf_ftype) (void *, const char*, ...);
-
-typedef struct disassemble_info
+enum CA_OPERATOR
 {
-	fprintf_ftype fprintf_func;
-	void *stream;
-	//void *application_data;
-	//enum bfd_flavour flavour;
-	//enum bfd_architecture arch;
-	//unsigned long mach;
-	//enum bfd_endian endian;
-	//enum bfd_endian endian_code;
-	//void *insn_sets;
-	//asection *section;
-	//asymbol **symbols;
-	//int num_symbols;
-
-	//asymbol **symtab;
-	//int symtab_pos;
-	//int symtab_size;
-
-	//unsigned long flags;
-	//#define INSN_HAS_RELOC	 (1 << 31)
-	//#define DISASSEMBLE_DATA (1 << 30)
-	//#define USER_SPECIFIED_MACHINE_TYPE (1 << 29)
-
-	void *private_data;
-
-	int (*read_memory_func)
-		(ULONG64 memaddr, unsigned char *myaddr, unsigned int length,
-		struct disassemble_info *dinfo);
-
-	void (*memory_error_func)
-		(int status, ULONG64 memaddr, struct disassemble_info *dinfo);
-
-	void (*print_address_func)
-		(ULONG64 addr, struct disassemble_info *dinfo);
-
-	//int (* symbol_at_address_func)
-	//	(ULONG64 addr, struct disassemble_info *dinfo);
-
-	//bfd_boolean (* symbol_is_valid)
-	//	(asymbol *, struct disassemble_info *dinfo);
-
-	//unsigned char *buffer;
-	//ULONG64 buffer_vma;
-	//unsigned int buffer_length;
-
-	int bytes_per_line;
-
-	//int bytes_per_chunk;
-	//enum bfd_endian display_endian;
-
-	//unsigned int octets_per_byte;
-
-	//unsigned int skip_zeroes;
-
-	//unsigned int skip_zeroes_at_end;
-
-	//bfd_boolean disassembler_needs_relocs;
-
-	//char insn_info_valid;
-	//char branch_delay_insns;
-	//char data_size;
-	//enum dis_insn_type insn_type;
-	//ULONG64 target;
-	//ULONG64 target2;
-
-	char * disassembler_options;
-} disassemble_info;
-
-static int print_insn(ULONG64, disassemble_info *);
-static void dofloat(int);
-static void OP_ST(int, int);
-static void OP_STi(int, int);
-static int putop(const char *, int);
-static void oappend(const char *);
-static void append_seg(void);
-static void OP_indirE(int, int);
-static void print_operand_value(char *, int, __int64);
-static void OP_E_register(int, int);
-static void OP_E_memory(int, int);
-static void print_displacement(char *, __int64);
-static void OP_E(int, int);
-static void OP_G(int, int);
-static ULONG64 get64(void);
-static ULONG64 get32(void);
-static ULONG64 get32s(void);
-static int get16(void);
-static void set_op(ULONG64, int);
-static void OP_Skip_MODRM(int, int);
-static void OP_REG(int, int);
-static void OP_IMREG(int, int);
-static void OP_I(int, int);
-static void OP_I64(int, int);
-static void OP_sI(int, int);
-static void OP_J(int, int);
-static void OP_SEG(int, int);
-static void OP_DIR(int, int);
-static void OP_OFF(int, int);
-static void OP_OFF64(int, int);
-static void ptr_reg(int, int);
-static void OP_ESreg(int, int);
-static void OP_DSreg(int, int);
-static void OP_C(int, int);
-static void OP_D(int, int);
-static void OP_T(int, int);
-static void OP_R(int, int);
-static void OP_MMX(int, int);
-static void OP_XMM(int, int);
-static void OP_EM(int, int);
-static void OP_EX(int, int);
-static void OP_EMC(int, int);
-static void OP_MXC(int, int);
-static void OP_MS(int, int);
-static void OP_XS(int, int);
-static void OP_M(int, int);
-static void OP_VEX(int, int);
-static void OP_EX_Vex(int, int);
-static void OP_EX_VexW(int, int);
-static void OP_EX_VexImmW(int, int);
-static void OP_XMM_Vex(int, int);
-static void OP_XMM_VexW(int, int);
-static void OP_REG_VexI4(int, int);
-static void PCLMUL_Fixup(int, int);
-static void VEXI4_Fixup(int, int);
-static void VZERO_Fixup(int, int);
-static void VCMP_Fixup(int, int);
-static void OP_0f07(int, int);
-static void OP_Monitor(int, int);
-static void OP_Mwait(int, int);
-static void NOP_Fixup1(int, int);
-static void NOP_Fixup2(int, int);
-static void OP_3DNowSuffix(int, int);
-static void CMP_Fixup(int, int);
-static void BadOp(void);
-static void REP_Fixup(int, int);
-static void CMPXCHG8B_Fixup(int, int);
-static void XMM_Fixup(int, int);
-static void CRC32_Fixup(int, int);
-static void FXSAVE_Fixup(int, int);
-static void OP_LWPCB_E(int, int);
-static void OP_LWP_E(int, int);
-static void OP_Vex_2src_1(int, int);
-static void OP_Vex_2src_2(int, int);
-
-static void MOVBE_Fixup(int, int);
-
-struct dis_private {
-	/* Points to first byte not fetched.  */
-	unsigned char *max_fetched;
-	unsigned char the_buffer[MAX_MNEM_SIZE];
-	ULONG64 insn_start;
-	int orig_sizeflag;
-	jmp_buf bailout;
+	ADD,
+	SUBTRACT,
+	MULTIPLY,
+	DIVIDE,
+	INCREMENT,
+	DECREMENT,
+	BITWISE_AND,
+	BITWISE_OR,
+	BITWISE_NOT,
+	BITWISE_XOR,
+	BITWISE_SHIFT_RIGHT,
+	BITWISE_SHIFT_LEFT,
+	ROTATE_RIGHT,
+	ROTATE_LEFT
 };
 
-enum address_mode {
-	mode_16bit, mode_32bit, mode_64bit
+// A local variable on stack, its value can always be queried given its address
+struct ca_stack_var
+{
+	address_t stack_addr;
+	char* sym_name;
+	struct win_type type;
 };
-
-enum address_mode address_mode;
-
-/* Flags for the prefixes for the current instruction.  See below.  */
-static int prefixes;
-
-/* REX prefix the current instruction.  See below.  */
-static int rex;
-/* Bits of REX we've already used.  */
-static int rex_used;
-/* REX bits in original REX prefix ignored.  */
-static int rex_ignored;
-/* Mark parts used in the REX prefix.  When we are testing for
- empty prefix (for 8bit register REX extension), just mask it
- out.  Otherwise test for REX bit is excuse for existence of REX
- only in case value is nonzero.  */
-#define USED_REX(value)					\
-  {							\
-    if (value)						\
-      {							\
-	if ((rex & value))				\
-	  rex_used |= (value) | REX_OPCODE;		\
-      }							\
-    else						\
-      rex_used |= REX_OPCODE;				\
-  }
-
-/* Flags for prefixes which we somehow handled when printing the
- current instruction.  */
-static int used_prefixes;
-
-/* Flags stored in PREFIXES.  */
-#define PREFIX_REPZ 1
-#define PREFIX_REPNZ 2
-#define PREFIX_LOCK 4
-#define PREFIX_CS 8
-#define PREFIX_SS 0x10
-#define PREFIX_DS 0x20
-#define PREFIX_ES 0x40
-#define PREFIX_FS 0x80
-#define PREFIX_GS 0x100
-#define PREFIX_DATA 0x200
-#define PREFIX_ADDR 0x400
-#define PREFIX_FWAIT 0x800
-
-/* Make sure that bytes from INFO->PRIVATE_DATA->BUFFER (inclusive)
- to ADDR (exclusive) are valid.  Returns 1 for success, longjmps
- on error.  */
-#define FETCH_DATA(info, addr) \
-  ((addr) <= ((struct dis_private *) (info->private_data))->max_fetched \
-   ? 1 : fetch_data ((info), (addr)))
-
-static int fetch_data(struct disassemble_info *info, unsigned char *addr) {
-	int status;
-	struct dis_private *priv = (struct dis_private *) info->private_data;
-	ULONG64 start = priv->insn_start + (priv->max_fetched - priv->the_buffer);
-
-	if (addr <= priv->the_buffer + MAX_MNEM_SIZE)
-		status = (*info->read_memory_func)(start, priv->max_fetched,
-				addr - priv->max_fetched, info);
-	else
-		status = -1;
-	if (status != 0) {
-		/* If we did manage to read at least one byte, then
-		 print_insn_i386 will do something sensible.  Otherwise, print
-		 an error.  We do that here because this is where we know
-		 STATUS.  */
-		if (priv->max_fetched == priv->the_buffer)
-			(*info->memory_error_func)(status, start, info);
-		longjmp(priv->bailout, 1);
-	} else
-		priv->max_fetched = addr;
-	return 1;
-}
-
-#define XX { NULL, 0 }
-#define Bad_Opcode NULL, { { NULL, 0 } }
-
-#define Eb { OP_E, b_mode }
-#define EbS { OP_E, b_swap_mode }
-#define Ev { OP_E, v_mode }
-#define EvS { OP_E, v_swap_mode }
-#define Ed { OP_E, d_mode }
-#define Edq { OP_E, dq_mode }
-#define Edqw { OP_E, dqw_mode }
-#define Edqb { OP_E, dqb_mode }
-#define Edqd { OP_E, dqd_mode }
-#define Eq { OP_E, q_mode }
-#define indirEv { OP_indirE, stack_v_mode }
-#define indirEp { OP_indirE, f_mode }
-#define stackEv { OP_E, stack_v_mode }
-#define Em { OP_E, m_mode }
-#define Ew { OP_E, w_mode }
-#define M { OP_M, 0 }		/* lea, lgdt, etc. */
-#define Ma { OP_M, a_mode }
-#define Mb { OP_M, b_mode }
-#define Md { OP_M, d_mode }
-#define Mo { OP_M, o_mode }
-#define Mp { OP_M, f_mode }		/* 32 or 48 bit memory operand for LDS, LES etc */
-#define Mq { OP_M, q_mode }
-#define Mx { OP_M, x_mode }
-#define Mxmm { OP_M, xmm_mode }
-#define Gb { OP_G, b_mode }
-#define Gv { OP_G, v_mode }
-#define Gd { OP_G, d_mode }
-#define Gdq { OP_G, dq_mode }
-#define Gm { OP_G, m_mode }
-#define Gw { OP_G, w_mode }
-#define Rd { OP_R, d_mode }
-#define Rm { OP_R, m_mode }
-#define Ib { OP_I, b_mode }
-#define sIb { OP_sI, b_mode }	/* sign extened byte */
-#define sIbT { OP_sI, b_T_mode } /* sign extened byte like 'T' */
-#define Iv { OP_I, v_mode }
-#define sIv { OP_sI, v_mode }
-#define Iq { OP_I, q_mode }
-#define Iv64 { OP_I64, v_mode }
-#define Iw { OP_I, w_mode }
-#define I1 { OP_I, const_1_mode }
-#define Jb { OP_J, b_mode }
-#define Jv { OP_J, v_mode }
-#define Cm { OP_C, m_mode }
-#define Dm { OP_D, m_mode }
-#define Td { OP_T, d_mode }
-#define Skip_MODRM { OP_Skip_MODRM, 0 }
-
-#define RMeAX { OP_REG, eAX_reg }
-#define RMeBX { OP_REG, eBX_reg }
-#define RMeCX { OP_REG, eCX_reg }
-#define RMeDX { OP_REG, eDX_reg }
-#define RMeSP { OP_REG, eSP_reg }
-#define RMeBP { OP_REG, eBP_reg }
-#define RMeSI { OP_REG, eSI_reg }
-#define RMeDI { OP_REG, eDI_reg }
-#define RMrAX { OP_REG, rAX_reg }
-#define RMrBX { OP_REG, rBX_reg }
-#define RMrCX { OP_REG, rCX_reg }
-#define RMrDX { OP_REG, rDX_reg }
-#define RMrSP { OP_REG, rSP_reg }
-#define RMrBP { OP_REG, rBP_reg }
-#define RMrSI { OP_REG, rSI_reg }
-#define RMrDI { OP_REG, rDI_reg }
-#define RMAL { OP_REG, al_reg }
-#define RMCL { OP_REG, cl_reg }
-#define RMDL { OP_REG, dl_reg }
-#define RMBL { OP_REG, bl_reg }
-#define RMAH { OP_REG, ah_reg }
-#define RMCH { OP_REG, ch_reg }
-#define RMDH { OP_REG, dh_reg }
-#define RMBH { OP_REG, bh_reg }
-#define RMAX { OP_REG, enum_ax_reg }
-#define RMDX { OP_REG, dx_reg }
-
-#define eAX { OP_IMREG, eAX_reg }
-#define eBX { OP_IMREG, eBX_reg }
-#define eCX { OP_IMREG, eCX_reg }
-#define eDX { OP_IMREG, eDX_reg }
-#define eSP { OP_IMREG, eSP_reg }
-#define eBP { OP_IMREG, eBP_reg }
-#define eSI { OP_IMREG, eSI_reg }
-#define eDI { OP_IMREG, eDI_reg }
-#define AL { OP_IMREG, al_reg }
-#define CL { OP_IMREG, cl_reg }
-#define DL { OP_IMREG, dl_reg }
-#define BL { OP_IMREG, bl_reg }
-#define AH { OP_IMREG, ah_reg }
-#define CH { OP_IMREG, ch_reg }
-#define DH { OP_IMREG, dh_reg }
-#define BH { OP_IMREG, bh_reg }
-#define AX { OP_IMREG, enum_ax_reg }
-#define DX { OP_IMREG, dx_reg }
-#define zAX { OP_IMREG, z_mode_ax_reg }
-#define indirDX { OP_IMREG, indir_dx_reg }
-
-#define Sw { OP_SEG, w_mode }
-#define Sv { OP_SEG, v_mode }
-#define Ap { OP_DIR, 0 }
-#define Ob { OP_OFF64, b_mode }
-#define Ov { OP_OFF64, v_mode }
-#define Xb { OP_DSreg, eSI_reg }
-#define Xv { OP_DSreg, eSI_reg }
-#define Xz { OP_DSreg, eSI_reg }
-#define Yb { OP_ESreg, eDI_reg }
-#define Yv { OP_ESreg, eDI_reg }
-#define DSBX { OP_DSreg, eBX_reg }
-
-#define es { OP_REG, es_reg }
-#define ss { OP_REG, ss_reg }
-#define cs { OP_REG, cs_reg }
-#define ds { OP_REG, ds_reg }
-#define fs { OP_REG, fs_reg }
-#define gs { OP_REG, gs_reg }
-
-#define MX { OP_MMX, 0 }
-#define XM { OP_XMM, 0 }
-#define XMScalar { OP_XMM, scalar_mode }
-#define XMM { OP_XMM, xmm_mode }
-#define EM { OP_EM, v_mode }
-#define EMS { OP_EM, v_swap_mode }
-#define EMd { OP_EM, d_mode }
-#define EMx { OP_EM, x_mode }
-#define EXw { OP_EX, w_mode }
-#define EXd { OP_EX, d_mode }
-#define EXdScalar { OP_EX, d_scalar_mode }
-#define EXdS { OP_EX, d_swap_mode }
-#define EXq { OP_EX, q_mode }
-#define EXqScalar { OP_EX, q_scalar_mode }
-#define EXqScalarS { OP_EX, q_scalar_swap_mode }
-#define EXqS { OP_EX, q_swap_mode }
-#define EXx { OP_EX, x_mode }
-#define EXxS { OP_EX, x_swap_mode }
-#define EXxmm { OP_EX, xmm_mode }
-#define EXxmmq { OP_EX, xmmq_mode }
-#define EXymmq { OP_EX, ymmq_mode }
-#define EXVexWdq { OP_EX, vex_w_dq_mode }
-#define EXVexWdqScalar { OP_EX, vex_scalar_w_dq_mode }
-#define MS { OP_MS, v_mode }
-#define XS { OP_XS, v_mode }
-#define EMCq { OP_EMC, q_mode }
-#define MXC { OP_MXC, 0 }
-#define OPSUF { OP_3DNowSuffix, 0 }
-#define CMP { CMP_Fixup, 0 }
-#define XMM0 { XMM_Fixup, 0 }
-#define FXSAVE { FXSAVE_Fixup, 0 }
-#define Vex_2src_1 { OP_Vex_2src_1, 0 }
-#define Vex_2src_2 { OP_Vex_2src_2, 0 }
-
-#define Vex { OP_VEX, vex_mode }
-#define VexScalar { OP_VEX, vex_scalar_mode }
-#define Vex128 { OP_VEX, vex128_mode }
-#define Vex256 { OP_VEX, vex256_mode }
-#define VexGdq { OP_VEX, dq_mode }
-#define VexI4 { VEXI4_Fixup, 0}
-#define EXdVex { OP_EX_Vex, d_mode }
-#define EXdVexS { OP_EX_Vex, d_swap_mode }
-#define EXdVexScalarS { OP_EX_Vex, d_scalar_swap_mode }
-#define EXqVex { OP_EX_Vex, q_mode }
-#define EXqVexS { OP_EX_Vex, q_swap_mode }
-#define EXqVexScalarS { OP_EX_Vex, q_scalar_swap_mode }
-#define EXVexW { OP_EX_VexW, x_mode }
-#define EXdVexW { OP_EX_VexW, d_mode }
-#define EXqVexW { OP_EX_VexW, q_mode }
-#define EXVexImmW { OP_EX_VexImmW, x_mode }
-#define XMVex { OP_XMM_Vex, 0 }
-#define XMVexScalar { OP_XMM_Vex, scalar_mode }
-#define XMVexW { OP_XMM_VexW, 0 }
-#define XMVexI4 { OP_REG_VexI4, x_mode }
-#define PCLMUL { PCLMUL_Fixup, 0 }
-#define VZERO { VZERO_Fixup, 0 }
-#define VCMP { VCMP_Fixup, 0 }
-
-/* Used handle "rep" prefix for string instructions.  */
-#define Xbr { REP_Fixup, eSI_reg }
-#define Xvr { REP_Fixup, eSI_reg }
-#define Ybr { REP_Fixup, eDI_reg }
-#define Yvr { REP_Fixup, eDI_reg }
-#define Yzr { REP_Fixup, eDI_reg }
-#define indirDXr { REP_Fixup, indir_dx_reg }
-#define ALr { REP_Fixup, al_reg }
-#define eAXr { REP_Fixup, eAX_reg }
-
-#define cond_jump_flag { NULL, cond_jump_mode }
-#define loop_jcxz_flag { NULL, loop_jcxz_mode }
-
-/* bits in sizeflag */
-#define SUFFIX_ALWAYS 4
-#define AFLAG 2
-#define DFLAG 1
-
-enum {
-	/* byte operand */
-	b_mode = 1,
-	/* byte operand with operand swapped */
-	b_swap_mode,
-	/* byte operand, sign extend like 'T' suffix */
-	b_T_mode,
-	/* operand size depends on prefixes */
-	v_mode,
-	/* operand size depends on prefixes with operand swapped */
-	v_swap_mode,
-	/* word operand */
-	w_mode,
-	/* double word operand  */
-	d_mode,
-	/* double word operand with operand swapped */
-	d_swap_mode,
-	/* quad word operand */
-	q_mode,
-	/* quad word operand with operand swapped */
-	q_swap_mode,
-	/* ten-byte operand */
-	t_mode,
-	/* 16-byte XMM or 32-byte YMM operand */
-	x_mode,
-	/* 16-byte XMM or 32-byte YMM operand with operand swapped */
-	x_swap_mode,
-	/* 16-byte XMM operand */
-	xmm_mode,
-	/* 16-byte XMM or quad word operand */
-	xmmq_mode,
-	/* 32-byte YMM or quad word operand */
-	ymmq_mode,
-	/* d_mode in 32bit, q_mode in 64bit mode.  */
-	m_mode,
-	/* pair of v_mode operands */
-	a_mode, cond_jump_mode, loop_jcxz_mode,
-	/* operand size depends on REX prefixes.  */
-	dq_mode,
-	/* registers like dq_mode, memory like w_mode.  */
-	dqw_mode,
-	/* 4- or 6-byte pointer operand */
-	f_mode, const_1_mode,
-	/* v_mode for stack-related opcodes.  */
-	stack_v_mode,
-	/* non-quad operand size depends on prefixes */
-	z_mode,
-	/* 16-byte operand */
-	o_mode,
-	/* registers like dq_mode, memory like b_mode.  */
-	dqb_mode,
-	/* registers like dq_mode, memory like d_mode.  */
-	dqd_mode,
-	/* normal vex mode */
-	vex_mode,
-	/* 128bit vex mode */
-	vex128_mode,
-	/* 256bit vex mode */
-	vex256_mode,
-	/* operand size depends on the VEX.W bit.  */
-	vex_w_dq_mode,
-
-	/* scalar, ignore vector length.  */
-	scalar_mode,
-	/* like d_mode, ignore vector length.  */
-	d_scalar_mode,
-	/* like d_swap_mode, ignore vector length.  */
-	d_scalar_swap_mode,
-	/* like q_mode, ignore vector length.  */
-	q_scalar_mode,
-	/* like q_swap_mode, ignore vector length.  */
-	q_scalar_swap_mode,
-	/* like vex_mode, ignore vector length.  */
-	vex_scalar_mode,
-	/* like vex_w_dq_mode, ignore vector length.  */
-	vex_scalar_w_dq_mode,
-
-	es_reg, cs_reg, ss_reg, ds_reg, fs_reg, gs_reg,
-
-	eAX_reg, eCX_reg, eDX_reg, eBX_reg, eSP_reg, eBP_reg, eSI_reg, eDI_reg,
-
-	al_reg, cl_reg, dl_reg, bl_reg, ah_reg, ch_reg, dh_reg, bh_reg,
-
-	enum_ax_reg, cx_reg, dx_reg, bx_reg, sp_reg, bp_reg, si_reg, di_reg,
-
-	rAX_reg, rCX_reg, rDX_reg, rBX_reg, rSP_reg, rBP_reg, rSI_reg, rDI_reg,
-
-	z_mode_ax_reg, indir_dx_reg
-};
-
-enum {
-	FLOATCODE = 1,
-	USE_REG_TABLE,
-	USE_MOD_TABLE,
-	USE_RM_TABLE,
-	USE_PREFIX_TABLE,
-	USE_X86_64_TABLE,
-	USE_3BYTE_TABLE,
-	USE_XOP_8F_TABLE,
-	USE_VEX_C4_TABLE,
-	USE_VEX_C5_TABLE,
-	USE_VEX_LEN_TABLE,
-	USE_VEX_W_TABLE
-};
-
-#define FLOAT			NULL, { { NULL, FLOATCODE } }
-
-#define DIS386(T, I)		NULL, { { NULL, (T)}, { NULL,  (I) } }
-#define REG_TABLE(I)		DIS386 (USE_REG_TABLE, (I))
-#define MOD_TABLE(I)		DIS386 (USE_MOD_TABLE, (I))
-#define RM_TABLE(I)		DIS386 (USE_RM_TABLE, (I))
-#define PREFIX_TABLE(I)		DIS386 (USE_PREFIX_TABLE, (I))
-#define X86_64_TABLE(I)		DIS386 (USE_X86_64_TABLE, (I))
-#define THREE_BYTE_TABLE(I)	DIS386 (USE_3BYTE_TABLE, (I))
-#define XOP_8F_TABLE(I)		DIS386 (USE_XOP_8F_TABLE, (I))
-#define VEX_C4_TABLE(I)		DIS386 (USE_VEX_C4_TABLE, (I))
-#define VEX_C5_TABLE(I)		DIS386 (USE_VEX_C5_TABLE, (I))
-#define VEX_LEN_TABLE(I)	DIS386 (USE_VEX_LEN_TABLE, (I))
-#define VEX_W_TABLE(I)		DIS386 (USE_VEX_W_TABLE, (I))
-
-enum {
-	REG_80 = 0,
-	REG_81,
-	REG_82,
-	REG_8F,
-	REG_C0,
-	REG_C1,
-	REG_C6,
-	REG_C7,
-	REG_D0,
-	REG_D1,
-	REG_D2,
-	REG_D3,
-	REG_F6,
-	REG_F7,
-	REG_FE,
-	REG_FF,
-	REG_0F00,
-	REG_0F01,
-	REG_0F0D,
-	REG_0F18,
-	REG_0F71,
-	REG_0F72,
-	REG_0F73,
-	REG_0FA6,
-	REG_0FA7,
-	REG_0FAE,
-	REG_0FBA,
-	REG_0FC7,
-	REG_VEX_0F71,
-	REG_VEX_0F72,
-	REG_VEX_0F73,
-	REG_VEX_0FAE,
-	REG_VEX_0F38F3,
-	REG_XOP_LWPCB,
-	REG_XOP_LWP,
-	REG_XOP_TBM_01,
-	REG_XOP_TBM_02
-};
-
-enum {
-	MOD_8D = 0,
-	MOD_0F01_REG_0,
-	MOD_0F01_REG_1,
-	MOD_0F01_REG_2,
-	MOD_0F01_REG_3,
-	MOD_0F01_REG_7,
-	MOD_0F12_PREFIX_0,
-	MOD_0F13,
-	MOD_0F16_PREFIX_0,
-	MOD_0F17,
-	MOD_0F18_REG_0,
-	MOD_0F18_REG_1,
-	MOD_0F18_REG_2,
-	MOD_0F18_REG_3,
-	MOD_0F20,
-	MOD_0F21,
-	MOD_0F22,
-	MOD_0F23,
-	MOD_0F24,
-	MOD_0F26,
-	MOD_0F2B_PREFIX_0,
-	MOD_0F2B_PREFIX_1,
-	MOD_0F2B_PREFIX_2,
-	MOD_0F2B_PREFIX_3,
-	MOD_0F51,
-	MOD_0F71_REG_2,
-	MOD_0F71_REG_4,
-	MOD_0F71_REG_6,
-	MOD_0F72_REG_2,
-	MOD_0F72_REG_4,
-	MOD_0F72_REG_6,
-	MOD_0F73_REG_2,
-	MOD_0F73_REG_3,
-	MOD_0F73_REG_6,
-	MOD_0F73_REG_7,
-	MOD_0FAE_REG_0,
-	MOD_0FAE_REG_1,
-	MOD_0FAE_REG_2,
-	MOD_0FAE_REG_3,
-	MOD_0FAE_REG_4,
-	MOD_0FAE_REG_5,
-	MOD_0FAE_REG_6,
-	MOD_0FAE_REG_7,
-	MOD_0FB2,
-	MOD_0FB4,
-	MOD_0FB5,
-	MOD_0FC7_REG_6,
-	MOD_0FC7_REG_7,
-	MOD_0FD7,
-	MOD_0FE7_PREFIX_2,
-	MOD_0FF0_PREFIX_3,
-	MOD_0F382A_PREFIX_2,
-	MOD_62_32BIT,
-	MOD_C4_32BIT,
-	MOD_C5_32BIT,
-	MOD_VEX_0F12_PREFIX_0,
-	MOD_VEX_0F13,
-	MOD_VEX_0F16_PREFIX_0,
-	MOD_VEX_0F17,
-	MOD_VEX_0F2B,
-	MOD_VEX_0F50,
-	MOD_VEX_0F71_REG_2,
-	MOD_VEX_0F71_REG_4,
-	MOD_VEX_0F71_REG_6,
-	MOD_VEX_0F72_REG_2,
-	MOD_VEX_0F72_REG_4,
-	MOD_VEX_0F72_REG_6,
-	MOD_VEX_0F73_REG_2,
-	MOD_VEX_0F73_REG_3,
-	MOD_VEX_0F73_REG_6,
-	MOD_VEX_0F73_REG_7,
-	MOD_VEX_0FAE_REG_2,
-	MOD_VEX_0FAE_REG_3,
-	MOD_VEX_0FD7_PREFIX_2,
-	MOD_VEX_0FE7_PREFIX_2,
-	MOD_VEX_0FF0_PREFIX_3,
-	MOD_VEX_0F3818_PREFIX_2,
-	MOD_VEX_0F3819_PREFIX_2,
-	MOD_VEX_0F381A_PREFIX_2,
-	MOD_VEX_0F382A_PREFIX_2,
-	MOD_VEX_0F382C_PREFIX_2,
-	MOD_VEX_0F382D_PREFIX_2,
-	MOD_VEX_0F382E_PREFIX_2,
-	MOD_VEX_0F382F_PREFIX_2
-};
-
-enum {
-	RM_0F01_REG_0 = 0,
-	RM_0F01_REG_1,
-	RM_0F01_REG_2,
-	RM_0F01_REG_3,
-	RM_0F01_REG_7,
-	RM_0FAE_REG_5,
-	RM_0FAE_REG_6,
-	RM_0FAE_REG_7
-};
-
-enum {
-	PREFIX_90 = 0,
-	PREFIX_0F10,
-	PREFIX_0F11,
-	PREFIX_0F12,
-	PREFIX_0F16,
-	PREFIX_0F2A,
-	PREFIX_0F2B,
-	PREFIX_0F2C,
-	PREFIX_0F2D,
-	PREFIX_0F2E,
-	PREFIX_0F2F,
-	PREFIX_0F51,
-	PREFIX_0F52,
-	PREFIX_0F53,
-	PREFIX_0F58,
-	PREFIX_0F59,
-	PREFIX_0F5A,
-	PREFIX_0F5B,
-	PREFIX_0F5C,
-	PREFIX_0F5D,
-	PREFIX_0F5E,
-	PREFIX_0F5F,
-	PREFIX_0F60,
-	PREFIX_0F61,
-	PREFIX_0F62,
-	PREFIX_0F6C,
-	PREFIX_0F6D,
-	PREFIX_0F6F,
-	PREFIX_0F70,
-	PREFIX_0F73_REG_3,
-	PREFIX_0F73_REG_7,
-	PREFIX_0F78,
-	PREFIX_0F79,
-	PREFIX_0F7C,
-	PREFIX_0F7D,
-	PREFIX_0F7E,
-	PREFIX_0F7F,
-	PREFIX_0FAE_REG_0,
-	PREFIX_0FAE_REG_1,
-	PREFIX_0FAE_REG_2,
-	PREFIX_0FAE_REG_3,
-	PREFIX_0FB8,
-	PREFIX_0FBC,
-	PREFIX_0FBD,
-	PREFIX_0FC2,
-	PREFIX_0FC3,
-	PREFIX_0FC7_REG_6,
-	PREFIX_0FD0,
-	PREFIX_0FD6,
-	PREFIX_0FE6,
-	PREFIX_0FE7,
-	PREFIX_0FF0,
-	PREFIX_0FF7,
-	PREFIX_0F3810,
-	PREFIX_0F3814,
-	PREFIX_0F3815,
-	PREFIX_0F3817,
-	PREFIX_0F3820,
-	PREFIX_0F3821,
-	PREFIX_0F3822,
-	PREFIX_0F3823,
-	PREFIX_0F3824,
-	PREFIX_0F3825,
-	PREFIX_0F3828,
-	PREFIX_0F3829,
-	PREFIX_0F382A,
-	PREFIX_0F382B,
-	PREFIX_0F3830,
-	PREFIX_0F3831,
-	PREFIX_0F3832,
-	PREFIX_0F3833,
-	PREFIX_0F3834,
-	PREFIX_0F3835,
-	PREFIX_0F3837,
-	PREFIX_0F3838,
-	PREFIX_0F3839,
-	PREFIX_0F383A,
-	PREFIX_0F383B,
-	PREFIX_0F383C,
-	PREFIX_0F383D,
-	PREFIX_0F383E,
-	PREFIX_0F383F,
-	PREFIX_0F3840,
-	PREFIX_0F3841,
-	PREFIX_0F3880,
-	PREFIX_0F3881,
-	PREFIX_0F38DB,
-	PREFIX_0F38DC,
-	PREFIX_0F38DD,
-	PREFIX_0F38DE,
-	PREFIX_0F38DF,
-	PREFIX_0F38F0,
-	PREFIX_0F38F1,
-	PREFIX_0F3A08,
-	PREFIX_0F3A09,
-	PREFIX_0F3A0A,
-	PREFIX_0F3A0B,
-	PREFIX_0F3A0C,
-	PREFIX_0F3A0D,
-	PREFIX_0F3A0E,
-	PREFIX_0F3A14,
-	PREFIX_0F3A15,
-	PREFIX_0F3A16,
-	PREFIX_0F3A17,
-	PREFIX_0F3A20,
-	PREFIX_0F3A21,
-	PREFIX_0F3A22,
-	PREFIX_0F3A40,
-	PREFIX_0F3A41,
-	PREFIX_0F3A42,
-	PREFIX_0F3A44,
-	PREFIX_0F3A60,
-	PREFIX_0F3A61,
-	PREFIX_0F3A62,
-	PREFIX_0F3A63,
-	PREFIX_0F3ADF,
-	PREFIX_VEX_0F10,
-	PREFIX_VEX_0F11,
-	PREFIX_VEX_0F12,
-	PREFIX_VEX_0F16,
-	PREFIX_VEX_0F2A,
-	PREFIX_VEX_0F2C,
-	PREFIX_VEX_0F2D,
-	PREFIX_VEX_0F2E,
-	PREFIX_VEX_0F2F,
-	PREFIX_VEX_0F51,
-	PREFIX_VEX_0F52,
-	PREFIX_VEX_0F53,
-	PREFIX_VEX_0F58,
-	PREFIX_VEX_0F59,
-	PREFIX_VEX_0F5A,
-	PREFIX_VEX_0F5B,
-	PREFIX_VEX_0F5C,
-	PREFIX_VEX_0F5D,
-	PREFIX_VEX_0F5E,
-	PREFIX_VEX_0F5F,
-	PREFIX_VEX_0F60,
-	PREFIX_VEX_0F61,
-	PREFIX_VEX_0F62,
-	PREFIX_VEX_0F63,
-	PREFIX_VEX_0F64,
-	PREFIX_VEX_0F65,
-	PREFIX_VEX_0F66,
-	PREFIX_VEX_0F67,
-	PREFIX_VEX_0F68,
-	PREFIX_VEX_0F69,
-	PREFIX_VEX_0F6A,
-	PREFIX_VEX_0F6B,
-	PREFIX_VEX_0F6C,
-	PREFIX_VEX_0F6D,
-	PREFIX_VEX_0F6E,
-	PREFIX_VEX_0F6F,
-	PREFIX_VEX_0F70,
-	PREFIX_VEX_0F71_REG_2,
-	PREFIX_VEX_0F71_REG_4,
-	PREFIX_VEX_0F71_REG_6,
-	PREFIX_VEX_0F72_REG_2,
-	PREFIX_VEX_0F72_REG_4,
-	PREFIX_VEX_0F72_REG_6,
-	PREFIX_VEX_0F73_REG_2,
-	PREFIX_VEX_0F73_REG_3,
-	PREFIX_VEX_0F73_REG_6,
-	PREFIX_VEX_0F73_REG_7,
-	PREFIX_VEX_0F74,
-	PREFIX_VEX_0F75,
-	PREFIX_VEX_0F76,
-	PREFIX_VEX_0F77,
-	PREFIX_VEX_0F7C,
-	PREFIX_VEX_0F7D,
-	PREFIX_VEX_0F7E,
-	PREFIX_VEX_0F7F,
-	PREFIX_VEX_0FC2,
-	PREFIX_VEX_0FC4,
-	PREFIX_VEX_0FC5,
-	PREFIX_VEX_0FD0,
-	PREFIX_VEX_0FD1,
-	PREFIX_VEX_0FD2,
-	PREFIX_VEX_0FD3,
-	PREFIX_VEX_0FD4,
-	PREFIX_VEX_0FD5,
-	PREFIX_VEX_0FD6,
-	PREFIX_VEX_0FD7,
-	PREFIX_VEX_0FD8,
-	PREFIX_VEX_0FD9,
-	PREFIX_VEX_0FDA,
-	PREFIX_VEX_0FDB,
-	PREFIX_VEX_0FDC,
-	PREFIX_VEX_0FDD,
-	PREFIX_VEX_0FDE,
-	PREFIX_VEX_0FDF,
-	PREFIX_VEX_0FE0,
-	PREFIX_VEX_0FE1,
-	PREFIX_VEX_0FE2,
-	PREFIX_VEX_0FE3,
-	PREFIX_VEX_0FE4,
-	PREFIX_VEX_0FE5,
-	PREFIX_VEX_0FE6,
-	PREFIX_VEX_0FE7,
-	PREFIX_VEX_0FE8,
-	PREFIX_VEX_0FE9,
-	PREFIX_VEX_0FEA,
-	PREFIX_VEX_0FEB,
-	PREFIX_VEX_0FEC,
-	PREFIX_VEX_0FED,
-	PREFIX_VEX_0FEE,
-	PREFIX_VEX_0FEF,
-	PREFIX_VEX_0FF0,
-	PREFIX_VEX_0FF1,
-	PREFIX_VEX_0FF2,
-	PREFIX_VEX_0FF3,
-	PREFIX_VEX_0FF4,
-	PREFIX_VEX_0FF5,
-	PREFIX_VEX_0FF6,
-	PREFIX_VEX_0FF7,
-	PREFIX_VEX_0FF8,
-	PREFIX_VEX_0FF9,
-	PREFIX_VEX_0FFA,
-	PREFIX_VEX_0FFB,
-	PREFIX_VEX_0FFC,
-	PREFIX_VEX_0FFD,
-	PREFIX_VEX_0FFE,
-	PREFIX_VEX_0F3800,
-	PREFIX_VEX_0F3801,
-	PREFIX_VEX_0F3802,
-	PREFIX_VEX_0F3803,
-	PREFIX_VEX_0F3804,
-	PREFIX_VEX_0F3805,
-	PREFIX_VEX_0F3806,
-	PREFIX_VEX_0F3807,
-	PREFIX_VEX_0F3808,
-	PREFIX_VEX_0F3809,
-	PREFIX_VEX_0F380A,
-	PREFIX_VEX_0F380B,
-	PREFIX_VEX_0F380C,
-	PREFIX_VEX_0F380D,
-	PREFIX_VEX_0F380E,
-	PREFIX_VEX_0F380F,
-	PREFIX_VEX_0F3813,
-	PREFIX_VEX_0F3817,
-	PREFIX_VEX_0F3818,
-	PREFIX_VEX_0F3819,
-	PREFIX_VEX_0F381A,
-	PREFIX_VEX_0F381C,
-	PREFIX_VEX_0F381D,
-	PREFIX_VEX_0F381E,
-	PREFIX_VEX_0F3820,
-	PREFIX_VEX_0F3821,
-	PREFIX_VEX_0F3822,
-	PREFIX_VEX_0F3823,
-	PREFIX_VEX_0F3824,
-	PREFIX_VEX_0F3825,
-	PREFIX_VEX_0F3828,
-	PREFIX_VEX_0F3829,
-	PREFIX_VEX_0F382A,
-	PREFIX_VEX_0F382B,
-	PREFIX_VEX_0F382C,
-	PREFIX_VEX_0F382D,
-	PREFIX_VEX_0F382E,
-	PREFIX_VEX_0F382F,
-	PREFIX_VEX_0F3830,
-	PREFIX_VEX_0F3831,
-	PREFIX_VEX_0F3832,
-	PREFIX_VEX_0F3833,
-	PREFIX_VEX_0F3834,
-	PREFIX_VEX_0F3835,
-	PREFIX_VEX_0F3837,
-	PREFIX_VEX_0F3838,
-	PREFIX_VEX_0F3839,
-	PREFIX_VEX_0F383A,
-	PREFIX_VEX_0F383B,
-	PREFIX_VEX_0F383C,
-	PREFIX_VEX_0F383D,
-	PREFIX_VEX_0F383E,
-	PREFIX_VEX_0F383F,
-	PREFIX_VEX_0F3840,
-	PREFIX_VEX_0F3841,
-	PREFIX_VEX_0F3896,
-	PREFIX_VEX_0F3897,
-	PREFIX_VEX_0F3898,
-	PREFIX_VEX_0F3899,
-	PREFIX_VEX_0F389A,
-	PREFIX_VEX_0F389B,
-	PREFIX_VEX_0F389C,
-	PREFIX_VEX_0F389D,
-	PREFIX_VEX_0F389E,
-	PREFIX_VEX_0F389F,
-	PREFIX_VEX_0F38A6,
-	PREFIX_VEX_0F38A7,
-	PREFIX_VEX_0F38A8,
-	PREFIX_VEX_0F38A9,
-	PREFIX_VEX_0F38AA,
-	PREFIX_VEX_0F38AB,
-	PREFIX_VEX_0F38AC,
-	PREFIX_VEX_0F38AD,
-	PREFIX_VEX_0F38AE,
-	PREFIX_VEX_0F38AF,
-	PREFIX_VEX_0F38B6,
-	PREFIX_VEX_0F38B7,
-	PREFIX_VEX_0F38B8,
-	PREFIX_VEX_0F38B9,
-	PREFIX_VEX_0F38BA,
-	PREFIX_VEX_0F38BB,
-	PREFIX_VEX_0F38BC,
-	PREFIX_VEX_0F38BD,
-	PREFIX_VEX_0F38BE,
-	PREFIX_VEX_0F38BF,
-	PREFIX_VEX_0F38DB,
-	PREFIX_VEX_0F38DC,
-	PREFIX_VEX_0F38DD,
-	PREFIX_VEX_0F38DE,
-	PREFIX_VEX_0F38DF,
-	PREFIX_VEX_0F38F2,
-	PREFIX_VEX_0F38F3_REG_1,
-	PREFIX_VEX_0F38F3_REG_2,
-	PREFIX_VEX_0F38F3_REG_3,
-	PREFIX_VEX_0F38F7,
-	PREFIX_VEX_0F3A04,
-	PREFIX_VEX_0F3A05,
-	PREFIX_VEX_0F3A06,
-	PREFIX_VEX_0F3A08,
-	PREFIX_VEX_0F3A09,
-	PREFIX_VEX_0F3A0A,
-	PREFIX_VEX_0F3A0B,
-	PREFIX_VEX_0F3A0C,
-	PREFIX_VEX_0F3A0D,
-	PREFIX_VEX_0F3A0E,
-	PREFIX_VEX_0F3A0F,
-	PREFIX_VEX_0F3A14,
-	PREFIX_VEX_0F3A15,
-	PREFIX_VEX_0F3A16,
-	PREFIX_VEX_0F3A17,
-	PREFIX_VEX_0F3A18,
-	PREFIX_VEX_0F3A19,
-	PREFIX_VEX_0F3A1D,
-	PREFIX_VEX_0F3A20,
-	PREFIX_VEX_0F3A21,
-	PREFIX_VEX_0F3A22,
-	PREFIX_VEX_0F3A40,
-	PREFIX_VEX_0F3A41,
-	PREFIX_VEX_0F3A42,
-	PREFIX_VEX_0F3A44,
-	PREFIX_VEX_0F3A48,
-	PREFIX_VEX_0F3A49,
-	PREFIX_VEX_0F3A4A,
-	PREFIX_VEX_0F3A4B,
-	PREFIX_VEX_0F3A4C,
-	PREFIX_VEX_0F3A5C,
-	PREFIX_VEX_0F3A5D,
-	PREFIX_VEX_0F3A5E,
-	PREFIX_VEX_0F3A5F,
-	PREFIX_VEX_0F3A60,
-	PREFIX_VEX_0F3A61,
-	PREFIX_VEX_0F3A62,
-	PREFIX_VEX_0F3A63,
-	PREFIX_VEX_0F3A68,
-	PREFIX_VEX_0F3A69,
-	PREFIX_VEX_0F3A6A,
-	PREFIX_VEX_0F3A6B,
-	PREFIX_VEX_0F3A6C,
-	PREFIX_VEX_0F3A6D,
-	PREFIX_VEX_0F3A6E,
-	PREFIX_VEX_0F3A6F,
-	PREFIX_VEX_0F3A78,
-	PREFIX_VEX_0F3A79,
-	PREFIX_VEX_0F3A7A,
-	PREFIX_VEX_0F3A7B,
-	PREFIX_VEX_0F3A7C,
-	PREFIX_VEX_0F3A7D,
-	PREFIX_VEX_0F3A7E,
-	PREFIX_VEX_0F3A7F,
-	PREFIX_VEX_0F3ADF
-};
-
-enum {
-	X86_64_06 = 0,
-	X86_64_07,
-	X86_64_0D,
-	X86_64_16,
-	X86_64_17,
-	X86_64_1E,
-	X86_64_1F,
-	X86_64_27,
-	X86_64_2F,
-	X86_64_37,
-	X86_64_3F,
-	X86_64_60,
-	X86_64_61,
-	X86_64_62,
-	X86_64_63,
-	X86_64_6D,
-	X86_64_6F,
-	X86_64_9A,
-	X86_64_C4,
-	X86_64_C5,
-	X86_64_CE,
-	X86_64_D4,
-	X86_64_D5,
-	X86_64_EA,
-	X86_64_0F01_REG_0,
-	X86_64_0F01_REG_1,
-	X86_64_0F01_REG_2,
-	X86_64_0F01_REG_3
-};
-
-enum {
-	THREE_BYTE_0F38 = 0, THREE_BYTE_0F3A, THREE_BYTE_0F7A
-};
-
-enum {
-	XOP_08 = 0, XOP_09, XOP_0A
-};
-
-enum {
-	VEX_0F = 0, VEX_0F38, VEX_0F3A
-};
-
-enum {
-	VEX_LEN_0F10_P_1 = 0,
-	VEX_LEN_0F10_P_3,
-	VEX_LEN_0F11_P_1,
-	VEX_LEN_0F11_P_3,
-	VEX_LEN_0F12_P_0_M_0,
-	VEX_LEN_0F12_P_0_M_1,
-	VEX_LEN_0F12_P_2,
-	VEX_LEN_0F13_M_0,
-	VEX_LEN_0F16_P_0_M_0,
-	VEX_LEN_0F16_P_0_M_1,
-	VEX_LEN_0F16_P_2,
-	VEX_LEN_0F17_M_0,
-	VEX_LEN_0F2A_P_1,
-	VEX_LEN_0F2A_P_3,
-	VEX_LEN_0F2C_P_1,
-	VEX_LEN_0F2C_P_3,
-	VEX_LEN_0F2D_P_1,
-	VEX_LEN_0F2D_P_3,
-	VEX_LEN_0F2E_P_0,
-	VEX_LEN_0F2E_P_2,
-	VEX_LEN_0F2F_P_0,
-	VEX_LEN_0F2F_P_2,
-	VEX_LEN_0F51_P_1,
-	VEX_LEN_0F51_P_3,
-	VEX_LEN_0F52_P_1,
-	VEX_LEN_0F53_P_1,
-	VEX_LEN_0F58_P_1,
-	VEX_LEN_0F58_P_3,
-	VEX_LEN_0F59_P_1,
-	VEX_LEN_0F59_P_3,
-	VEX_LEN_0F5A_P_1,
-	VEX_LEN_0F5A_P_3,
-	VEX_LEN_0F5C_P_1,
-	VEX_LEN_0F5C_P_3,
-	VEX_LEN_0F5D_P_1,
-	VEX_LEN_0F5D_P_3,
-	VEX_LEN_0F5E_P_1,
-	VEX_LEN_0F5E_P_3,
-	VEX_LEN_0F5F_P_1,
-	VEX_LEN_0F5F_P_3,
-	VEX_LEN_0F60_P_2,
-	VEX_LEN_0F61_P_2,
-	VEX_LEN_0F62_P_2,
-	VEX_LEN_0F63_P_2,
-	VEX_LEN_0F64_P_2,
-	VEX_LEN_0F65_P_2,
-	VEX_LEN_0F66_P_2,
-	VEX_LEN_0F67_P_2,
-	VEX_LEN_0F68_P_2,
-	VEX_LEN_0F69_P_2,
-	VEX_LEN_0F6A_P_2,
-	VEX_LEN_0F6B_P_2,
-	VEX_LEN_0F6C_P_2,
-	VEX_LEN_0F6D_P_2,
-	VEX_LEN_0F6E_P_2,
-	VEX_LEN_0F70_P_1,
-	VEX_LEN_0F70_P_2,
-	VEX_LEN_0F70_P_3,
-	VEX_LEN_0F71_R_2_P_2,
-	VEX_LEN_0F71_R_4_P_2,
-	VEX_LEN_0F71_R_6_P_2,
-	VEX_LEN_0F72_R_2_P_2,
-	VEX_LEN_0F72_R_4_P_2,
-	VEX_LEN_0F72_R_6_P_2,
-	VEX_LEN_0F73_R_2_P_2,
-	VEX_LEN_0F73_R_3_P_2,
-	VEX_LEN_0F73_R_6_P_2,
-	VEX_LEN_0F73_R_7_P_2,
-	VEX_LEN_0F74_P_2,
-	VEX_LEN_0F75_P_2,
-	VEX_LEN_0F76_P_2,
-	VEX_LEN_0F7E_P_1,
-	VEX_LEN_0F7E_P_2,
-	VEX_LEN_0FAE_R_2_M_0,
-	VEX_LEN_0FAE_R_3_M_0,
-	VEX_LEN_0FC2_P_1,
-	VEX_LEN_0FC2_P_3,
-	VEX_LEN_0FC4_P_2,
-	VEX_LEN_0FC5_P_2,
-	VEX_LEN_0FD1_P_2,
-	VEX_LEN_0FD2_P_2,
-	VEX_LEN_0FD3_P_2,
-	VEX_LEN_0FD4_P_2,
-	VEX_LEN_0FD5_P_2,
-	VEX_LEN_0FD6_P_2,
-	VEX_LEN_0FD7_P_2_M_1,
-	VEX_LEN_0FD8_P_2,
-	VEX_LEN_0FD9_P_2,
-	VEX_LEN_0FDA_P_2,
-	VEX_LEN_0FDB_P_2,
-	VEX_LEN_0FDC_P_2,
-	VEX_LEN_0FDD_P_2,
-	VEX_LEN_0FDE_P_2,
-	VEX_LEN_0FDF_P_2,
-	VEX_LEN_0FE0_P_2,
-	VEX_LEN_0FE1_P_2,
-	VEX_LEN_0FE2_P_2,
-	VEX_LEN_0FE3_P_2,
-	VEX_LEN_0FE4_P_2,
-	VEX_LEN_0FE5_P_2,
-	VEX_LEN_0FE8_P_2,
-	VEX_LEN_0FE9_P_2,
-	VEX_LEN_0FEA_P_2,
-	VEX_LEN_0FEB_P_2,
-	VEX_LEN_0FEC_P_2,
-	VEX_LEN_0FED_P_2,
-	VEX_LEN_0FEE_P_2,
-	VEX_LEN_0FEF_P_2,
-	VEX_LEN_0FF1_P_2,
-	VEX_LEN_0FF2_P_2,
-	VEX_LEN_0FF3_P_2,
-	VEX_LEN_0FF4_P_2,
-	VEX_LEN_0FF5_P_2,
-	VEX_LEN_0FF6_P_2,
-	VEX_LEN_0FF7_P_2,
-	VEX_LEN_0FF8_P_2,
-	VEX_LEN_0FF9_P_2,
-	VEX_LEN_0FFA_P_2,
-	VEX_LEN_0FFB_P_2,
-	VEX_LEN_0FFC_P_2,
-	VEX_LEN_0FFD_P_2,
-	VEX_LEN_0FFE_P_2,
-	VEX_LEN_0F3800_P_2,
-	VEX_LEN_0F3801_P_2,
-	VEX_LEN_0F3802_P_2,
-	VEX_LEN_0F3803_P_2,
-	VEX_LEN_0F3804_P_2,
-	VEX_LEN_0F3805_P_2,
-	VEX_LEN_0F3806_P_2,
-	VEX_LEN_0F3807_P_2,
-	VEX_LEN_0F3808_P_2,
-	VEX_LEN_0F3809_P_2,
-	VEX_LEN_0F380A_P_2,
-	VEX_LEN_0F380B_P_2,
-	VEX_LEN_0F3819_P_2_M_0,
-	VEX_LEN_0F381A_P_2_M_0,
-	VEX_LEN_0F381C_P_2,
-	VEX_LEN_0F381D_P_2,
-	VEX_LEN_0F381E_P_2,
-	VEX_LEN_0F3820_P_2,
-	VEX_LEN_0F3821_P_2,
-	VEX_LEN_0F3822_P_2,
-	VEX_LEN_0F3823_P_2,
-	VEX_LEN_0F3824_P_2,
-	VEX_LEN_0F3825_P_2,
-	VEX_LEN_0F3828_P_2,
-	VEX_LEN_0F3829_P_2,
-	VEX_LEN_0F382A_P_2_M_0,
-	VEX_LEN_0F382B_P_2,
-	VEX_LEN_0F3830_P_2,
-	VEX_LEN_0F3831_P_2,
-	VEX_LEN_0F3832_P_2,
-	VEX_LEN_0F3833_P_2,
-	VEX_LEN_0F3834_P_2,
-	VEX_LEN_0F3835_P_2,
-	VEX_LEN_0F3837_P_2,
-	VEX_LEN_0F3838_P_2,
-	VEX_LEN_0F3839_P_2,
-	VEX_LEN_0F383A_P_2,
-	VEX_LEN_0F383B_P_2,
-	VEX_LEN_0F383C_P_2,
-	VEX_LEN_0F383D_P_2,
-	VEX_LEN_0F383E_P_2,
-	VEX_LEN_0F383F_P_2,
-	VEX_LEN_0F3840_P_2,
-	VEX_LEN_0F3841_P_2,
-	VEX_LEN_0F38DB_P_2,
-	VEX_LEN_0F38DC_P_2,
-	VEX_LEN_0F38DD_P_2,
-	VEX_LEN_0F38DE_P_2,
-	VEX_LEN_0F38DF_P_2,
-	VEX_LEN_0F38F2_P_0,
-	VEX_LEN_0F38F3_R_1_P_0,
-	VEX_LEN_0F38F3_R_2_P_0,
-	VEX_LEN_0F38F3_R_3_P_0,
-	VEX_LEN_0F38F7_P_0,
-	VEX_LEN_0F3A06_P_2,
-	VEX_LEN_0F3A0A_P_2,
-	VEX_LEN_0F3A0B_P_2,
-	VEX_LEN_0F3A0E_P_2,
-	VEX_LEN_0F3A0F_P_2,
-	VEX_LEN_0F3A14_P_2,
-	VEX_LEN_0F3A15_P_2,
-	VEX_LEN_0F3A16_P_2,
-	VEX_LEN_0F3A17_P_2,
-	VEX_LEN_0F3A18_P_2,
-	VEX_LEN_0F3A19_P_2,
-	VEX_LEN_0F3A20_P_2,
-	VEX_LEN_0F3A21_P_2,
-	VEX_LEN_0F3A22_P_2,
-	VEX_LEN_0F3A41_P_2,
-	VEX_LEN_0F3A42_P_2,
-	VEX_LEN_0F3A44_P_2,
-	VEX_LEN_0F3A4C_P_2,
-	VEX_LEN_0F3A60_P_2,
-	VEX_LEN_0F3A61_P_2,
-	VEX_LEN_0F3A62_P_2,
-	VEX_LEN_0F3A63_P_2,
-	VEX_LEN_0F3A6A_P_2,
-	VEX_LEN_0F3A6B_P_2,
-	VEX_LEN_0F3A6E_P_2,
-	VEX_LEN_0F3A6F_P_2,
-	VEX_LEN_0F3A7A_P_2,
-	VEX_LEN_0F3A7B_P_2,
-	VEX_LEN_0F3A7E_P_2,
-	VEX_LEN_0F3A7F_P_2,
-	VEX_LEN_0F3ADF_P_2,
-	VEX_LEN_0FXOP_09_80,
-	VEX_LEN_0FXOP_09_81
-};
-
-enum {
-	VEX_W_0F10_P_0 = 0,
-	VEX_W_0F10_P_1,
-	VEX_W_0F10_P_2,
-	VEX_W_0F10_P_3,
-	VEX_W_0F11_P_0,
-	VEX_W_0F11_P_1,
-	VEX_W_0F11_P_2,
-	VEX_W_0F11_P_3,
-	VEX_W_0F12_P_0_M_0,
-	VEX_W_0F12_P_0_M_1,
-	VEX_W_0F12_P_1,
-	VEX_W_0F12_P_2,
-	VEX_W_0F12_P_3,
-	VEX_W_0F13_M_0,
-	VEX_W_0F14,
-	VEX_W_0F15,
-	VEX_W_0F16_P_0_M_0,
-	VEX_W_0F16_P_0_M_1,
-	VEX_W_0F16_P_1,
-	VEX_W_0F16_P_2,
-	VEX_W_0F17_M_0,
-	VEX_W_0F28,
-	VEX_W_0F29,
-	VEX_W_0F2B_M_0,
-	VEX_W_0F2E_P_0,
-	VEX_W_0F2E_P_2,
-	VEX_W_0F2F_P_0,
-	VEX_W_0F2F_P_2,
-	VEX_W_0F50_M_0,
-	VEX_W_0F51_P_0,
-	VEX_W_0F51_P_1,
-	VEX_W_0F51_P_2,
-	VEX_W_0F51_P_3,
-	VEX_W_0F52_P_0,
-	VEX_W_0F52_P_1,
-	VEX_W_0F53_P_0,
-	VEX_W_0F53_P_1,
-	VEX_W_0F58_P_0,
-	VEX_W_0F58_P_1,
-	VEX_W_0F58_P_2,
-	VEX_W_0F58_P_3,
-	VEX_W_0F59_P_0,
-	VEX_W_0F59_P_1,
-	VEX_W_0F59_P_2,
-	VEX_W_0F59_P_3,
-	VEX_W_0F5A_P_0,
-	VEX_W_0F5A_P_1,
-	VEX_W_0F5A_P_3,
-	VEX_W_0F5B_P_0,
-	VEX_W_0F5B_P_1,
-	VEX_W_0F5B_P_2,
-	VEX_W_0F5C_P_0,
-	VEX_W_0F5C_P_1,
-	VEX_W_0F5C_P_2,
-	VEX_W_0F5C_P_3,
-	VEX_W_0F5D_P_0,
-	VEX_W_0F5D_P_1,
-	VEX_W_0F5D_P_2,
-	VEX_W_0F5D_P_3,
-	VEX_W_0F5E_P_0,
-	VEX_W_0F5E_P_1,
-	VEX_W_0F5E_P_2,
-	VEX_W_0F5E_P_3,
-	VEX_W_0F5F_P_0,
-	VEX_W_0F5F_P_1,
-	VEX_W_0F5F_P_2,
-	VEX_W_0F5F_P_3,
-	VEX_W_0F60_P_2,
-	VEX_W_0F61_P_2,
-	VEX_W_0F62_P_2,
-	VEX_W_0F63_P_2,
-	VEX_W_0F64_P_2,
-	VEX_W_0F65_P_2,
-	VEX_W_0F66_P_2,
-	VEX_W_0F67_P_2,
-	VEX_W_0F68_P_2,
-	VEX_W_0F69_P_2,
-	VEX_W_0F6A_P_2,
-	VEX_W_0F6B_P_2,
-	VEX_W_0F6C_P_2,
-	VEX_W_0F6D_P_2,
-	VEX_W_0F6F_P_1,
-	VEX_W_0F6F_P_2,
-	VEX_W_0F70_P_1,
-	VEX_W_0F70_P_2,
-	VEX_W_0F70_P_3,
-	VEX_W_0F71_R_2_P_2,
-	VEX_W_0F71_R_4_P_2,
-	VEX_W_0F71_R_6_P_2,
-	VEX_W_0F72_R_2_P_2,
-	VEX_W_0F72_R_4_P_2,
-	VEX_W_0F72_R_6_P_2,
-	VEX_W_0F73_R_2_P_2,
-	VEX_W_0F73_R_3_P_2,
-	VEX_W_0F73_R_6_P_2,
-	VEX_W_0F73_R_7_P_2,
-	VEX_W_0F74_P_2,
-	VEX_W_0F75_P_2,
-	VEX_W_0F76_P_2,
-	VEX_W_0F77_P_0,
-	VEX_W_0F7C_P_2,
-	VEX_W_0F7C_P_3,
-	VEX_W_0F7D_P_2,
-	VEX_W_0F7D_P_3,
-	VEX_W_0F7E_P_1,
-	VEX_W_0F7F_P_1,
-	VEX_W_0F7F_P_2,
-	VEX_W_0FAE_R_2_M_0,
-	VEX_W_0FAE_R_3_M_0,
-	VEX_W_0FC2_P_0,
-	VEX_W_0FC2_P_1,
-	VEX_W_0FC2_P_2,
-	VEX_W_0FC2_P_3,
-	VEX_W_0FC4_P_2,
-	VEX_W_0FC5_P_2,
-	VEX_W_0FD0_P_2,
-	VEX_W_0FD0_P_3,
-	VEX_W_0FD1_P_2,
-	VEX_W_0FD2_P_2,
-	VEX_W_0FD3_P_2,
-	VEX_W_0FD4_P_2,
-	VEX_W_0FD5_P_2,
-	VEX_W_0FD6_P_2,
-	VEX_W_0FD7_P_2_M_1,
-	VEX_W_0FD8_P_2,
-	VEX_W_0FD9_P_2,
-	VEX_W_0FDA_P_2,
-	VEX_W_0FDB_P_2,
-	VEX_W_0FDC_P_2,
-	VEX_W_0FDD_P_2,
-	VEX_W_0FDE_P_2,
-	VEX_W_0FDF_P_2,
-	VEX_W_0FE0_P_2,
-	VEX_W_0FE1_P_2,
-	VEX_W_0FE2_P_2,
-	VEX_W_0FE3_P_2,
-	VEX_W_0FE4_P_2,
-	VEX_W_0FE5_P_2,
-	VEX_W_0FE6_P_1,
-	VEX_W_0FE6_P_2,
-	VEX_W_0FE6_P_3,
-	VEX_W_0FE7_P_2_M_0,
-	VEX_W_0FE8_P_2,
-	VEX_W_0FE9_P_2,
-	VEX_W_0FEA_P_2,
-	VEX_W_0FEB_P_2,
-	VEX_W_0FEC_P_2,
-	VEX_W_0FED_P_2,
-	VEX_W_0FEE_P_2,
-	VEX_W_0FEF_P_2,
-	VEX_W_0FF0_P_3_M_0,
-	VEX_W_0FF1_P_2,
-	VEX_W_0FF2_P_2,
-	VEX_W_0FF3_P_2,
-	VEX_W_0FF4_P_2,
-	VEX_W_0FF5_P_2,
-	VEX_W_0FF6_P_2,
-	VEX_W_0FF7_P_2,
-	VEX_W_0FF8_P_2,
-	VEX_W_0FF9_P_2,
-	VEX_W_0FFA_P_2,
-	VEX_W_0FFB_P_2,
-	VEX_W_0FFC_P_2,
-	VEX_W_0FFD_P_2,
-	VEX_W_0FFE_P_2,
-	VEX_W_0F3800_P_2,
-	VEX_W_0F3801_P_2,
-	VEX_W_0F3802_P_2,
-	VEX_W_0F3803_P_2,
-	VEX_W_0F3804_P_2,
-	VEX_W_0F3805_P_2,
-	VEX_W_0F3806_P_2,
-	VEX_W_0F3807_P_2,
-	VEX_W_0F3808_P_2,
-	VEX_W_0F3809_P_2,
-	VEX_W_0F380A_P_2,
-	VEX_W_0F380B_P_2,
-	VEX_W_0F380C_P_2,
-	VEX_W_0F380D_P_2,
-	VEX_W_0F380E_P_2,
-	VEX_W_0F380F_P_2,
-	VEX_W_0F3817_P_2,
-	VEX_W_0F3818_P_2_M_0,
-	VEX_W_0F3819_P_2_M_0,
-	VEX_W_0F381A_P_2_M_0,
-	VEX_W_0F381C_P_2,
-	VEX_W_0F381D_P_2,
-	VEX_W_0F381E_P_2,
-	VEX_W_0F3820_P_2,
-	VEX_W_0F3821_P_2,
-	VEX_W_0F3822_P_2,
-	VEX_W_0F3823_P_2,
-	VEX_W_0F3824_P_2,
-	VEX_W_0F3825_P_2,
-	VEX_W_0F3828_P_2,
-	VEX_W_0F3829_P_2,
-	VEX_W_0F382A_P_2_M_0,
-	VEX_W_0F382B_P_2,
-	VEX_W_0F382C_P_2_M_0,
-	VEX_W_0F382D_P_2_M_0,
-	VEX_W_0F382E_P_2_M_0,
-	VEX_W_0F382F_P_2_M_0,
-	VEX_W_0F3830_P_2,
-	VEX_W_0F3831_P_2,
-	VEX_W_0F3832_P_2,
-	VEX_W_0F3833_P_2,
-	VEX_W_0F3834_P_2,
-	VEX_W_0F3835_P_2,
-	VEX_W_0F3837_P_2,
-	VEX_W_0F3838_P_2,
-	VEX_W_0F3839_P_2,
-	VEX_W_0F383A_P_2,
-	VEX_W_0F383B_P_2,
-	VEX_W_0F383C_P_2,
-	VEX_W_0F383D_P_2,
-	VEX_W_0F383E_P_2,
-	VEX_W_0F383F_P_2,
-	VEX_W_0F3840_P_2,
-	VEX_W_0F3841_P_2,
-	VEX_W_0F38DB_P_2,
-	VEX_W_0F38DC_P_2,
-	VEX_W_0F38DD_P_2,
-	VEX_W_0F38DE_P_2,
-	VEX_W_0F38DF_P_2,
-	VEX_W_0F3A04_P_2,
-	VEX_W_0F3A05_P_2,
-	VEX_W_0F3A06_P_2,
-	VEX_W_0F3A08_P_2,
-	VEX_W_0F3A09_P_2,
-	VEX_W_0F3A0A_P_2,
-	VEX_W_0F3A0B_P_2,
-	VEX_W_0F3A0C_P_2,
-	VEX_W_0F3A0D_P_2,
-	VEX_W_0F3A0E_P_2,
-	VEX_W_0F3A0F_P_2,
-	VEX_W_0F3A14_P_2,
-	VEX_W_0F3A15_P_2,
-	VEX_W_0F3A18_P_2,
-	VEX_W_0F3A19_P_2,
-	VEX_W_0F3A20_P_2,
-	VEX_W_0F3A21_P_2,
-	VEX_W_0F3A40_P_2,
-	VEX_W_0F3A41_P_2,
-	VEX_W_0F3A42_P_2,
-	VEX_W_0F3A44_P_2,
-	VEX_W_0F3A48_P_2,
-	VEX_W_0F3A49_P_2,
-	VEX_W_0F3A4A_P_2,
-	VEX_W_0F3A4B_P_2,
-	VEX_W_0F3A4C_P_2,
-	VEX_W_0F3A60_P_2,
-	VEX_W_0F3A61_P_2,
-	VEX_W_0F3A62_P_2,
-	VEX_W_0F3A63_P_2,
-	VEX_W_0F3ADF_P_2
-};
-
-typedef void (*op_rtn)(int bytemode, int sizeflag);
-
-struct dis386 {
-	const char *name;
-	struct {
-		op_rtn rtn;
-		int bytemode;
-	} op[MAX_OPERANDS];
-};
-
-/* Upper case letters in the instruction names here are macros.
- 'A' => print 'b' if no register operands or suffix_always is true
- 'B' => print 'b' if suffix_always is true
- 'C' => print 's' or 'l' ('w' or 'd' in Intel mode) depending on operand
- size prefix
- 'D' => print 'w' if no register operands or 'w', 'l' or 'q', if
- suffix_always is true
- 'E' => print 'e' if 32-bit form of jcxz
- 'F' => print 'w' or 'l' depending on address size prefix (loop insns)
- 'G' => print 'w' or 'l' depending on operand size prefix (i/o insns)
- 'H' => print ",pt" or ",pn" branch hint
- 'I' => honor following macro letter even in Intel mode (implemented only
- for some of the macro letters)
- 'J' => print 'l'
- 'K' => print 'd' or 'q' if rex prefix is present.
- 'L' => print 'l' if suffix_always is true
- 'M' => print 'r' if intel_mnemonic is false.
- 'N' => print 'n' if instruction has no wait "prefix"
- 'O' => print 'd' or 'o' (or 'q' in Intel mode)
- 'P' => print 'w', 'l' or 'q' if instruction has an operand size prefix,
- or suffix_always is true.  print 'q' if rex prefix is present.
- 'Q' => print 'w', 'l' or 'q' for memory operand or suffix_always
- is true
- 'R' => print 'w', 'l' or 'q' ('d' for 'l' and 'e' in Intel mode)
- 'S' => print 'w', 'l' or 'q' if suffix_always is true
- 'T' => print 'q' in 64bit mode and behave as 'P' otherwise
- 'U' => print 'q' in 64bit mode and behave as 'Q' otherwise
- 'V' => print 'q' in 64bit mode and behave as 'S' otherwise
- 'W' => print 'b', 'w' or 'l' ('d' in Intel mode)
- 'X' => print 's', 'd' depending on data16 prefix (for XMM)
- 'Y' => 'q' if instruction has an REX 64bit overwrite prefix and
- suffix_always is true.
- 'Z' => print 'q' in 64bit mode and behave as 'L' otherwise
- '!' => change condition from true to false or from false to true.
- '%' => add 1 upper case letter to the macro.
-
- 2 upper case letter macros:
- "XY" => print 'x' or 'y' if no register operands or suffix_always
- is true.
- "XW" => print 's', 'd' depending on the VEX.W bit (for FMA)
- "LQ" => print 'l' ('d' in Intel mode) or 'q' for memory operand
- or suffix_always is true
- "LB" => print "abs" in 64bit mode and behave as 'B' otherwise
- "LS" => print "abs" in 64bit mode and behave as 'S' otherwise
- "LV" => print "abs" for 64bit operand and behave as 'S' otherwise
-
- Many of the above letters print nothing in Intel mode.  See "putop"
- for the details.
-
- Braces '{' and '}', and vertical bars '|', indicate alternative
- mnemonic strings for AT&T and Intel.  */
-
-static const struct dis386 dis386[] = {
-/* 00 */
-{ "addB", { Eb, Gb } }, { "addS", { Ev, Gv } }, { "addB", { Gb, EbS } }, {
-		"addS", { Gv, EvS } }, { "addB", { AL, Ib } }, { "addS", { eAX, Iv } },
-		{ X86_64_TABLE (X86_64_06) }, { X86_64_TABLE (X86_64_07) },
-		/* 08 */
-		{ "orB", { Eb, Gb } }, { "orS", { Ev, Gv } }, { "orB", { Gb, EbS } }, {
-				"orS", { Gv, EvS } }, { "orB", { AL, Ib } }, { "orS",
-				{ eAX, Iv } }, { X86_64_TABLE (X86_64_0D) }, { Bad_Opcode }, /* 0x0f extended opcode escape */
-		/* 10 */
-		{ "adcB", { Eb, Gb } }, { "adcS", { Ev, Gv } }, { "adcB", { Gb, EbS } },
-		{ "adcS", { Gv, EvS } }, { "adcB", { AL, Ib } },
-		{ "adcS", { eAX, Iv } }, { X86_64_TABLE (X86_64_16) }, {
-				X86_64_TABLE (X86_64_17) },
-		/* 18 */
-		{ "sbbB", { Eb, Gb } }, { "sbbS", { Ev, Gv } }, { "sbbB", { Gb, EbS } },
-		{ "sbbS", { Gv, EvS } }, { "sbbB", { AL, Ib } },
-		{ "sbbS", { eAX, Iv } }, { X86_64_TABLE (X86_64_1E) }, {
-				X86_64_TABLE (X86_64_1F) },
-		/* 20 */
-		{ "andB", { Eb, Gb } }, { "andS", { Ev, Gv } }, { "andB", { Gb, EbS } },
-		{ "andS", { Gv, EvS } }, { "andB", { AL, Ib } },
-		{ "andS", { eAX, Iv } }, { Bad_Opcode }, /* SEG ES prefix */
-		{ X86_64_TABLE (X86_64_27) },
-		/* 28 */
-		{ "subB", { Eb, Gb } }, { "subS", { Ev, Gv } }, { "subB", { Gb, EbS } },
-		{ "subS", { Gv, EvS } }, { "subB", { AL, Ib } },
-		{ "subS", { eAX, Iv } }, { Bad_Opcode }, /* SEG CS prefix */
-		{ X86_64_TABLE (X86_64_2F) },
-		/* 30 */
-		{ "xorB", { Eb, Gb } }, { "xorS", { Ev, Gv } }, { "xorB", { Gb, EbS } },
-		{ "xorS", { Gv, EvS } }, { "xorB", { AL, Ib } },
-		{ "xorS", { eAX, Iv } }, { Bad_Opcode }, /* SEG SS prefix */
-		{ X86_64_TABLE (X86_64_37) },
-		/* 38 */
-		{ "cmpB", { Eb, Gb } }, { "cmpS", { Ev, Gv } }, { "cmpB", { Gb, EbS } },
-		{ "cmpS", { Gv, EvS } }, { "cmpB", { AL, Ib } },
-		{ "cmpS", { eAX, Iv } }, { Bad_Opcode }, /* SEG DS prefix */
-		{ X86_64_TABLE (X86_64_3F) },
-		/* 40 */
-		{ "inc{S|}", { RMeAX } }, { "inc{S|}", { RMeCX } }, { "inc{S|}",
-				{ RMeDX } }, { "inc{S|}", { RMeBX } }, { "inc{S|}", { RMeSP } },
-		{ "inc{S|}", { RMeBP } }, { "inc{S|}", { RMeSI } }, { "inc{S|}",
-				{ RMeDI } },
-		/* 48 */
-		{ "dec{S|}", { RMeAX } }, { "dec{S|}", { RMeCX } }, { "dec{S|}",
-				{ RMeDX } }, { "dec{S|}", { RMeBX } }, { "dec{S|}", { RMeSP } },
-		{ "dec{S|}", { RMeBP } }, { "dec{S|}", { RMeSI } }, { "dec{S|}",
-				{ RMeDI } },
-		/* 50 */
-		{ "pushV", { RMrAX } }, { "pushV", { RMrCX } }, { "pushV", { RMrDX } },
-		{ "pushV", { RMrBX } }, { "pushV", { RMrSP } }, { "pushV", { RMrBP } },
-		{ "pushV", { RMrSI } }, { "pushV", { RMrDI } },
-		/* 58 */
-		{ "popV", { RMrAX } }, { "popV", { RMrCX } }, { "popV", { RMrDX } }, {
-				"popV", { RMrBX } }, { "popV", { RMrSP } },
-		{ "popV", { RMrBP } }, { "popV", { RMrSI } }, { "popV", { RMrDI } },
-		/* 60 */
-		{ X86_64_TABLE (X86_64_60) }, { X86_64_TABLE (X86_64_61) }, {
-				X86_64_TABLE (X86_64_62) }, { X86_64_TABLE (X86_64_63) }, {
-				Bad_Opcode }, /* seg fs */
-		{ Bad_Opcode }, /* seg gs */
-		{ Bad_Opcode }, /* op size prefix */
-		{ Bad_Opcode }, /* adr size prefix */
-		/* 68 */
-		{ "pushT", { sIv } }, { "imulS", { Gv, Ev, Iv } },
-		{ "pushT", { sIbT } }, { "imulS", { Gv, Ev, sIb } }, { "ins{b|}", { Ybr,
-				indirDX } }, { X86_64_TABLE (X86_64_6D) }, { "outs{b|}", {
-				indirDXr, Xb } }, { X86_64_TABLE (X86_64_6F) },
-		/* 70 */
-		{ "joH", { Jb, XX, cond_jump_flag } }, { "jnoH", { Jb, XX,
-				cond_jump_flag } }, { "jbH", { Jb, XX, cond_jump_flag } }, {
-				"jaeH", { Jb, XX, cond_jump_flag } }, { "jeH", { Jb, XX,
-				cond_jump_flag } }, { "jneH", { Jb, XX, cond_jump_flag } }, {
-				"jbeH", { Jb, XX, cond_jump_flag } }, { "jaH", { Jb, XX,
-				cond_jump_flag } },
-		/* 78 */
-		{ "jsH", { Jb, XX, cond_jump_flag } }, { "jnsH", { Jb, XX,
-				cond_jump_flag } }, { "jpH", { Jb, XX, cond_jump_flag } }, {
-				"jnpH", { Jb, XX, cond_jump_flag } }, { "jlH", { Jb, XX,
-				cond_jump_flag } }, { "jgeH", { Jb, XX, cond_jump_flag } }, {
-				"jleH", { Jb, XX, cond_jump_flag } }, { "jgH", { Jb, XX,
-				cond_jump_flag } },
-		/* 80 */
-		{ REG_TABLE (REG_80) }, { REG_TABLE (REG_81) }, { Bad_Opcode }, {
-				REG_TABLE (REG_82) }, { "testB", { Eb, Gb } }, { "testS", { Ev,
-				Gv } }, { "xchgB", { Eb, Gb } }, { "xchgS", { Ev, Gv } },
-		/* 88 */
-		{ "movB", { Eb, Gb } }, { "movS", { Ev, Gv } }, { "movB", { Gb, EbS } },
-		{ "movS", { Gv, EvS } }, { "movD", { Sv, Sw } }, { MOD_TABLE (MOD_8D) },
-		{ "movD", { Sw, Sv } }, { REG_TABLE (REG_8F) },
-		/* 90 */
-		{ PREFIX_TABLE (PREFIX_90) }, { "xchgS", { RMeCX, eAX } }, { "xchgS", {
-				RMeDX, eAX } }, { "xchgS", { RMeBX, eAX } }, { "xchgS", { RMeSP,
-				eAX } }, { "xchgS", { RMeBP, eAX } },
-		{ "xchgS", { RMeSI, eAX } }, { "xchgS", { RMeDI, eAX } },
-		/* 98 */
-		{ "cW{t|}R", { XX } }, { "cR{t|}O", { XX } },
-		{ X86_64_TABLE (X86_64_9A) }, { Bad_Opcode }, /* fwait */
-		{ "pushfT", { XX } }, { "popfT", { XX } }, { "sahf", { XX } }, { "lahf",
-				{ XX } },
-		/* a0 */
-		{ "mov%LB", { AL, Ob } }, { "mov%LS", { eAX, Ov } }, { "mov%LB", { Ob,
-				AL } }, { "mov%LS", { Ov, eAX } }, { "movs{b|}", { Ybr, Xb } },
-		{ "movs{R|}", { Yvr, Xv } }, { "cmps{b|}", { Xb, Yb } }, { "cmps{R|}", {
-				Xv, Yv } },
-		/* a8 */
-		{ "testB", { AL, Ib } }, { "testS", { eAX, Iv } }, { "stosB",
-				{ Ybr, AL } }, { "stosS", { Yvr, eAX } },
-		{ "lodsB", { ALr, Xb } }, { "lodsS", { eAXr, Xv } }, { "scasB",
-				{ AL, Yb } }, { "scasS", { eAX, Yv } },
-		/* b0 */
-		{ "movB", { RMAL, Ib } }, { "movB", { RMCL, Ib } }, { "movB",
-				{ RMDL, Ib } }, { "movB", { RMBL, Ib } },
-		{ "movB", { RMAH, Ib } }, { "movB", { RMCH, Ib } }, { "movB",
-				{ RMDH, Ib } }, { "movB", { RMBH, Ib } },
-		/* b8 */
-		{ "mov%LV", { RMeAX, Iv64 } }, { "mov%LV", { RMeCX, Iv64 } }, {
-				"mov%LV", { RMeDX, Iv64 } }, { "mov%LV", { RMeBX, Iv64 } }, {
-				"mov%LV", { RMeSP, Iv64 } }, { "mov%LV", { RMeBP, Iv64 } }, {
-				"mov%LV", { RMeSI, Iv64 } }, { "mov%LV", { RMeDI, Iv64 } },
-		/* c0 */
-		{ REG_TABLE (REG_C0) }, { REG_TABLE (REG_C1) }, { "retT", { Iw } }, {
-				"retT", { XX } }, { X86_64_TABLE (X86_64_C4) }, {
-				X86_64_TABLE (X86_64_C5) }, { REG_TABLE (REG_C6) }, {
-				REG_TABLE (REG_C7) },
-		/* c8 */
-		{ "enterT", { Iw, Ib } }, { "leaveT", { XX } }, { "Jret{|f}P", { Iw } },
-		{ "Jret{|f}P", { XX } }, { "int3", { XX } }, { "int", { Ib } }, {
-				X86_64_TABLE (X86_64_CE) }, { "iretP", { XX } },
-		/* d0 */
-		{ REG_TABLE (REG_D0) }, { REG_TABLE (REG_D1) }, { REG_TABLE (REG_D2) },
-		{ REG_TABLE (REG_D3) }, { X86_64_TABLE (X86_64_D4) }, {
-				X86_64_TABLE (X86_64_D5) }, { Bad_Opcode },
-		{ "xlat", { DSBX } },
-		/* d8 */
-		{ FLOAT }, { FLOAT }, { FLOAT }, { FLOAT }, { FLOAT }, { FLOAT }, {
-				FLOAT }, { FLOAT },
-		/* e0 */
-		{ "loopneFH", { Jb, XX, loop_jcxz_flag } }, { "loopeFH", { Jb, XX,
-				loop_jcxz_flag } }, { "loopFH", { Jb, XX, loop_jcxz_flag } }, {
-				"jEcxzH", { Jb, XX, loop_jcxz_flag } }, { "inB", { AL, Ib } }, {
-				"inG", { zAX, Ib } }, { "outB", { Ib, AL } }, { "outG", { Ib,
-				zAX } },
-		/* e8 */
-		{ "callT", { Jv } }, { "jmpT", { Jv } }, { X86_64_TABLE (X86_64_EA) }, {
-				"jmp", { Jb } }, { "inB", { AL, indirDX } }, { "inG", { zAX,
-				indirDX } }, { "outB", { indirDX, AL } }, { "outG", { indirDX,
-				zAX } },
-		/* f0 */
-		{ Bad_Opcode }, /* lock prefix */
-		{ "icebp", { XX } }, { Bad_Opcode }, /* repne */
-		{ Bad_Opcode }, /* repz */
-		{ "hlt", { XX } }, { "cmc", { XX } }, { REG_TABLE (REG_F6) }, {
-				REG_TABLE (REG_F7) },
-		/* f8 */
-		{ "clc", { XX } }, { "stc", { XX } }, { "cli", { XX } },
-		{ "sti", { XX } }, { "cld", { XX } }, { "std", { XX } }, {
-				REG_TABLE (REG_FE) }, { REG_TABLE (REG_FF) }, };
-
-static const struct dis386 dis386_twobyte[] = {
-/* 00 */
-{ REG_TABLE (REG_0F00 ) }, { REG_TABLE (REG_0F01 ) }, { "larS", { Gv, Ew } }, {
-		"lslS", { Gv, Ew } }, { Bad_Opcode }, { "syscall", { XX } }, { "clts", {
-		XX } }, { "sysretP", { XX } },
-/* 08 */
-{ "invd", { XX } }, { "wbinvd", { XX } }, { Bad_Opcode }, { "ud2", { XX } }, {
-		Bad_Opcode }, { REG_TABLE (REG_0F0D) }, { "femms", { XX } }, { "", { MX,
-		EM, OPSUF } }, /* See OP_3DNowSuffix.  */
-/* 10 */
-{ PREFIX_TABLE (PREFIX_0F10) }, { PREFIX_TABLE (PREFIX_0F11) }, {
-		PREFIX_TABLE (PREFIX_0F12) }, { MOD_TABLE (MOD_0F13) }, { "unpcklpX", {
-		XM, EXx } }, { "unpckhpX", { XM, EXx } },
-		{ PREFIX_TABLE (PREFIX_0F16) }, { MOD_TABLE (MOD_0F17) },
-		/* 18 */
-		{ REG_TABLE (REG_0F18) }, { "nopQ", { Ev } }, { "nopQ", { Ev } }, {
-				"nopQ", { Ev } }, { "nopQ", { Ev } }, { "nopQ", { Ev } }, {
-				"nopQ", { Ev } }, { "nopQ", { Ev } },
-		/* 20 */
-		{ MOD_TABLE (MOD_0F20) }, { MOD_TABLE (MOD_0F21) }, {
-				MOD_TABLE (MOD_0F22) }, { MOD_TABLE (MOD_0F23) }, {
-				MOD_TABLE (MOD_0F24) }, { Bad_Opcode },
-		{ MOD_TABLE (MOD_0F26) }, { Bad_Opcode },
-		/* 28 */
-		{ "movapX", { XM, EXx } }, { "movapX", { EXxS, XM } }, {
-				PREFIX_TABLE (PREFIX_0F2A) }, { PREFIX_TABLE (PREFIX_0F2B) }, {
-				PREFIX_TABLE (PREFIX_0F2C) }, { PREFIX_TABLE (PREFIX_0F2D) }, {
-				PREFIX_TABLE (PREFIX_0F2E) }, { PREFIX_TABLE (PREFIX_0F2F) },
-		/* 30 */
-		{ "wrmsr", { XX } }, { "rdtsc", { XX } }, { "rdmsr", { XX } }, {
-				"rdpmc", { XX } }, { "sysenter", { XX } },
-		{ "sysexit", { XX } }, { Bad_Opcode }, { "getsec", { XX } },
-		/* 38 */
-		{ THREE_BYTE_TABLE (THREE_BYTE_0F38) }, { Bad_Opcode }, {
-				THREE_BYTE_TABLE (THREE_BYTE_0F3A) }, { Bad_Opcode }, {
-				Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-		/* 40 */
-		{ "cmovoS", { Gv, Ev } }, { "cmovnoS", { Gv, Ev } }, { "cmovbS", { Gv,
-				Ev } }, { "cmovaeS", { Gv, Ev } }, { "cmoveS", { Gv, Ev } }, {
-				"cmovneS", { Gv, Ev } }, { "cmovbeS", { Gv, Ev } }, { "cmovaS",
-				{ Gv, Ev } },
-		/* 48 */
-		{ "cmovsS", { Gv, Ev } }, { "cmovnsS", { Gv, Ev } }, { "cmovpS", { Gv,
-				Ev } }, { "cmovnpS", { Gv, Ev } }, { "cmovlS", { Gv, Ev } }, {
-				"cmovgeS", { Gv, Ev } }, { "cmovleS", { Gv, Ev } }, { "cmovgS",
-				{ Gv, Ev } },
-		/* 50 */
-		{ MOD_TABLE (MOD_0F51) }, { PREFIX_TABLE (PREFIX_0F51) }, {
-				PREFIX_TABLE (PREFIX_0F52) }, { PREFIX_TABLE (PREFIX_0F53) }, {
-				"andpX", { XM, EXx } }, { "andnpX", { XM, EXx } }, { "orpX", {
-				XM, EXx } }, { "xorpX", { XM, EXx } },
-		/* 58 */
-		{ PREFIX_TABLE (PREFIX_0F58) }, { PREFIX_TABLE (PREFIX_0F59) }, {
-				PREFIX_TABLE (PREFIX_0F5A) }, { PREFIX_TABLE (PREFIX_0F5B) }, {
-				PREFIX_TABLE (PREFIX_0F5C) }, { PREFIX_TABLE (PREFIX_0F5D) }, {
-				PREFIX_TABLE (PREFIX_0F5E) }, { PREFIX_TABLE (PREFIX_0F5F) },
-		/* 60 */
-		{ PREFIX_TABLE (PREFIX_0F60) }, { PREFIX_TABLE (PREFIX_0F61) }, {
-				PREFIX_TABLE (PREFIX_0F62) }, { "packsswb", { MX, EM } }, {
-				"pcmpgtb", { MX, EM } }, { "pcmpgtw", { MX, EM } }, { "pcmpgtd",
-				{ MX, EM } }, { "packuswb", { MX, EM } },
-		/* 68 */
-		{ "punpckhbw", { MX, EM } }, { "punpckhwd", { MX, EM } }, { "punpckhdq",
-				{ MX, EM } }, { "packssdw", { MX, EM } }, {
-				PREFIX_TABLE (PREFIX_0F6C) }, { PREFIX_TABLE (PREFIX_0F6D) }, {
-				"movK", { MX, Edq } }, { PREFIX_TABLE (PREFIX_0F6F) },
-		/* 70 */
-		{ PREFIX_TABLE (PREFIX_0F70) }, { REG_TABLE (REG_0F71) }, {
-				REG_TABLE (REG_0F72) }, { REG_TABLE (REG_0F73) }, { "pcmpeqb", {
-				MX, EM } }, { "pcmpeqw", { MX, EM } },
-		{ "pcmpeqd", { MX, EM } }, { "emms", { XX } },
-		/* 78 */
-		{ PREFIX_TABLE (PREFIX_0F78) }, { PREFIX_TABLE (PREFIX_0F79) }, {
-				THREE_BYTE_TABLE (THREE_BYTE_0F7A) }, { Bad_Opcode }, {
-				PREFIX_TABLE (PREFIX_0F7C) }, { PREFIX_TABLE (PREFIX_0F7D) }, {
-				PREFIX_TABLE (PREFIX_0F7E) }, { PREFIX_TABLE (PREFIX_0F7F) },
-		/* 80 */
-		{ "joH", { Jv, XX, cond_jump_flag } }, { "jnoH", { Jv, XX,
-				cond_jump_flag } }, { "jbH", { Jv, XX, cond_jump_flag } }, {
-				"jaeH", { Jv, XX, cond_jump_flag } }, { "jeH", { Jv, XX,
-				cond_jump_flag } }, { "jneH", { Jv, XX, cond_jump_flag } }, {
-				"jbeH", { Jv, XX, cond_jump_flag } }, { "jaH", { Jv, XX,
-				cond_jump_flag } },
-		/* 88 */
-		{ "jsH", { Jv, XX, cond_jump_flag } }, { "jnsH", { Jv, XX,
-				cond_jump_flag } }, { "jpH", { Jv, XX, cond_jump_flag } }, {
-				"jnpH", { Jv, XX, cond_jump_flag } }, { "jlH", { Jv, XX,
-				cond_jump_flag } }, { "jgeH", { Jv, XX, cond_jump_flag } }, {
-				"jleH", { Jv, XX, cond_jump_flag } }, { "jgH", { Jv, XX,
-				cond_jump_flag } },
-		/* 90 */
-		{ "seto", { Eb } }, { "setno", { Eb } }, { "setb", { Eb } }, { "setae",
-				{ Eb } }, { "sete", { Eb } }, { "setne", { Eb } }, { "setbe", {
-				Eb } }, { "seta", { Eb } },
-		/* 98 */
-		{ "sets", { Eb } }, { "setns", { Eb } }, { "setp", { Eb } }, { "setnp",
-				{ Eb } }, { "setl", { Eb } }, { "setge", { Eb } }, { "setle", {
-				Eb } }, { "setg", { Eb } },
-		/* a0 */
-		{ "pushT", { fs } }, { "popT", { fs } }, { "cpuid", { XX } }, { "btS", {
-				Ev, Gv } }, { "shldS", { Ev, Gv, Ib } }, { "shldS",
-				{ Ev, Gv, CL } }, { REG_TABLE (REG_0FA6) }, {
-				REG_TABLE (REG_0FA7) },
-		/* a8 */
-		{ "pushT", { gs } }, { "popT", { gs } }, { "rsm", { XX } }, { "btsS", {
-				Ev, Gv } }, { "shrdS", { Ev, Gv, Ib } }, { "shrdS",
-				{ Ev, Gv, CL } }, { REG_TABLE (REG_0FAE) }, { "imulS",
-				{ Gv, Ev } },
-		/* b0 */
-		{ "cmpxchgB", { Eb, Gb } }, { "cmpxchgS", { Ev, Gv } }, {
-				MOD_TABLE (MOD_0FB2) }, { "btrS", { Ev, Gv } }, {
-				MOD_TABLE (MOD_0FB4) }, { MOD_TABLE (MOD_0FB5) }, {
-				"movz{bR|x}", { Gv, Eb } }, { "movz{wR|x}", { Gv, Ew } }, /* yes, there really is movzww ! */
-		/* b8 */
-		{ PREFIX_TABLE (PREFIX_0FB8) }, { "ud1", { XX } }, {
-				REG_TABLE (REG_0FBA) }, { "btcS", { Ev, Gv } }, {
-				PREFIX_TABLE (PREFIX_0FBC) }, { PREFIX_TABLE (PREFIX_0FBD) }, {
-				"movs{bR|x}", { Gv, Eb } }, { "movs{wR|x}", { Gv, Ew } }, /* yes, there really is movsww ! */
-		/* c0 */
-		{ "xaddB", { Eb, Gb } }, { "xaddS", { Ev, Gv } }, {
-				PREFIX_TABLE (PREFIX_0FC2) }, { PREFIX_TABLE (PREFIX_0FC3) }, {
-				"pinsrw", { MX, Edqw, Ib } }, { "pextrw", { Gdq, MS, Ib } }, {
-				"shufpX", { XM, EXx, Ib } }, { REG_TABLE (REG_0FC7) },
-		/* c8 */
-		{ "bswap", { RMeAX } }, { "bswap", { RMeCX } }, { "bswap", { RMeDX } },
-		{ "bswap", { RMeBX } }, { "bswap", { RMeSP } }, { "bswap", { RMeBP } },
-		{ "bswap", { RMeSI } }, { "bswap", { RMeDI } },
-		/* d0 */
-		{ PREFIX_TABLE (PREFIX_0FD0) }, { "psrlw", { MX, EM } }, { "psrld", {
-				MX, EM } }, { "psrlq", { MX, EM } }, { "paddq", { MX, EM } }, {
-				"pmullw", { MX, EM } }, { PREFIX_TABLE (PREFIX_0FD6) }, {
-				MOD_TABLE (MOD_0FD7) },
-		/* d8 */
-		{ "psubusb", { MX, EM } }, { "psubusw", { MX, EM } }, { "pminub", { MX,
-				EM } }, { "pand", { MX, EM } }, { "paddusb", { MX, EM } }, {
-				"paddusw", { MX, EM } }, { "pmaxub", { MX, EM } }, { "pandn", {
-				MX, EM } },
-		/* e0 */
-		{ "pavgb", { MX, EM } }, { "psraw", { MX, EM } },
-		{ "psrad", { MX, EM } }, { "pavgw", { MX, EM } }, { "pmulhuw",
-				{ MX, EM } }, { "pmulhw", { MX, EM } }, {
-				PREFIX_TABLE (PREFIX_0FE6) }, { PREFIX_TABLE (PREFIX_0FE7) },
-		/* e8 */
-		{ "psubsb", { MX, EM } }, { "psubsw", { MX, EM } }, { "pminsw",
-				{ MX, EM } }, { "por", { MX, EM } }, { "paddsb", { MX, EM } }, {
-				"paddsw", { MX, EM } }, { "pmaxsw", { MX, EM } }, { "pxor", {
-				MX, EM } },
-		/* f0 */
-		{ PREFIX_TABLE (PREFIX_0FF0) }, { "psllw", { MX, EM } }, { "pslld", {
-				MX, EM } }, { "psllq", { MX, EM } }, { "pmuludq", { MX, EM } },
-		{ "pmaddwd", { MX, EM } }, { "psadbw", { MX, EM } }, {
-				PREFIX_TABLE (PREFIX_0FF7) },
-		/* f8 */
-		{ "psubb", { MX, EM } }, { "psubw", { MX, EM } },
-		{ "psubd", { MX, EM } }, { "psubq", { MX, EM } },
-		{ "paddb", { MX, EM } }, { "paddw", { MX, EM } },
-		{ "paddd", { MX, EM } }, { Bad_Opcode }, };
-
-static const unsigned char onebyte_has_modrm[256] = {
-/*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
-/*       -------------------------------        */
-/* 00 */1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, /* 00 */
-/* 10 */1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, /* 10 */
-/* 20 */1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, /* 20 */
-/* 30 */1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, /* 30 */
-/* 40 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 40 */
-/* 50 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 50 */
-/* 60 */0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, /* 60 */
-/* 70 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 70 */
-/* 80 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 80 */
-/* 90 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 90 */
-/* a0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* a0 */
-/* b0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* b0 */
-/* c0 */1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, /* c0 */
-/* d0 */1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, /* d0 */
-/* e0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* e0 */
-/* f0 */0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1 /* f0 */
-/*       -------------------------------        */
-/*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
-};
-
-static const unsigned char twobyte_has_modrm[256] = {
-/*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
-/*       -------------------------------        */
-/* 00 */1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, /* 0f */
-/* 10 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 1f */
-/* 20 */1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, /* 2f */
-/* 30 */0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, /* 3f */
-/* 40 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 4f */
-/* 50 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 5f */
-/* 60 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 6f */
-/* 70 */1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, /* 7f */
-/* 80 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 8f */
-/* 90 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 9f */
-/* a0 */0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, /* af */
-/* b0 */1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, /* bf */
-/* c0 */1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, /* cf */
-/* d0 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* df */
-/* e0 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* ef */
-/* f0 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0 /* ff */
-/*       -------------------------------        */
-/*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
-};
-
-// myan
-// some instructions have fixed size for at least one operand
-static const int onebyte_size_map[] = {
-		/*      0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f        */
-		/* 00 */1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, /* 00 */
-		/* 10 */1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, /* 10 */
-		/* 20 */1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, /* 20 */
-		/* 30 */1, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, /* 30 */
-		/* 40 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 40 */
-		/* 50 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 50 */
-		/* 60 */0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 60 */
-		/* 70 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 70 */
-		/* 80 */1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, /* 80 */
-		/* 90 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 90 */
-		/* a0 */1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, /* a0 */
-		/* b0 */1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, /* b0 */
-		/* c0 */1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* c0 */
-		/* d0 */1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* d0 */
-		/* e0 */0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* e0 */
-		/* f0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* f0 */
-		/*      0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f        */
-};
-
-static const int twobyte_size_map[] = {
-		/*      0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f        */
-		/* 00 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 00 */
-		/* 10 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 10 */
-		/* 20 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 20 */
-		/* 30 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 30 */
-		/* 40 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 40 */
-		/* 50 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 50 */
-		/* 60 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 60 */
-		/* 70 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 70 */
-		/* 80 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* 80 */
-		/* 90 */1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 90 */
-		/* a0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* a0 */
-		/* b0 */1, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 1, 2, /* b0 */
-		/* c0 */1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* c0 */
-		/* d0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* d0 */
-		/* e0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* e0 */
-		/* f0 */0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* f0 */
-		/*      0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f        */
-};
-
-static char obuf[100];
-static char *obufp;
-static char *mnemonicendp;
-static char scratchbuf[100];
-static unsigned char *start_codep;
-static unsigned char *insn_codep;
-static unsigned char *codep;
-static int last_lock_prefix;
-static int last_repz_prefix;
-static int last_repnz_prefix;
-static int last_data_prefix;
-static int last_addr_prefix;
-static int last_rex_prefix;
-static int last_seg_prefix;
-#define MAX_CODE_LENGTH 15
-/* We can up to 14 prefixes since the maximum instruction length is
- 15bytes.  */
-static int all_prefixes[MAX_CODE_LENGTH - 1];
-static disassemble_info *the_info;
-static struct {
-	int mod;
-	int reg;
-	int rm;
-} modrm;
-static unsigned char need_modrm;
-static struct {
-	int scale;
-	int index;
-	int base;
-} sib;
-static struct {
-	int register_specifier;
-	int length;
-	int prefix;
-	int w;
-} vex;
-static unsigned char need_vex;
-static unsigned char need_vex_reg;
-static unsigned char vex_w_done;
-
-struct op {
-	const char *name;
-	unsigned int len;
-};
-
-/* If we are accessing mod/rm/reg without need_modrm set, then the
- values are stale.  Hitting this abort likely indicates that you
- need to update onebyte_has_modrm or twobyte_has_modrm.  */
-#define MODRM_CHECK  if (!need_modrm) abort ()
-
-static const char **names64;
-static const char **names32;
-static const char **names16;
-static const char **names8;
-static const char **names8rex;
-static const char **names_seg;
-static const char *index64;
-static const char *index32;
-static const char **index16;
-
-static const char *intel_names64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp",
-		"rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15" };
-static const char *intel_names32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp",
-		"esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d",
-		"r15d" };
-static const char *intel_names16[] = { "ax", "cx", "dx", "bx", "sp", "bp", "si",
-		"di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w" };
-static const char *intel_names8[] = { "al", "cl", "dl", "bl", "ah", "ch", "dh",
-		"bh", };
-static const char *intel_names8rex[] = { "al", "cl", "dl", "bl", "spl", "bpl",
-		"sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b",
-		"r15b" };
-static const char *intel_names_seg[] = { "es", "cs", "ss", "ds", "fs", "gs",
-		"?", "?", };
-static const char *intel_index64 = "riz";
-static const char *intel_index32 = "eiz";
-static const char *intel_index16[] = { "bx+si", "bx+di", "bp+si", "bp+di", "si",
-		"di", "bp", "bx" };
-
-static const char *att_names64[] = { "%rax", "%rcx", "%rdx", "%rbx", "%rsp",
-		"%rbp", "%rsi", "%rdi", "%r8", "%r9", "%r10", "%r11", "%r12", "%r13",
-		"%r14", "%r15" };
-static const char *att_names32[] = { "%eax", "%ecx", "%edx", "%ebx", "%esp",
-		"%ebp", "%esi", "%edi", "%r8d", "%r9d", "%r10d", "%r11d", "%r12d",
-		"%r13d", "%r14d", "%r15d" };
-static const char *att_names16[] = { "%ax", "%cx", "%dx", "%bx", "%sp", "%bp",
-		"%si", "%di", "%r8w", "%r9w", "%r10w", "%r11w", "%r12w", "%r13w",
-		"%r14w", "%r15w" };
-static const char *att_names8[] = { "%al", "%cl", "%dl", "%bl", "%ah", "%ch",
-		"%dh", "%bh", };
-static const char *att_names8rex[] = { "%al", "%cl", "%dl", "%bl", "%spl",
-		"%bpl", "%sil", "%dil", "%r8b", "%r9b", "%r10b", "%r11b", "%r12b",
-		"%r13b", "%r14b", "%r15b" };
-static const char *att_names_seg[] = { "%es", "%cs", "%ss", "%ds", "%fs", "%gs",
-		"%?", "%?", };
-static const char *att_index64 = "%riz";
-static const char *att_index32 = "%eiz";
-static const char *att_index16[] = { "%bx,%si", "%bx,%di", "%bp,%si", "%bp,%di",
-		"%si", "%di", "%bp", "%bx" };
-
-static const char **names_mm;
-static const char *intel_names_mm[] = { "mm0", "mm1", "mm2", "mm3", "mm4",
-		"mm5", "mm6", "mm7" };
-static const char *att_names_mm[] = { "%mm0", "%mm1", "%mm2", "%mm3", "%mm4",
-		"%mm5", "%mm6", "%mm7" };
-
-static const char **names_xmm;
-static const char *intel_names_xmm[] = { "xmm0", "xmm1", "xmm2", "xmm3", "xmm4",
-		"xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12",
-		"xmm13", "xmm14", "xmm15" };
-static const char *att_names_xmm[] = { "%xmm0", "%xmm1", "%xmm2", "%xmm3",
-		"%xmm4", "%xmm5", "%xmm6", "%xmm7", "%xmm8", "%xmm9", "%xmm10",
-		"%xmm11", "%xmm12", "%xmm13", "%xmm14", "%xmm15" };
-
-static const char **names_ymm;
-static const char *intel_names_ymm[] = { "ymm0", "ymm1", "ymm2", "ymm3", "ymm4",
-		"ymm5", "ymm6", "ymm7", "ymm8", "ymm9", "ymm10", "ymm11", "ymm12",
-		"ymm13", "ymm14", "ymm15" };
-static const char *att_names_ymm[] = { "%ymm0", "%ymm1", "%ymm2", "%ymm3",
-		"%ymm4", "%ymm5", "%ymm6", "%ymm7", "%ymm8", "%ymm9", "%ymm10",
-		"%ymm11", "%ymm12", "%ymm13", "%ymm14", "%ymm15" };
-
-static const struct dis386 reg_table[][8] = {
-/* REG_80 */
-{ { "addA", { Eb, Ib } }, { "orA", { Eb, Ib } }, { "adcA", { Eb, Ib } }, {
-		"sbbA", { Eb, Ib } }, { "andA", { Eb, Ib } }, { "subA", { Eb, Ib } }, {
-		"xorA", { Eb, Ib } }, { "cmpA", { Eb, Ib } }, },
-/* REG_81 */
-{ { "addQ", { Ev, Iv } }, { "orQ", { Ev, Iv } }, { "adcQ", { Ev, Iv } }, {
-		"sbbQ", { Ev, Iv } }, { "andQ", { Ev, Iv } }, { "subQ", { Ev, Iv } }, {
-		"xorQ", { Ev, Iv } }, { "cmpQ", { Ev, Iv } }, },
-/* REG_82 */
-{ { "addQ", { Ev, sIb } }, { "orQ", { Ev, sIb } }, { "adcQ", { Ev, sIb } }, {
-		"sbbQ", { Ev, sIb } }, { "andQ", { Ev, sIb } }, { "subQ", { Ev, sIb } },
-		{ "xorQ", { Ev, sIb } }, { "cmpQ", { Ev, sIb } }, },
-/* REG_8F */
-{ { "popU", { stackEv } }, { XOP_8F_TABLE (XOP_09) }, { Bad_Opcode }, {
-		Bad_Opcode }, { Bad_Opcode }, { XOP_8F_TABLE (XOP_09) }, },
-/* REG_C0 */
-{ { "rolA", { Eb, Ib } }, { "rorA", { Eb, Ib } }, { "rclA", { Eb, Ib } }, {
-		"rcrA", { Eb, Ib } }, { "shlA", { Eb, Ib } }, { "shrA", { Eb, Ib } }, {
-		Bad_Opcode }, { "sarA", { Eb, Ib } }, },
-/* REG_C1 */
-{ { "rolQ", { Ev, Ib } }, { "rorQ", { Ev, Ib } }, { "rclQ", { Ev, Ib } }, {
-		"rcrQ", { Ev, Ib } }, { "shlQ", { Ev, Ib } }, { "shrQ", { Ev, Ib } }, {
-		Bad_Opcode }, { "sarQ", { Ev, Ib } }, },
-/* REG_C6 */
-{ { "movA", { Eb, Ib } }, },
-/* REG_C7 */
-{ { "movQ", { Ev, Iv } }, },
-/* REG_D0 */
-{ { "rolA", { Eb, I1 } }, { "rorA", { Eb, I1 } }, { "rclA", { Eb, I1 } }, {
-		"rcrA", { Eb, I1 } }, { "shlA", { Eb, I1 } }, { "shrA", { Eb, I1 } }, {
-		Bad_Opcode }, { "sarA", { Eb, I1 } }, },
-/* REG_D1 */
-{ { "rolQ", { Ev, I1 } }, { "rorQ", { Ev, I1 } }, { "rclQ", { Ev, I1 } }, {
-		"rcrQ", { Ev, I1 } }, { "shlQ", { Ev, I1 } }, { "shrQ", { Ev, I1 } }, {
-		Bad_Opcode }, { "sarQ", { Ev, I1 } }, },
-/* REG_D2 */
-{ { "rolA", { Eb, CL } }, { "rorA", { Eb, CL } }, { "rclA", { Eb, CL } }, {
-		"rcrA", { Eb, CL } }, { "shlA", { Eb, CL } }, { "shrA", { Eb, CL } }, {
-		Bad_Opcode }, { "sarA", { Eb, CL } }, },
-/* REG_D3 */
-{ { "rolQ", { Ev, CL } }, { "rorQ", { Ev, CL } }, { "rclQ", { Ev, CL } }, {
-		"rcrQ", { Ev, CL } }, { "shlQ", { Ev, CL } }, { "shrQ", { Ev, CL } }, {
-		Bad_Opcode }, { "sarQ", { Ev, CL } }, },
-/* REG_F6 */
-{ { "testA", { Eb, Ib } }, { Bad_Opcode }, { "notA", { Eb } },
-		{ "negA", { Eb } }, { "mulA", { Eb } }, /* Don't print the implicit %al register,  */
-		{ "imulA", { Eb } }, /* to distinguish these opcodes from other */
-		{ "divA", { Eb } }, /* mul/imul opcodes.  Do the same for div  */
-		{ "idivA", { Eb } }, /* and idiv for consistency.		   */
-},
-/* REG_F7 */
-{ { "testQ", { Ev, Iv } }, { Bad_Opcode }, { "notQ", { Ev } },
-		{ "negQ", { Ev } }, { "mulQ", { Ev } }, /* Don't print the implicit register.  */
-		{ "imulQ", { Ev } }, { "divQ", { Ev } }, { "idivQ", { Ev } }, },
-/* REG_FE */
-{ { "incA", { Eb } }, { "decA", { Eb } }, },
-/* REG_FF */
-{ { "incQ", { Ev } }, { "decQ", { Ev } }, { "call{T|}", { indirEv } }, {
-		"Jcall{T|}", { indirEp } }, { "jmp{T|}", { indirEv } }, { "Jjmp{T|}", {
-		indirEp } }, { "pushU", { stackEv } }, { Bad_Opcode }, },
-/* REG_0F00 */
-{ { "sldtD", { Sv } }, { "strD", { Sv } }, { "lldt", { Ew } },
-		{ "ltr", { Ew } }, { "verr", { Ew } }, { "verw", { Ew } },
-		{ Bad_Opcode }, { Bad_Opcode }, },
-/* REG_0F01 */
-{ { MOD_TABLE (MOD_0F01_REG_0) }, { MOD_TABLE (MOD_0F01_REG_1) }, {
-		MOD_TABLE (MOD_0F01_REG_2) }, { MOD_TABLE (MOD_0F01_REG_3) }, { "smswD",
-		{ Sv } }, { Bad_Opcode }, { "lmsw", { Ew } }, {
-		MOD_TABLE (MOD_0F01_REG_7) }, },
-/* REG_0F0D */
-{ { "prefetch", { Mb } }, { "prefetchw", { Mb } }, },
-/* REG_0F18 */
-{ { MOD_TABLE (MOD_0F18_REG_0) }, { MOD_TABLE (MOD_0F18_REG_1) }, {
-		MOD_TABLE (MOD_0F18_REG_2) }, { MOD_TABLE (MOD_0F18_REG_3) }, },
-/* REG_0F71 */
-{ { Bad_Opcode }, { Bad_Opcode }, { MOD_TABLE (MOD_0F71_REG_2) },
-		{ Bad_Opcode }, { MOD_TABLE (MOD_0F71_REG_4) }, { Bad_Opcode }, {
-				MOD_TABLE (MOD_0F71_REG_6) }, },
-/* REG_0F72 */
-{ { Bad_Opcode }, { Bad_Opcode }, { MOD_TABLE (MOD_0F72_REG_2) },
-		{ Bad_Opcode }, { MOD_TABLE (MOD_0F72_REG_4) }, { Bad_Opcode }, {
-				MOD_TABLE (MOD_0F72_REG_6) }, },
-/* REG_0F73 */
-{ { Bad_Opcode }, { Bad_Opcode }, { MOD_TABLE (MOD_0F73_REG_2) }, {
-		MOD_TABLE (MOD_0F73_REG_3) }, { Bad_Opcode }, { Bad_Opcode }, {
-		MOD_TABLE (MOD_0F73_REG_6) }, { MOD_TABLE (MOD_0F73_REG_7) }, },
-/* REG_0FA6 */
-{ { "montmul", { { OP_0f07, 0 } } }, { "xsha1", { { OP_0f07, 0 } } }, {
-		"xsha256", { { OP_0f07, 0 } } }, },
-/* REG_0FA7 */
-{ { "xstore-rng", { { OP_0f07, 0 } } }, { "xcrypt-ecb", { { OP_0f07, 0 } } }, {
-		"xcrypt-cbc", { { OP_0f07, 0 } } },
-		{ "xcrypt-ctr", { { OP_0f07, 0 } } },
-		{ "xcrypt-cfb", { { OP_0f07, 0 } } },
-		{ "xcrypt-ofb", { { OP_0f07, 0 } } }, },
-/* REG_0FAE */
-{ { MOD_TABLE (MOD_0FAE_REG_0) }, { MOD_TABLE (MOD_0FAE_REG_1) }, {
-		MOD_TABLE (MOD_0FAE_REG_2) }, { MOD_TABLE (MOD_0FAE_REG_3) }, {
-		MOD_TABLE (MOD_0FAE_REG_4) }, { MOD_TABLE (MOD_0FAE_REG_5) }, {
-		MOD_TABLE (MOD_0FAE_REG_6) }, { MOD_TABLE (MOD_0FAE_REG_7) }, },
-/* REG_0FBA */
-{ { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { "btQ", { Ev,
-		Ib } }, { "btsQ", { Ev, Ib } }, { "btrQ", { Ev, Ib } }, { "btcQ", { Ev,
-		Ib } }, },
-/* REG_0FC7 */
-{ { Bad_Opcode }, { "cmpxchg8b", { { CMPXCHG8B_Fixup, q_mode } } },
-		{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-				MOD_TABLE (MOD_0FC7_REG_6) }, { MOD_TABLE (MOD_0FC7_REG_7) }, },
-/* REG_VEX_0F71 */
-{ { Bad_Opcode }, { Bad_Opcode }, { MOD_TABLE (MOD_VEX_0F71_REG_2) }, {
-		Bad_Opcode }, { MOD_TABLE (MOD_VEX_0F71_REG_4) }, { Bad_Opcode }, {
-		MOD_TABLE (MOD_VEX_0F71_REG_6) }, },
-/* REG_VEX_0F72 */
-{ { Bad_Opcode }, { Bad_Opcode }, { MOD_TABLE (MOD_VEX_0F72_REG_2) }, {
-		Bad_Opcode }, { MOD_TABLE (MOD_VEX_0F72_REG_4) }, { Bad_Opcode }, {
-		MOD_TABLE (MOD_VEX_0F72_REG_6) }, },
-/* REG_VEX_0F73 */
-{ { Bad_Opcode }, { Bad_Opcode }, { MOD_TABLE (MOD_VEX_0F73_REG_2) }, {
-		MOD_TABLE (MOD_VEX_0F73_REG_3) }, { Bad_Opcode }, { Bad_Opcode }, {
-		MOD_TABLE (MOD_VEX_0F73_REG_6) }, { MOD_TABLE (MOD_VEX_0F73_REG_7) }, },
-/* REG_VEX_0FAE */
-{ { Bad_Opcode }, { Bad_Opcode }, { MOD_TABLE (MOD_VEX_0FAE_REG_2) }, {
-		MOD_TABLE (MOD_VEX_0FAE_REG_3) }, },
-/* REG_VEX_0F38F3 */
-{ { Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F38F3_REG_1) }, {
-		PREFIX_TABLE (PREFIX_VEX_0F38F3_REG_2) }, {
-		PREFIX_TABLE (PREFIX_VEX_0F38F3_REG_3) }, },
-/* REG_XOP_LWPCB */
-{ { "llwpcb", { { OP_LWPCB_E, 0 } } }, { "slwpcb", { { OP_LWPCB_E, 0 } } }, },
-/* REG_XOP_LWP */
-{ { "lwpins", { { OP_LWP_E, 0 }, Ed, Iq } }, { "lwpval", { { OP_LWP_E, 0 }, Ed,
-		Iq } }, },
-/* REG_XOP_TBM_01 */
-{ { Bad_Opcode }, { "blcfill", { { OP_LWP_E, 0 }, Ev } }, { "blsfill", { {
-		OP_LWP_E, 0 }, Ev } }, { "blcs", { { OP_LWP_E, 0 }, Ev } }, { "tzmsk", {
-		{ OP_LWP_E, 0 }, Ev } }, { "blcic", { { OP_LWP_E, 0 }, Ev } }, {
-		"blsic", { { OP_LWP_E, 0 }, Ev } },
-		{ "t1mskc", { { OP_LWP_E, 0 }, Ev } }, },
-/* REG_XOP_TBM_02 */
-{ { Bad_Opcode }, { "blcmsk", { { OP_LWP_E, 0 }, Ev } }, { Bad_Opcode }, {
-		Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { "blci", {
-		{ OP_LWP_E, 0 }, Ev } }, }, };
-
-static const struct dis386 prefix_table[][4] =
-		{
-				/* PREFIX_90 */
-				{ { "xchgS",
-						{ { NOP_Fixup1, eAX_reg }, { NOP_Fixup2, eAX_reg } } },
-						{ "pause", { XX } }, { "xchgS",
-								{ { NOP_Fixup1, eAX_reg },
-										{ NOP_Fixup2, eAX_reg } } }, },
-
-				/* PREFIX_0F10 */
-				{ { "movups", { XM, EXx } }, { "movss", { XM, EXd } }, {
-						"movupd", { XM, EXx } }, { "movsd", { XM, EXq } }, },
-
-				/* PREFIX_0F11 */
-				{ { "movups", { EXxS, XM } }, { "movss", { EXdS, XM } }, {
-						"movupd", { EXxS, XM } }, { "movsd", { EXqS, XM } }, },
-
-				/* PREFIX_0F12 */
-				{ { MOD_TABLE (MOD_0F12_PREFIX_0) },
-						{ "movsldup", { XM, EXx } }, { "movlpd", { XM, EXq } },
-						{ "movddup", { XM, EXq } }, },
-
-				/* PREFIX_0F16 */
-				{ { MOD_TABLE (MOD_0F16_PREFIX_0) },
-						{ "movshdup", { XM, EXx } }, { "movhpd", { XM, EXq } }, },
-
-				/* PREFIX_0F2A */
-				{ { "cvtpi2ps", { XM, EMCq } }, { "cvtsi2ss%LQ", { XM, Ev } }, {
-						"cvtpi2pd", { XM, EMCq } },
-						{ "cvtsi2sd%LQ", { XM, Ev } }, },
-
-				/* PREFIX_0F2B */
-				{ { MOD_TABLE (MOD_0F2B_PREFIX_0) }, {
-						MOD_TABLE (MOD_0F2B_PREFIX_1) }, {
-						MOD_TABLE (MOD_0F2B_PREFIX_2) }, {
-						MOD_TABLE (MOD_0F2B_PREFIX_3) }, },
-
-				/* PREFIX_0F2C */
-				{ { "cvttps2pi", { MXC, EXq } }, { "cvttss2siY", { Gv, EXd } },
-						{ "cvttpd2pi", { MXC, EXx } }, { "cvttsd2siY",
-								{ Gv, EXq } }, },
-
-				/* PREFIX_0F2D */
-				{ { "cvtps2pi", { MXC, EXq } }, { "cvtss2siY", { Gv, EXd } }, {
-						"cvtpd2pi", { MXC, EXx } }, { "cvtsd2siY", { Gv, EXq } }, },
-
-				/* PREFIX_0F2E */
-				{ { "ucomiss", { XM, EXd } }, { Bad_Opcode }, { "ucomisd", { XM,
-						EXq } }, },
-
-				/* PREFIX_0F2F */
-				{ { "comiss", { XM, EXd } }, { Bad_Opcode }, { "comisd", { XM,
-						EXq } }, },
-
-				/* PREFIX_0F51 */
-				{ { "sqrtps", { XM, EXx } }, { "sqrtss", { XM, EXd } }, {
-						"sqrtpd", { XM, EXx } }, { "sqrtsd", { XM, EXq } }, },
-
-				/* PREFIX_0F52 */
-				{ { "rsqrtps", { XM, EXx } }, { "rsqrtss", { XM, EXd } }, },
-
-				/* PREFIX_0F53 */
-				{ { "rcpps", { XM, EXx } }, { "rcpss", { XM, EXd } }, },
-
-				/* PREFIX_0F58 */
-				{ { "addps", { XM, EXx } }, { "addss", { XM, EXd } }, { "addpd",
-						{ XM, EXx } }, { "addsd", { XM, EXq } }, },
-
-				/* PREFIX_0F59 */
-				{ { "mulps", { XM, EXx } }, { "mulss", { XM, EXd } }, { "mulpd",
-						{ XM, EXx } }, { "mulsd", { XM, EXq } }, },
-
-				/* PREFIX_0F5A */
-				{ { "cvtps2pd", { XM, EXq } }, { "cvtss2sd", { XM, EXd } }, {
-						"cvtpd2ps", { XM, EXx } }, { "cvtsd2ss", { XM, EXq } }, },
-
-				/* PREFIX_0F5B */
-				{ { "cvtdq2ps", { XM, EXx } }, { "cvttps2dq", { XM, EXx } }, {
-						"cvtps2dq", { XM, EXx } }, },
-
-				/* PREFIX_0F5C */
-				{ { "subps", { XM, EXx } }, { "subss", { XM, EXd } }, { "subpd",
-						{ XM, EXx } }, { "subsd", { XM, EXq } }, },
-
-				/* PREFIX_0F5D */
-				{ { "minps", { XM, EXx } }, { "minss", { XM, EXd } }, { "minpd",
-						{ XM, EXx } }, { "minsd", { XM, EXq } }, },
-
-				/* PREFIX_0F5E */
-				{ { "divps", { XM, EXx } }, { "divss", { XM, EXd } }, { "divpd",
-						{ XM, EXx } }, { "divsd", { XM, EXq } }, },
-
-				/* PREFIX_0F5F */
-				{ { "maxps", { XM, EXx } }, { "maxss", { XM, EXd } }, { "maxpd",
-						{ XM, EXx } }, { "maxsd", { XM, EXq } }, },
-
-				/* PREFIX_0F60 */
-				{ { "punpcklbw", { MX, EMd } }, { Bad_Opcode }, { "punpcklbw", {
-						MX, EMx } }, },
-
-				/* PREFIX_0F61 */
-				{ { "punpcklwd", { MX, EMd } }, { Bad_Opcode }, { "punpcklwd", {
-						MX, EMx } }, },
-
-				/* PREFIX_0F62 */
-				{ { "punpckldq", { MX, EMd } }, { Bad_Opcode }, { "punpckldq", {
-						MX, EMx } }, },
-
-				/* PREFIX_0F6C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "punpcklqdq", { XM, EXx } }, },
-
-				/* PREFIX_0F6D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "punpckhqdq", { XM, EXx } }, },
-
-				/* PREFIX_0F6F */
-				{ { "movq", { MX, EM } }, { "movdqu", { XM, EXx } }, { "movdqa",
-						{ XM, EXx } }, },
-
-				/* PREFIX_0F70 */
-				{ { "pshufw", { MX, EM, Ib } }, { "pshufhw", { XM, EXx, Ib } },
-						{ "pshufd", { XM, EXx, Ib } }, { "pshuflw", { XM, EXx,
-								Ib } }, },
-
-				/* PREFIX_0F73_REG_3 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "psrldq", { XS, Ib } }, },
-
-				/* PREFIX_0F73_REG_7 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pslldq", { XS, Ib } }, },
-
-				/* PREFIX_0F78 */
-				{ { "vmread", { Em, Gm } }, { Bad_Opcode }, { "extrq", { XS, Ib,
-						Ib } }, { "insertq", { XM, XS, Ib, Ib } }, },
-
-				/* PREFIX_0F79 */
-				{ { "vmwrite", { Gm, Em } }, { Bad_Opcode }, { "extrq",
-						{ XM, XS } }, { "insertq", { XM, XS } }, },
-
-				/* PREFIX_0F7C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "haddpd", { XM, EXx } }, {
-						"haddps", { XM, EXx } }, },
-
-				/* PREFIX_0F7D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "hsubpd", { XM, EXx } }, {
-						"hsubps", { XM, EXx } }, },
-
-				/* PREFIX_0F7E */
-				{ { "movK", { Edq, MX } }, { "movq", { XM, EXq } }, { "movK", {
-						Edq, XM } }, },
-
-				/* PREFIX_0F7F */
-				{ { "movq", { EMS, MX } }, { "movdqu", { EXxS, XM } }, {
-						"movdqa", { EXxS, XM } }, },
-
-				/* PREFIX_0FAE_REG_0 */
-				{ { Bad_Opcode }, { "rdfsbase", { Ev } }, },
-
-				/* PREFIX_0FAE_REG_1 */
-				{ { Bad_Opcode }, { "rdgsbase", { Ev } }, },
-
-				/* PREFIX_0FAE_REG_2 */
-				{ { Bad_Opcode }, { "wrfsbase", { Ev } }, },
-
-				/* PREFIX_0FAE_REG_3 */
-				{ { Bad_Opcode }, { "wrgsbase", { Ev } }, },
-
-				/* PREFIX_0FB8 */
-				{ { Bad_Opcode }, { "popcntS", { Gv, Ev } }, },
-
-				/* PREFIX_0FBC */
-				{ { "bsfS", { Gv, Ev } }, { "tzcntS", { Gv, Ev } }, { "bsfS", {
-						Gv, Ev } }, },
-
-				/* PREFIX_0FBD */
-				{ { "bsrS", { Gv, Ev } }, { "lzcntS", { Gv, Ev } }, { "bsrS", {
-						Gv, Ev } }, },
-
-				/* PREFIX_0FC2 */
-				{ { "cmpps", { XM, EXx, CMP } }, { "cmpss", { XM, EXd, CMP } },
-						{ "cmppd", { XM, EXx, CMP } }, { "cmpsd",
-								{ XM, EXq, CMP } }, },
-
-				/* PREFIX_0FC3 */
-				{ { "movntiS", { Ma, Gv } }, },
-
-				/* PREFIX_0FC7_REG_6 */
-				{ { "vmptrld", { Mq } }, { "vmxon", { Mq } }, { "vmclear",
-						{ Mq } }, },
-
-				/* PREFIX_0FD0 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "addsubpd", { XM, EXx } }, {
-						"addsubps", { XM, EXx } }, },
-
-				/* PREFIX_0FD6 */
-				{ { Bad_Opcode }, { "movq2dq", { XM, MS } }, { "movq", { EXqS,
-						XM } }, { "movdq2q", { MX, XS } }, },
-
-				/* PREFIX_0FE6 */
-				{ { Bad_Opcode }, { "cvtdq2pd", { XM, EXq } }, { "cvttpd2dq", {
-						XM, EXx } }, { "cvtpd2dq", { XM, EXx } }, },
-
-				/* PREFIX_0FE7 */
-				{ { "movntq", { Mq, MX } }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_0FE7_PREFIX_2) }, },
-
-				/* PREFIX_0FF0 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_0FF0_PREFIX_3) }, },
-
-				/* PREFIX_0FF7 */
-				{ { "maskmovq", { MX, MS } }, { Bad_Opcode }, { "maskmovdqu", {
-						XM, XS } }, },
-
-				/* PREFIX_0F3810 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pblendvb",
-						{ XM, EXx, XMM0 } }, },
-
-				/* PREFIX_0F3814 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "blendvps",
-						{ XM, EXx, XMM0 } }, },
-
-				/* PREFIX_0F3815 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "blendvpd",
-						{ XM, EXx, XMM0 } }, },
-
-				/* PREFIX_0F3817 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "ptest", { XM, EXx } }, },
-
-				/* PREFIX_0F3820 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovsxbw", { XM, EXq } }, },
-
-				/* PREFIX_0F3821 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovsxbd", { XM, EXd } }, },
-
-				/* PREFIX_0F3822 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovsxbq", { XM, EXw } }, },
-
-				/* PREFIX_0F3823 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovsxwd", { XM, EXq } }, },
-
-				/* PREFIX_0F3824 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovsxwq", { XM, EXd } }, },
-
-				/* PREFIX_0F3825 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovsxdq", { XM, EXq } }, },
-
-				/* PREFIX_0F3828 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmuldq", { XM, EXx } }, },
-
-				/* PREFIX_0F3829 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pcmpeqq", { XM, EXx } }, },
-
-				/* PREFIX_0F382A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_0F382A_PREFIX_2) }, },
-
-				/* PREFIX_0F382B */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "packusdw", { XM, EXx } }, },
-
-				/* PREFIX_0F3830 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovzxbw", { XM, EXq } }, },
-
-				/* PREFIX_0F3831 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovzxbd", { XM, EXd } }, },
-
-				/* PREFIX_0F3832 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovzxbq", { XM, EXw } }, },
-
-				/* PREFIX_0F3833 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovzxwd", { XM, EXq } }, },
-
-				/* PREFIX_0F3834 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovzxwq", { XM, EXd } }, },
-
-				/* PREFIX_0F3835 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmovzxdq", { XM, EXq } }, },
-
-				/* PREFIX_0F3837 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pcmpgtq", { XM, EXx } }, },
-
-				/* PREFIX_0F3838 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pminsb", { XM, EXx } }, },
-
-				/* PREFIX_0F3839 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pminsd", { XM, EXx } }, },
-
-				/* PREFIX_0F383A */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pminuw", { XM, EXx } }, },
-
-				/* PREFIX_0F383B */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pminud", { XM, EXx } }, },
-
-				/* PREFIX_0F383C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmaxsb", { XM, EXx } }, },
-
-				/* PREFIX_0F383D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmaxsd", { XM, EXx } }, },
-
-				/* PREFIX_0F383E */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmaxuw", { XM, EXx } }, },
-
-				/* PREFIX_0F383F */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmaxud", { XM, EXx } }, },
-
-				/* PREFIX_0F3840 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pmulld", { XM, EXx } }, },
-
-				/* PREFIX_0F3841 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "phminposuw", { XM, EXx } }, },
-
-				/* PREFIX_0F3880 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "invept", { Gm, Mo } }, },
-
-				/* PREFIX_0F3881 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "invvpid", { Gm, Mo } }, },
-
-				/* PREFIX_0F38DB */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "aesimc", { XM, EXx } }, },
-
-				/* PREFIX_0F38DC */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "aesenc", { XM, EXx } }, },
-
-				/* PREFIX_0F38DD */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "aesenclast", { XM, EXx } }, },
-
-				/* PREFIX_0F38DE */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "aesdec", { XM, EXx } }, },
-
-				/* PREFIX_0F38DF */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "aesdeclast", { XM, EXx } }, },
-
-				/* PREFIX_0F38F0 */
-				{ { "movbeS", { Gv, { MOVBE_Fixup, v_mode } } }, { Bad_Opcode },
-						{ "movbeS", { Gv, { MOVBE_Fixup, v_mode } } }, {
-								"crc32", { Gdq, { CRC32_Fixup, b_mode } } }, },
-
-				/* PREFIX_0F38F1 */
-				{ { "movbeS", { { MOVBE_Fixup, v_mode }, Gv } }, { Bad_Opcode },
-						{ "movbeS", { { MOVBE_Fixup, v_mode }, Gv } }, {
-								"crc32", { Gdq, { CRC32_Fixup, v_mode } } }, },
-
-				/* PREFIX_0F3A08 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "roundps", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A09 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "roundpd", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A0A */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "roundss", { XM, EXd, Ib } }, },
-
-				/* PREFIX_0F3A0B */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "roundsd", { XM, EXq, Ib } }, },
-
-				/* PREFIX_0F3A0C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "blendps", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A0D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "blendpd", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A0E */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pblendw", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A14 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pextrb", { Edqb, XM, Ib } }, },
-
-				/* PREFIX_0F3A15 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pextrw", { Edqw, XM, Ib } }, },
-
-				/* PREFIX_0F3A16 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pextrK", { Edq, XM, Ib } }, },
-
-				/* PREFIX_0F3A17 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "extractps",
-						{ Edqd, XM, Ib } }, },
-
-				/* PREFIX_0F3A20 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pinsrb", { XM, Edqb, Ib } }, },
-
-				/* PREFIX_0F3A21 */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ "insertps", { XM, EXd, Ib } }, },
-
-				/* PREFIX_0F3A22 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pinsrK", { XM, Edq, Ib } }, },
-
-				/* PREFIX_0F3A40 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "dpps", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A41 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "dppd", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A42 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "mpsadbw", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A44 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "pclmulqdq", { XM, EXx,
-						PCLMUL } }, },
-
-				/* PREFIX_0F3A60 */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ "pcmpestrm", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A61 */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ "pcmpestri", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A62 */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ "pcmpistrm", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3A63 */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ "pcmpistri", { XM, EXx, Ib } }, },
-
-				/* PREFIX_0F3ADF */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "aeskeygenassist", { XM,
-						EXx, Ib } }, },
-
-				/* PREFIX_VEX_0F10 */
-				{ { VEX_W_TABLE (VEX_W_0F10_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F10_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F10_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F10_P_3) }, },
-
-				/* PREFIX_VEX_0F11 */
-				{ { VEX_W_TABLE (VEX_W_0F11_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F11_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F11_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F11_P_3) }, },
-
-				/* PREFIX_VEX_0F12 */
-				{ { MOD_TABLE (MOD_VEX_0F12_PREFIX_0) }, {
-						VEX_W_TABLE (VEX_W_0F12_P_1) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F12_P_2) }, {
-						VEX_W_TABLE (VEX_W_0F12_P_3) }, },
-
-				/* PREFIX_VEX_0F16 */
-				{ { MOD_TABLE (MOD_VEX_0F16_PREFIX_0) }, {
-						VEX_W_TABLE (VEX_W_0F16_P_1) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F16_P_2) }, },
-
-				/* PREFIX_VEX_0F2A */
-				{ { Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F2A_P_1) }, {
-						Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F2A_P_3) }, },
-
-				/* PREFIX_VEX_0F2C */
-				{ { Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F2C_P_1) }, {
-						Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F2C_P_3) }, },
-
-				/* PREFIX_VEX_0F2D */
-				{ { Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F2D_P_1) }, {
-						Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F2D_P_3) }, },
-
-				/* PREFIX_VEX_0F2E */
-				{ { VEX_LEN_TABLE (VEX_LEN_0F2E_P_0) }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F2E_P_2) }, },
-
-				/* PREFIX_VEX_0F2F */
-				{ { VEX_LEN_TABLE (VEX_LEN_0F2F_P_0) }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F2F_P_2) }, },
-
-				/* PREFIX_VEX_0F51 */
-				{ { VEX_W_TABLE (VEX_W_0F51_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F51_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F51_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F51_P_3) }, },
-
-				/* PREFIX_VEX_0F52 */
-				{ { VEX_W_TABLE (VEX_W_0F52_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F52_P_1) }, },
-
-				/* PREFIX_VEX_0F53 */
-				{ { VEX_W_TABLE (VEX_W_0F53_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F53_P_1) }, },
-
-				/* PREFIX_VEX_0F58 */
-				{ { VEX_W_TABLE (VEX_W_0F58_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F58_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F58_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F58_P_3) }, },
-
-				/* PREFIX_VEX_0F59 */
-				{ { VEX_W_TABLE (VEX_W_0F59_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F59_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F59_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F59_P_3) }, },
-
-				/* PREFIX_VEX_0F5A */
-				{ { VEX_W_TABLE (VEX_W_0F5A_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5A_P_1) }, { "vcvtpd2ps%XY", {
-						XMM, EXx } }, { VEX_LEN_TABLE (VEX_LEN_0F5A_P_3) }, },
-
-				/* PREFIX_VEX_0F5B */
-				{ { VEX_W_TABLE (VEX_W_0F5B_P_0) }, {
-						VEX_W_TABLE (VEX_W_0F5B_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F5B_P_2) }, },
-
-				/* PREFIX_VEX_0F5C */
-				{ { VEX_W_TABLE (VEX_W_0F5C_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5C_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F5C_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5C_P_3) }, },
-
-				/* PREFIX_VEX_0F5D */
-				{ { VEX_W_TABLE (VEX_W_0F5D_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5D_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F5D_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5D_P_3) }, },
-
-				/* PREFIX_VEX_0F5E */
-				{ { VEX_W_TABLE (VEX_W_0F5E_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5E_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F5E_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5E_P_3) }, },
-
-				/* PREFIX_VEX_0F5F */
-				{ { VEX_W_TABLE (VEX_W_0F5F_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5F_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F5F_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F5F_P_3) }, },
-
-				/* PREFIX_VEX_0F60 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F60_P_2) }, },
-
-				/* PREFIX_VEX_0F61 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F61_P_2) }, },
-
-				/* PREFIX_VEX_0F62 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F62_P_2) }, },
-
-				/* PREFIX_VEX_0F63 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F63_P_2) }, },
-
-				/* PREFIX_VEX_0F64 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F64_P_2) }, },
-
-				/* PREFIX_VEX_0F65 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F65_P_2) }, },
-
-				/* PREFIX_VEX_0F66 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F66_P_2) }, },
-
-				/* PREFIX_VEX_0F67 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F67_P_2) }, },
-
-				/* PREFIX_VEX_0F68 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F68_P_2) }, },
-
-				/* PREFIX_VEX_0F69 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F69_P_2) }, },
-
-				/* PREFIX_VEX_0F6A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F6A_P_2) }, },
-
-				/* PREFIX_VEX_0F6B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F6B_P_2) }, },
-
-				/* PREFIX_VEX_0F6C */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F6C_P_2) }, },
-
-				/* PREFIX_VEX_0F6D */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F6D_P_2) }, },
-
-				/* PREFIX_VEX_0F6E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F6E_P_2) }, },
-
-				/* PREFIX_VEX_0F6F */
-				{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F6F_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F6F_P_2) }, },
-
-				/* PREFIX_VEX_0F70 */
-				{ { Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F70_P_1) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F70_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F70_P_3) }, },
-
-				/* PREFIX_VEX_0F71_REG_2 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F71_R_2_P_2) }, },
-
-				/* PREFIX_VEX_0F71_REG_4 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F71_R_4_P_2) }, },
-
-				/* PREFIX_VEX_0F71_REG_6 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F71_R_6_P_2) }, },
-
-				/* PREFIX_VEX_0F72_REG_2 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F72_R_2_P_2) }, },
-
-				/* PREFIX_VEX_0F72_REG_4 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F72_R_4_P_2) }, },
-
-				/* PREFIX_VEX_0F72_REG_6 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F72_R_6_P_2) }, },
-
-				/* PREFIX_VEX_0F73_REG_2 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F73_R_2_P_2) }, },
-
-				/* PREFIX_VEX_0F73_REG_3 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F73_R_3_P_2) }, },
-
-				/* PREFIX_VEX_0F73_REG_6 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F73_R_6_P_2) }, },
-
-				/* PREFIX_VEX_0F73_REG_7 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F73_R_7_P_2) }, },
-
-				/* PREFIX_VEX_0F74 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F74_P_2) }, },
-
-				/* PREFIX_VEX_0F75 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F75_P_2) }, },
-
-				/* PREFIX_VEX_0F76 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F76_P_2) }, },
-
-				/* PREFIX_VEX_0F77 */
-				{ { VEX_W_TABLE (VEX_W_0F77_P_0) }, },
-
-				/* PREFIX_VEX_0F7C */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ VEX_W_TABLE (VEX_W_0F7C_P_2) }, {
-								VEX_W_TABLE (VEX_W_0F7C_P_3) }, },
-
-				/* PREFIX_VEX_0F7D */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ VEX_W_TABLE (VEX_W_0F7D_P_2) }, {
-								VEX_W_TABLE (VEX_W_0F7D_P_3) }, },
-
-				/* PREFIX_VEX_0F7E */
-				{ { Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0F7E_P_1) }, {
-						VEX_LEN_TABLE (VEX_LEN_0F7E_P_2) }, },
-
-				/* PREFIX_VEX_0F7F */
-				{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F7F_P_1) }, {
-						VEX_W_TABLE (VEX_W_0F7F_P_2) }, },
-
-				/* PREFIX_VEX_0FC2 */
-				{ { VEX_W_TABLE (VEX_W_0FC2_P_0) }, {
-						VEX_LEN_TABLE (VEX_LEN_0FC2_P_1) }, {
-						VEX_W_TABLE (VEX_W_0FC2_P_2) }, {
-						VEX_LEN_TABLE (VEX_LEN_0FC2_P_3) }, },
-
-				/* PREFIX_VEX_0FC4 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FC4_P_2) }, },
-
-				/* PREFIX_VEX_0FC5 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FC5_P_2) }, },
-
-				/* PREFIX_VEX_0FD0 */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ VEX_W_TABLE (VEX_W_0FD0_P_2) }, {
-								VEX_W_TABLE (VEX_W_0FD0_P_3) }, },
-
-				/* PREFIX_VEX_0FD1 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD1_P_2) }, },
-
-				/* PREFIX_VEX_0FD2 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD2_P_2) }, },
-
-				/* PREFIX_VEX_0FD3 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD3_P_2) }, },
-
-				/* PREFIX_VEX_0FD4 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD4_P_2) }, },
-
-				/* PREFIX_VEX_0FD5 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD5_P_2) }, },
-
-				/* PREFIX_VEX_0FD6 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD6_P_2) }, },
-
-				/* PREFIX_VEX_0FD7 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0FD7_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0FD8 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD8_P_2) }, },
-
-				/* PREFIX_VEX_0FD9 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FD9_P_2) }, },
-
-				/* PREFIX_VEX_0FDA */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FDA_P_2) }, },
-
-				/* PREFIX_VEX_0FDB */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FDB_P_2) }, },
-
-				/* PREFIX_VEX_0FDC */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FDC_P_2) }, },
-
-				/* PREFIX_VEX_0FDD */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FDD_P_2) }, },
-
-				/* PREFIX_VEX_0FDE */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FDE_P_2) }, },
-
-				/* PREFIX_VEX_0FDF */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FDF_P_2) }, },
-
-				/* PREFIX_VEX_0FE0 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE0_P_2) }, },
-
-				/* PREFIX_VEX_0FE1 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE1_P_2) }, },
-
-				/* PREFIX_VEX_0FE2 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE2_P_2) }, },
-
-				/* PREFIX_VEX_0FE3 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE3_P_2) }, },
-
-				/* PREFIX_VEX_0FE4 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE4_P_2) }, },
-
-				/* PREFIX_VEX_0FE5 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE5_P_2) }, },
-
-				/* PREFIX_VEX_0FE6 */
-				{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0FE6_P_1) }, {
-						VEX_W_TABLE (VEX_W_0FE6_P_2) }, {
-						VEX_W_TABLE (VEX_W_0FE6_P_3) }, },
-
-				/* PREFIX_VEX_0FE7 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0FE7_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0FE8 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE8_P_2) }, },
-
-				/* PREFIX_VEX_0FE9 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FE9_P_2) }, },
-
-				/* PREFIX_VEX_0FEA */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FEA_P_2) }, },
-
-				/* PREFIX_VEX_0FEB */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FEB_P_2) }, },
-
-				/* PREFIX_VEX_0FEC */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FEC_P_2) }, },
-
-				/* PREFIX_VEX_0FED */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FED_P_2) }, },
-
-				/* PREFIX_VEX_0FEE */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FEE_P_2) }, },
-
-				/* PREFIX_VEX_0FEF */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FEF_P_2) }, },
-
-				/* PREFIX_VEX_0FF0 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0FF0_PREFIX_3) }, },
-
-				/* PREFIX_VEX_0FF1 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF1_P_2) }, },
-
-				/* PREFIX_VEX_0FF2 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF2_P_2) }, },
-
-				/* PREFIX_VEX_0FF3 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF3_P_2) }, },
-
-				/* PREFIX_VEX_0FF4 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF4_P_2) }, },
-
-				/* PREFIX_VEX_0FF5 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF5_P_2) }, },
-
-				/* PREFIX_VEX_0FF6 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF6_P_2) }, },
-
-				/* PREFIX_VEX_0FF7 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF7_P_2) }, },
-
-				/* PREFIX_VEX_0FF8 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF8_P_2) }, },
-
-				/* PREFIX_VEX_0FF9 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FF9_P_2) }, },
-
-				/* PREFIX_VEX_0FFA */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FFA_P_2) }, },
-
-				/* PREFIX_VEX_0FFB */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FFB_P_2) }, },
-
-				/* PREFIX_VEX_0FFC */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FFC_P_2) }, },
-
-				/* PREFIX_VEX_0FFD */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FFD_P_2) }, },
-
-				/* PREFIX_VEX_0FFE */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0FFE_P_2) }, },
-
-				/* PREFIX_VEX_0F3800 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3800_P_2) }, },
-
-				/* PREFIX_VEX_0F3801 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3801_P_2) }, },
-
-				/* PREFIX_VEX_0F3802 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3802_P_2) }, },
-
-				/* PREFIX_VEX_0F3803 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3803_P_2) }, },
-
-				/* PREFIX_VEX_0F3804 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3804_P_2) }, },
-
-				/* PREFIX_VEX_0F3805 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3805_P_2) }, },
-
-				/* PREFIX_VEX_0F3806 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3806_P_2) }, },
-
-				/* PREFIX_VEX_0F3807 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3807_P_2) }, },
-
-				/* PREFIX_VEX_0F3808 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3808_P_2) }, },
-
-				/* PREFIX_VEX_0F3809 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3809_P_2) }, },
-
-				/* PREFIX_VEX_0F380A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F380A_P_2) }, },
-
-				/* PREFIX_VEX_0F380B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F380B_P_2) }, },
-
-				/* PREFIX_VEX_0F380C */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F380C_P_2) }, },
-
-				/* PREFIX_VEX_0F380D */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F380D_P_2) }, },
-
-				/* PREFIX_VEX_0F380E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F380E_P_2) }, },
-
-				/* PREFIX_VEX_0F380F */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F380F_P_2) }, },
-
-				/* PREFIX_VEX_0F3813 */
-				{ { Bad_Opcode }, { Bad_Opcode },
-						{ "vcvtph2ps", { XM, EXxmmq } }, },
-
-				/* PREFIX_VEX_0F3817 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3817_P_2) }, },
-
-				/* PREFIX_VEX_0F3818 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F3818_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F3819 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F3819_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F381A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F381A_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F381C */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F381C_P_2) }, },
-
-				/* PREFIX_VEX_0F381D */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F381D_P_2) }, },
-
-				/* PREFIX_VEX_0F381E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F381E_P_2) }, },
-
-				/* PREFIX_VEX_0F3820 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3820_P_2) }, },
-
-				/* PREFIX_VEX_0F3821 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3821_P_2) }, },
-
-				/* PREFIX_VEX_0F3822 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3822_P_2) }, },
-
-				/* PREFIX_VEX_0F3823 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3823_P_2) }, },
-
-				/* PREFIX_VEX_0F3824 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3824_P_2) }, },
-
-				/* PREFIX_VEX_0F3825 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3825_P_2) }, },
-
-				/* PREFIX_VEX_0F3828 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3828_P_2) }, },
-
-				/* PREFIX_VEX_0F3829 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3829_P_2) }, },
-
-				/* PREFIX_VEX_0F382A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F382A_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F382B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F382B_P_2) }, },
-
-				/* PREFIX_VEX_0F382C */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F382C_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F382D */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F382D_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F382E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F382E_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F382F */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						MOD_TABLE (MOD_VEX_0F382F_PREFIX_2) }, },
-
-				/* PREFIX_VEX_0F3830 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3830_P_2) }, },
-
-				/* PREFIX_VEX_0F3831 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3831_P_2) }, },
-
-				/* PREFIX_VEX_0F3832 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3832_P_2) }, },
-
-				/* PREFIX_VEX_0F3833 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3833_P_2) }, },
-
-				/* PREFIX_VEX_0F3834 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3834_P_2) }, },
-
-				/* PREFIX_VEX_0F3835 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3835_P_2) }, },
-
-				/* PREFIX_VEX_0F3837 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3837_P_2) }, },
-
-				/* PREFIX_VEX_0F3838 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3838_P_2) }, },
-
-				/* PREFIX_VEX_0F3839 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3839_P_2) }, },
-
-				/* PREFIX_VEX_0F383A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F383A_P_2) }, },
-
-				/* PREFIX_VEX_0F383B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F383B_P_2) }, },
-
-				/* PREFIX_VEX_0F383C */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F383C_P_2) }, },
-
-				/* PREFIX_VEX_0F383D */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F383D_P_2) }, },
-
-				/* PREFIX_VEX_0F383E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F383E_P_2) }, },
-
-				/* PREFIX_VEX_0F383F */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F383F_P_2) }, },
-
-				/* PREFIX_VEX_0F3840 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3840_P_2) }, },
-
-				/* PREFIX_VEX_0F3841 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3841_P_2) }, },
-
-				/* PREFIX_VEX_0F3896 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmaddsub132p%XW", { XM,
-						Vex, EXx } }, },
-
-				/* PREFIX_VEX_0F3897 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsubadd132p%XW", { XM,
-						Vex, EXx } }, },
-
-				/* PREFIX_VEX_0F3898 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmadd132p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F3899 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmadd132s%XW", { XMScalar,
-						VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F389A */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsub132p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F389B */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsub132s%XW", { XMScalar,
-						VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F389C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmadd132p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F389D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmadd132s%XW", {
-						XMScalar, VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F389E */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsub132p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F389F */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsub132s%XW", {
-						XMScalar, VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38A6 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmaddsub213p%XW", { XM,
-						Vex, EXx } }, { Bad_Opcode }, },
-
-				/* PREFIX_VEX_0F38A7 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsubadd213p%XW", { XM,
-						Vex, EXx } }, },
-
-				/* PREFIX_VEX_0F38A8 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmadd213p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38A9 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmadd213s%XW", { XMScalar,
-						VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38AA */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsub213p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38AB */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsub213s%XW", { XMScalar,
-						VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38AC */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmadd213p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38AD */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmadd213s%XW", {
-						XMScalar, VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38AE */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsub213p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38AF */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsub213s%XW", {
-						XMScalar, VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38B6 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmaddsub231p%XW", { XM,
-						Vex, EXx } }, },
-
-				/* PREFIX_VEX_0F38B7 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsubadd231p%XW", { XM,
-						Vex, EXx } }, },
-
-				/* PREFIX_VEX_0F38B8 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmadd231p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38B9 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmadd231s%XW", { XMScalar,
-						VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38BA */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsub231p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38BB */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsub231s%XW", { XMScalar,
-						VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38BC */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmadd231p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38BD */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmadd231s%XW", {
-						XMScalar, VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38BE */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsub231p%XW", { XM, Vex,
-						EXx } }, },
-
-				/* PREFIX_VEX_0F38BF */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsub231s%XW", {
-						XMScalar, VexScalar, EXVexWdqScalar } }, },
-
-				/* PREFIX_VEX_0F38DB */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F38DB_P_2) }, },
-
-				/* PREFIX_VEX_0F38DC */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F38DC_P_2) }, },
-
-				/* PREFIX_VEX_0F38DD */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F38DD_P_2) }, },
-
-				/* PREFIX_VEX_0F38DE */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F38DE_P_2) }, },
-
-				/* PREFIX_VEX_0F38DF */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F38DF_P_2) }, },
-
-				/* PREFIX_VEX_0F38F2 */
-				{ { VEX_LEN_TABLE (VEX_LEN_0F38F2_P_0) }, },
-
-				/* PREFIX_VEX_0F38F3_REG_1 */
-				{ { VEX_LEN_TABLE (VEX_LEN_0F38F3_R_1_P_0) }, },
-
-				/* PREFIX_VEX_0F38F3_REG_2 */
-				{ { VEX_LEN_TABLE (VEX_LEN_0F38F3_R_2_P_0) }, },
-
-				/* PREFIX_VEX_0F38F3_REG_3 */
-				{ { VEX_LEN_TABLE (VEX_LEN_0F38F3_R_3_P_0) }, },
-
-				/* PREFIX_VEX_0F38F7 */
-				{ { VEX_LEN_TABLE (VEX_LEN_0F38F7_P_0) }, },
-
-				/* PREFIX_VEX_0F3A04 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A04_P_2) }, },
-
-				/* PREFIX_VEX_0F3A05 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A05_P_2) }, },
-
-				/* PREFIX_VEX_0F3A06 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A06_P_2) }, },
-
-				/* PREFIX_VEX_0F3A08 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A08_P_2) }, },
-
-				/* PREFIX_VEX_0F3A09 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A09_P_2) }, },
-
-				/* PREFIX_VEX_0F3A0A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A0A_P_2) }, },
-
-				/* PREFIX_VEX_0F3A0B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A0B_P_2) }, },
-
-				/* PREFIX_VEX_0F3A0C */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A0C_P_2) }, },
-
-				/* PREFIX_VEX_0F3A0D */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A0D_P_2) }, },
-
-				/* PREFIX_VEX_0F3A0E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A0E_P_2) }, },
-
-				/* PREFIX_VEX_0F3A0F */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A0F_P_2) }, },
-
-				/* PREFIX_VEX_0F3A14 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A14_P_2) }, },
-
-				/* PREFIX_VEX_0F3A15 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A15_P_2) }, },
-
-				/* PREFIX_VEX_0F3A16 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A16_P_2) }, },
-
-				/* PREFIX_VEX_0F3A17 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A17_P_2) }, },
-
-				/* PREFIX_VEX_0F3A18 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A18_P_2) }, },
-
-				/* PREFIX_VEX_0F3A19 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A19_P_2) }, },
-
-				/* PREFIX_VEX_0F3A1D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vcvtps2ph", { EXxmmq, XM,
-						Ib } }, },
-
-				/* PREFIX_VEX_0F3A20 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A20_P_2) }, },
-
-				/* PREFIX_VEX_0F3A21 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A21_P_2) }, },
-
-				/* PREFIX_VEX_0F3A22 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A22_P_2) }, },
-
-				/* PREFIX_VEX_0F3A40 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A40_P_2) }, },
-
-				/* PREFIX_VEX_0F3A41 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A41_P_2) }, },
-
-				/* PREFIX_VEX_0F3A42 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A42_P_2) }, },
-
-				/* PREFIX_VEX_0F3A44 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A44_P_2) }, },
-
-				/* PREFIX_VEX_0F3A48 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A48_P_2) }, },
-
-				/* PREFIX_VEX_0F3A49 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A49_P_2) }, },
-
-				/* PREFIX_VEX_0F3A4A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A4A_P_2) }, },
-
-				/* PREFIX_VEX_0F3A4B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_W_TABLE (VEX_W_0F3A4B_P_2) }, },
-
-				/* PREFIX_VEX_0F3A4C */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A4C_P_2) }, },
-
-				/* PREFIX_VEX_0F3A5C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmaddsubps", { XMVexW,
-						Vex, EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A5D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmaddsubpd", { XMVexW,
-						Vex, EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A5E */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsubaddps", { XMVexW,
-						Vex, EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A5F */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsubaddpd", { XMVexW,
-						Vex, EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A60 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A60_P_2) }, { Bad_Opcode }, },
-
-				/* PREFIX_VEX_0F3A61 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A61_P_2) }, },
-
-				/* PREFIX_VEX_0F3A62 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A62_P_2) }, },
-
-				/* PREFIX_VEX_0F3A63 */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A63_P_2) }, },
-
-				/* PREFIX_VEX_0F3A68 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmaddps", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A69 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmaddpd", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A6A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A6A_P_2) }, },
-
-				/* PREFIX_VEX_0F3A6B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A6B_P_2) }, },
-
-				/* PREFIX_VEX_0F3A6C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsubps", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A6D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfmsubpd", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A6E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A6E_P_2) }, },
-
-				/* PREFIX_VEX_0F3A6F */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A6F_P_2) }, },
-
-				/* PREFIX_VEX_0F3A78 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmaddps", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A79 */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmaddpd", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A7A */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A7A_P_2) }, },
-
-				/* PREFIX_VEX_0F3A7B */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A7B_P_2) }, },
-
-				/* PREFIX_VEX_0F3A7C */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsubps", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, { Bad_Opcode }, },
-
-				/* PREFIX_VEX_0F3A7D */
-				{ { Bad_Opcode }, { Bad_Opcode }, { "vfnmsubpd", { XMVexW, Vex,
-						EXVexW, EXVexW, VexI4 } }, },
-
-				/* PREFIX_VEX_0F3A7E */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A7E_P_2) }, },
-
-				/* PREFIX_VEX_0F3A7F */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3A7F_P_2) }, },
-
-				/* PREFIX_VEX_0F3ADF */
-				{ { Bad_Opcode }, { Bad_Opcode }, {
-						VEX_LEN_TABLE (VEX_LEN_0F3ADF_P_2) }, }, };
-
-static const struct dis386 x86_64_table[][2] = {
-/* X86_64_06 */
-{ { "pushP", { es } }, },
-
-/* X86_64_07 */
-{ { "popP", { es } }, },
-
-/* X86_64_0D */
-{ { "pushP", { cs } }, },
-
-/* X86_64_16 */
-{ { "pushP", { ss } }, },
-
-/* X86_64_17 */
-{ { "popP", { ss } }, },
-
-/* X86_64_1E */
-{ { "pushP", { ds } }, },
-
-/* X86_64_1F */
-{ { "popP", { ds } }, },
-
-/* X86_64_27 */
-{ { "daa", { XX } }, },
-
-/* X86_64_2F */
-{ { "das", { XX } }, },
-
-/* X86_64_37 */
-{ { "aaa", { XX } }, },
-
-/* X86_64_3F */
-{ { "aas", { XX } }, },
-
-/* X86_64_60 */
-{ { "pushaP", { XX } }, },
-
-/* X86_64_61 */
-{ { "popaP", { XX } }, },
-
-/* X86_64_62 */
-{ { MOD_TABLE (MOD_62_32BIT) }, },
-
-/* X86_64_63 */
-{ { "arpl", { Ew, Gw } }, { "movs{lq|xd}", { Gv, Ed } }, },
-
-/* X86_64_6D */
-{ { "ins{R|}", { Yzr, indirDX } }, { "ins{G|}", { Yzr, indirDX } }, },
-
-/* X86_64_6F */
-{ { "outs{R|}", { indirDXr, Xz } }, { "outs{G|}", { indirDXr, Xz } }, },
-
-/* X86_64_9A */
-{ { "Jcall{T|}", { Ap } }, },
-
-/* X86_64_C4 */
-{ { MOD_TABLE (MOD_C4_32BIT) }, { VEX_C4_TABLE (VEX_0F) }, },
-
-/* X86_64_C5 */
-{ { MOD_TABLE (MOD_C5_32BIT) }, { VEX_C5_TABLE (VEX_0F) }, },
-
-/* X86_64_CE */
-{ { "into", { XX } }, },
-
-/* X86_64_D4 */
-{ { "aam", { Ib } }, },
-
-/* X86_64_D5 */
-{ { "aad", { Ib } }, },
-
-/* X86_64_EA */
-{ { "Jjmp{T|}", { Ap } }, },
-
-/* X86_64_0F01_REG_0 */
-{ { "sgdt{Q|IQ}", { M } }, { "sgdt", { M } }, },
-
-/* X86_64_0F01_REG_1 */
-{ { "sidt{Q|IQ}", { M } }, { "sidt", { M } }, },
-
-/* X86_64_0F01_REG_2 */
-{ { "lgdt{Q|Q}", { M } }, { "lgdt", { M } }, },
-
-/* X86_64_0F01_REG_3 */
-{ { "lidt{Q|Q}", { M } }, { "lidt", { M } }, }, };
-
-static const struct dis386 three_byte_table[][256] =
-		{
-
-				/* THREE_BYTE_0F38 */
-				{
-				/* 00 */
-				{ "pshufb", { MX, EM } }, { "phaddw", { MX, EM } }, { "phaddd",
-						{ MX, EM } }, { "phaddsw", { MX, EM } }, { "pmaddubsw",
-						{ MX, EM } }, { "phsubw", { MX, EM } }, { "phsubd", {
-						MX, EM } }, { "phsubsw", { MX, EM } },
-				/* 08 */
-				{ "psignb", { MX, EM } }, { "psignw", { MX, EM } }, { "psignd",
-						{ MX, EM } }, { "pmulhrsw", { MX, EM } },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 10 */
-						{ PREFIX_TABLE (PREFIX_0F3810) }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_0F3814) }, {
-								PREFIX_TABLE (PREFIX_0F3815) }, { Bad_Opcode },
-						{ PREFIX_TABLE (PREFIX_0F3817) },
-						/* 18 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { "pabsb", { MX, EM } }, {
-								"pabsw", { MX, EM } }, { "pabsd", { MX, EM } },
-						{ Bad_Opcode },
-						/* 20 */
-						{ PREFIX_TABLE (PREFIX_0F3820) }, {
-								PREFIX_TABLE (PREFIX_0F3821) }, {
-								PREFIX_TABLE (PREFIX_0F3822) }, {
-								PREFIX_TABLE (PREFIX_0F3823) }, {
-								PREFIX_TABLE (PREFIX_0F3824) }, {
-								PREFIX_TABLE (PREFIX_0F3825) }, { Bad_Opcode },
-						{ Bad_Opcode },
-						/* 28 */
-						{ PREFIX_TABLE (PREFIX_0F3828) }, {
-								PREFIX_TABLE (PREFIX_0F3829) }, {
-								PREFIX_TABLE (PREFIX_0F382A) }, {
-								PREFIX_TABLE (PREFIX_0F382B) }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* 30 */
-						{ PREFIX_TABLE (PREFIX_0F3830) }, {
-								PREFIX_TABLE (PREFIX_0F3831) }, {
-								PREFIX_TABLE (PREFIX_0F3832) }, {
-								PREFIX_TABLE (PREFIX_0F3833) }, {
-								PREFIX_TABLE (PREFIX_0F3834) }, {
-								PREFIX_TABLE (PREFIX_0F3835) }, { Bad_Opcode },
-						{ PREFIX_TABLE (PREFIX_0F3837) },
-						/* 38 */
-						{ PREFIX_TABLE (PREFIX_0F3838) }, {
-								PREFIX_TABLE (PREFIX_0F3839) }, {
-								PREFIX_TABLE (PREFIX_0F383A) }, {
-								PREFIX_TABLE (PREFIX_0F383B) }, {
-								PREFIX_TABLE (PREFIX_0F383C) }, {
-								PREFIX_TABLE (PREFIX_0F383D) }, {
-								PREFIX_TABLE (PREFIX_0F383E) }, {
-								PREFIX_TABLE (PREFIX_0F383F) },
-						/* 40 */
-						{ PREFIX_TABLE (PREFIX_0F3840) }, {
-								PREFIX_TABLE (PREFIX_0F3841) }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 48 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 60 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 68 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 80 */
-						{ PREFIX_TABLE (PREFIX_0F3880) }, {
-								PREFIX_TABLE (PREFIX_0F3881) }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 90 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 98 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_0F38DB) }, {
-								PREFIX_TABLE (PREFIX_0F38DC) }, {
-								PREFIX_TABLE (PREFIX_0F38DD) }, {
-								PREFIX_TABLE (PREFIX_0F38DE) }, {
-								PREFIX_TABLE (PREFIX_0F38DF) },
-						/* e0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f0 */
-						{ PREFIX_TABLE (PREFIX_0F38F0) }, {
-								PREFIX_TABLE (PREFIX_0F38F1) }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, },
-				/* THREE_BYTE_0F3A */
-				{
-				/* 00 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 08 */
-						{ PREFIX_TABLE (PREFIX_0F3A08) }, {
-								PREFIX_TABLE (PREFIX_0F3A09) }, {
-								PREFIX_TABLE (PREFIX_0F3A0A) }, {
-								PREFIX_TABLE (PREFIX_0F3A0B) }, {
-								PREFIX_TABLE (PREFIX_0F3A0C) }, {
-								PREFIX_TABLE (PREFIX_0F3A0D) }, {
-								PREFIX_TABLE (PREFIX_0F3A0E) }, { "palignr", {
-								MX, EM, Ib } },
-						/* 10 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { PREFIX_TABLE (PREFIX_0F3A14) },
-						{ PREFIX_TABLE (PREFIX_0F3A15) }, {
-								PREFIX_TABLE (PREFIX_0F3A16) }, {
-								PREFIX_TABLE (PREFIX_0F3A17) },
-						/* 18 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 20 */
-						{ PREFIX_TABLE (PREFIX_0F3A20) }, {
-								PREFIX_TABLE (PREFIX_0F3A21) }, {
-								PREFIX_TABLE (PREFIX_0F3A22) }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 28 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 30 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 38 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 40 */
-						{ PREFIX_TABLE (PREFIX_0F3A40) }, {
-								PREFIX_TABLE (PREFIX_0F3A41) }, {
-								PREFIX_TABLE (PREFIX_0F3A42) }, { Bad_Opcode },
-						{ PREFIX_TABLE (PREFIX_0F3A44) }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 48 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 60 */
-						{ PREFIX_TABLE (PREFIX_0F3A60) }, {
-								PREFIX_TABLE (PREFIX_0F3A61) }, {
-								PREFIX_TABLE (PREFIX_0F3A62) }, {
-								PREFIX_TABLE (PREFIX_0F3A63) }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* 68 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 80 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 90 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 98 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { PREFIX_TABLE (PREFIX_0F3ADF) },
-						/* e0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, },
-
-				/* THREE_BYTE_0F7A */
-				{
-				/* 00 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 08 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 10 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 18 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 20 */
-						{ "ptest", { XX } }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 28 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 30 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 38 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 40 */
-						{ Bad_Opcode }, { "phaddbw", { XM, EXq } }, { "phaddbd",
-								{ XM, EXq } }, { "phaddbq", { XM, EXq } }, {
-								Bad_Opcode }, { Bad_Opcode }, { "phaddwd", { XM,
-								EXq } }, { "phaddwq", { XM, EXq } },
-						/* 48 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								"phadddq", { XM, EXq } }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { "phaddubw", { XM, EXq } }, {
-								"phaddubd", { XM, EXq } }, { "phaddubq", { XM,
-								EXq } }, { Bad_Opcode }, { Bad_Opcode }, {
-								"phadduwd", { XM, EXq } }, { "phadduwq", { XM,
-								EXq } },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								"phaddudq", { XM, EXq } }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* 60 */
-						{ Bad_Opcode }, { "phsubbw", { XM, EXq } }, { "phsubbd",
-								{ XM, EXq } }, { "phsubbq", { XM, EXq } }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 68 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 80 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 90 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 98 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, }, };
-
-static const struct dis386 xop_table[][256] =
-		{
-				/* XOP_08 */
-				{
-				/* 00 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 08 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 10 */
-						{ "bextr", { Gv, Ev, Iq } }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* 18 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 20 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 28 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 30 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 38 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 40 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 48 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 60 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 68 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 80 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { "vpmacssww", {
-								XMVexW, Vex, EXVexW, EXVexW, VexI4 } }, {
-								"vpmacsswd", { XMVexW, Vex, EXVexW, EXVexW,
-										VexI4 } }, { "vpmacssdql", { XMVexW,
-								Vex, EXVexW, EXVexW, VexI4 } },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								"vpmacssdd", { XMVexW, Vex, EXVexW, EXVexW,
-										VexI4 } }, { "vpmacssdqh", { XMVexW,
-								Vex, EXVexW, EXVexW, VexI4 } },
-						/* 90 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { "vpmacsww", {
-								XMVexW, Vex, EXVexW, EXVexW, VexI4 } }, {
-								"vpmacswd",
-								{ XMVexW, Vex, EXVexW, EXVexW, VexI4 } }, {
-								"vpmacsdql", { XMVexW, Vex, EXVexW, EXVexW,
-										VexI4 } },
-						/* 98 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								"vpmacsdd",
-								{ XMVexW, Vex, EXVexW, EXVexW, VexI4 } }, {
-								"vpmacsdqh", { XMVexW, Vex, EXVexW, EXVexW,
-										VexI4 } },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { "vpcmov", { XMVexW,
-								Vex, EXVexW, EXVexW, VexI4 } }, { "vpperm", {
-								XMVexW, Vex, EXVexW, EXVexW, VexI4 } }, {
-								Bad_Opcode }, { Bad_Opcode }, { "vpmadcsswd", {
-								XMVexW, Vex, EXVexW, EXVexW, VexI4 } }, {
-								Bad_Opcode },
-						/* a8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								"vpmadcswd", { XMVexW, Vex, EXVexW, EXVexW,
-										VexI4 } }, { Bad_Opcode },
-						/* b8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c0 */
-						{ "vprotb", { XM, Vex_2src_1, Ib } }, { "vprotw", { XM,
-								Vex_2src_1, Ib } }, { "vprotd", { XM,
-								Vex_2src_1, Ib } }, { "vprotq", { XM,
-								Vex_2src_1, Ib } }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { "vpcomb",
-								{ XM, Vex128, EXx, Ib } }, { "vpcomw", { XM,
-								Vex128, EXx, Ib } }, { "vpcomd", { XM, Vex128,
-								EXx, Ib } },
-						{ "vpcomq", { XM, Vex128, EXx, Ib } },
-						/* d0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { "vpcomub",
-								{ XM, Vex128, EXx, Ib } }, { "vpcomuw", { XM,
-								Vex128, EXx, Ib } }, { "vpcomud", { XM, Vex128,
-								EXx, Ib } }, { "vpcomuq",
-								{ XM, Vex128, EXx, Ib } },
-						/* f0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, },
-				/* XOP_09 */
-				{
-				/* 00 */
-				{ Bad_Opcode }, { REG_TABLE (REG_XOP_TBM_01) }, {
-						REG_TABLE (REG_XOP_TBM_02) }, { Bad_Opcode }, {
-						Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-						Bad_Opcode },
-				/* 08 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 10 */
-						{ Bad_Opcode }, { Bad_Opcode }, {
-								REG_TABLE (REG_XOP_LWPCB) }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 18 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 20 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 28 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 30 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 38 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 40 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 48 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 60 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 68 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 80 */
-						{ VEX_LEN_TABLE (VEX_LEN_0FXOP_09_80) }, {
-								VEX_LEN_TABLE (VEX_LEN_0FXOP_09_81) }, {
-								"vfrczss", { XM, EXd } }, { "vfrczsd",
-								{ XM, EXq } }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 90 */
-						{ "vprotb", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vprotw", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vprotd", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vprotq", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vpshlb", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vpshlw", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vpshld", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vpshlq", { XM, Vex_2src_1, Vex_2src_2 } },
-						/* 98 */
-						{ "vpshab", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vpshaw", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vpshad", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								"vpshaq", { XM, Vex_2src_1, Vex_2src_2 } }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c0 */
-						{ Bad_Opcode }, { "vphaddbw", { XM, EXxmm } }, {
-								"vphaddbd", { XM, EXxmm } }, { "vphaddbq", { XM,
-								EXxmm } }, { Bad_Opcode }, { Bad_Opcode }, {
-								"vphaddwd", { XM, EXxmm } }, { "vphaddwq", { XM,
-								EXxmm } },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								"vphadddq", { XM, EXxmm } }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* d0 */
-						{ Bad_Opcode }, { "vphaddubw", { XM, EXxmm } }, {
-								"vphaddubd", { XM, EXxmm } }, { "vphaddubq", {
-								XM, EXxmm } }, { Bad_Opcode }, { Bad_Opcode }, {
-								"vphadduwd", { XM, EXxmm } }, { "vphadduwq", {
-								XM, EXxmm } },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								"vphaddudq", { XM, EXxmm } }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* e0 */
-						{ Bad_Opcode }, { "vphsubbw", { XM, EXxmm } }, {
-								"vphsubwd", { XM, EXxmm } }, { "vphsubdq", { XM,
-								EXxmm } }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, },
-				/* XOP_0A */
-				{
-				/* 00 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 08 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 10 */
-						{ "bextr", { Gv, Ev, Iq } }, { Bad_Opcode }, {
-								REG_TABLE (REG_XOP_LWP) }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 18 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 20 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 28 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 30 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 38 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 40 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 48 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 60 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 68 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 80 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 90 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 98 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, }, };
-
-static const struct dis386 vex_table[][256] =
-		{
-		/* VEX_0F */
-		{
-		/* 00 */
-		{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-				Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-		/* 08 */
-		{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-				Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-		/* 10 */
-		{ PREFIX_TABLE (PREFIX_VEX_0F10) }, { PREFIX_TABLE (PREFIX_VEX_0F11) },
-				{ PREFIX_TABLE (PREFIX_VEX_0F12) },
-				{ MOD_TABLE (MOD_VEX_0F13) }, { VEX_W_TABLE (VEX_W_0F14) }, {
-						VEX_W_TABLE (VEX_W_0F15) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F16) }, {
-						MOD_TABLE (MOD_VEX_0F17) },
-				/* 18 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 20 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 28 */
-				{ VEX_W_TABLE (VEX_W_0F28) }, { VEX_W_TABLE (VEX_W_0F29) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F2A) }, {
-						MOD_TABLE (MOD_VEX_0F2B) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F2C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F2D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F2E) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F2F) },
-				/* 30 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 38 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 40 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 48 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 50 */
-				{ MOD_TABLE (MOD_VEX_0F50) },
-				{ PREFIX_TABLE (PREFIX_VEX_0F51) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F52) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F53) }, { "vandpX", { XM, Vex,
-						EXx } }, { "vandnpX", { XM, Vex, EXx } }, { "vorpX", {
-						XM, Vex, EXx } }, { "vxorpX", { XM, Vex, EXx } },
-				/* 58 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F58) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F59) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F5A) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F5B) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F5C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F5D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F5E) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F5F) },
-				/* 60 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F60) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F61) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F62) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F63) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F64) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F65) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F66) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F67) },
-				/* 68 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F68) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F69) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F6A) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F6B) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F6C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F6D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F6E) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F6F) },
-				/* 70 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F70) },
-				{ REG_TABLE (REG_VEX_0F71) }, { REG_TABLE (REG_VEX_0F72) }, {
-						REG_TABLE (REG_VEX_0F73) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F74) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F75) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F76) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F77) },
-				/* 78 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ PREFIX_TABLE (PREFIX_VEX_0F7C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F7D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F7E) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F7F) },
-				/* 80 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 88 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 90 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* 98 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* a0 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* a8 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { REG_TABLE (REG_VEX_0FAE) }, {
-						Bad_Opcode },
-				/* b0 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* b8 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* c0 */
-				{ Bad_Opcode }, { Bad_Opcode },
-				{ PREFIX_TABLE (PREFIX_VEX_0FC2) }, { Bad_Opcode }, {
-						PREFIX_TABLE (PREFIX_VEX_0FC4) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FC5) }, { "vshufpX", { XM,
-						Vex, EXx, Ib } }, { Bad_Opcode },
-				/* c8 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-				/* d0 */
-				{ PREFIX_TABLE (PREFIX_VEX_0FD0) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD1) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD2) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD3) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD4) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD5) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD6) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD7) },
-				/* d8 */
-				{ PREFIX_TABLE (PREFIX_VEX_0FD8) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FD9) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FDA) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FDB) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FDC) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FDD) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FDE) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FDF) },
-				/* e0 */
-				{ PREFIX_TABLE (PREFIX_VEX_0FE0) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE1) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE2) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE3) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE4) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE5) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE6) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE7) },
-				/* e8 */
-				{ PREFIX_TABLE (PREFIX_VEX_0FE8) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FE9) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FEA) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FEB) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FEC) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FED) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FEE) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FEF) },
-				/* f0 */
-				{ PREFIX_TABLE (PREFIX_VEX_0FF0) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF1) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF2) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF3) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF4) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF5) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF6) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF7) },
-				/* f8 */
-				{ PREFIX_TABLE (PREFIX_VEX_0FF8) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FF9) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FFA) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FFB) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FFC) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FFD) }, {
-						PREFIX_TABLE (PREFIX_VEX_0FFE) }, { Bad_Opcode }, },
-				/* VEX_0F38 */
-				{
-				/* 00 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3800) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3801) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3802) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3803) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3804) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3805) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3806) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3807) },
-				/* 08 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3808) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3809) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F380A) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F380B) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F380C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F380D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F380E) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F380F) },
-				/* 10 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3813) }, { Bad_Opcode }, {
-						Bad_Opcode }, { Bad_Opcode }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3817) },
-				/* 18 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3818) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3819) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F381A) }, { Bad_Opcode }, {
-						PREFIX_TABLE (PREFIX_VEX_0F381C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F381D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F381E) }, { Bad_Opcode },
-				/* 20 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3820) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3821) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3822) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3823) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3824) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3825) }, { Bad_Opcode }, {
-						Bad_Opcode },
-				/* 28 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3828) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3829) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F382A) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F382B) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F382C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F382D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F382E) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F382F) },
-				/* 30 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3830) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3831) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3832) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3833) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3834) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3835) }, { Bad_Opcode }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3837) },
-				/* 38 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3838) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3839) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F383A) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F383B) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F383C) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F383D) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F383E) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F383F) },
-				/* 40 */
-				{ PREFIX_TABLE (PREFIX_VEX_0F3840) }, {
-						PREFIX_TABLE (PREFIX_VEX_0F3841) }, { Bad_Opcode }, {
-						Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-						Bad_Opcode }, { Bad_Opcode },
-				/* 48 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 60 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 68 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 80 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 90 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3896) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3897) },
-						/* 98 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3898) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3899) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F389A) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F389B) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F389C) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F389D) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F389E) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F389F) },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38A6) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38A7) },
-						/* a8 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F38A8) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38A9) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38AA) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38AB) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38AC) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38AD) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38AE) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38AF) },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38B6) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38B7) },
-						/* b8 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F38B8) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38B9) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38BA) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38BB) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38BC) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38BD) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38BE) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38BF) },
-						/* c0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38DB) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38DC) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38DD) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38DE) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38DF) },
-						/* e0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f0 */
-						{ Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38F2) }, {
-								REG_TABLE (REG_VEX_0F38F3) }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_VEX_0F38F7) },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, },
-				/* VEX_0F3A */
-				{
-				/* 00 */
-				{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A04) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A05) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A06) },
-						{ Bad_Opcode },
-						/* 08 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A08) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A09) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A0A) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A0B) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A0C) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A0D) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A0E) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A0F) },
-						/* 10 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A14) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A15) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A16) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A17) },
-						/* 18 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A18) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A19) },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A1D) },
-						{ Bad_Opcode }, { Bad_Opcode },
-						/* 20 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A20) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A21) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A22) },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 28 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 30 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 38 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 40 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A40) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A41) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A42) },
-						{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F3A44) }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* 48 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A48) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A49) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A4A) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A4B) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A4C) },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode },
-						/* 50 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 58 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A5C) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A5D) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A5E) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A5F) },
-						/* 60 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A60) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A61) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A62) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A63) },
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						/* 68 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A68) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A69) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A6A) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A6B) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A6C) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A6D) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A6E) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A6F) },
-						/* 70 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 78 */
-						{ PREFIX_TABLE (PREFIX_VEX_0F3A78) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A79) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A7A) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A7B) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A7C) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A7D) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A7E) }, {
-								PREFIX_TABLE (PREFIX_VEX_0F3A7F) },
-						/* 80 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 88 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 90 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* 98 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* a8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* b8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* c8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* d8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode },
-						{ PREFIX_TABLE (PREFIX_VEX_0F3ADF) },
-						/* e0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* e8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f0 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode },
-						/* f8 */
-						{ Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-								Bad_Opcode }, { Bad_Opcode }, }, };
-
-static const struct dis386 vex_len_table[][2] = {
-/* VEX_LEN_0F10_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F10_P_1) }, { VEX_W_TABLE (VEX_W_0F10_P_1) }, },
-
-/* VEX_LEN_0F10_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F10_P_3) }, { VEX_W_TABLE (VEX_W_0F10_P_3) }, },
-
-/* VEX_LEN_0F11_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F11_P_1) }, { VEX_W_TABLE (VEX_W_0F11_P_1) }, },
-
-/* VEX_LEN_0F11_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F11_P_3) }, { VEX_W_TABLE (VEX_W_0F11_P_3) }, },
-
-/* VEX_LEN_0F12_P_0_M_0 */
-{ { VEX_W_TABLE (VEX_W_0F12_P_0_M_0) }, },
-
-/* VEX_LEN_0F12_P_0_M_1 */
-{ { VEX_W_TABLE (VEX_W_0F12_P_0_M_1) }, },
-
-/* VEX_LEN_0F12_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F12_P_2) }, },
-
-/* VEX_LEN_0F13_M_0 */
-{ { VEX_W_TABLE (VEX_W_0F13_M_0) }, },
-
-/* VEX_LEN_0F16_P_0_M_0 */
-{ { VEX_W_TABLE (VEX_W_0F16_P_0_M_0) }, },
-
-/* VEX_LEN_0F16_P_0_M_1 */
-{ { VEX_W_TABLE (VEX_W_0F16_P_0_M_1) }, },
-
-/* VEX_LEN_0F16_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F16_P_2) }, },
-
-/* VEX_LEN_0F17_M_0 */
-{ { VEX_W_TABLE (VEX_W_0F17_M_0) }, },
-
-/* VEX_LEN_0F2A_P_1 */
-{ { "vcvtsi2ss%LQ", { XMScalar, VexScalar, Ev } }, { "vcvtsi2ss%LQ", { XMScalar,
-		VexScalar, Ev } }, },
-
-/* VEX_LEN_0F2A_P_3 */
-{ { "vcvtsi2sd%LQ", { XMScalar, VexScalar, Ev } }, { "vcvtsi2sd%LQ", { XMScalar,
-		VexScalar, Ev } }, },
-
-/* VEX_LEN_0F2C_P_1 */
-{ { "vcvttss2siY", { Gv, EXdScalar } }, { "vcvttss2siY", { Gv, EXdScalar } }, },
-
-/* VEX_LEN_0F2C_P_3 */
-{ { "vcvttsd2siY", { Gv, EXqScalar } }, { "vcvttsd2siY", { Gv, EXqScalar } }, },
-
-/* VEX_LEN_0F2D_P_1 */
-{ { "vcvtss2siY", { Gv, EXdScalar } }, { "vcvtss2siY", { Gv, EXdScalar } }, },
-
-/* VEX_LEN_0F2D_P_3 */
-{ { "vcvtsd2siY", { Gv, EXqScalar } }, { "vcvtsd2siY", { Gv, EXqScalar } }, },
-
-/* VEX_LEN_0F2E_P_0 */
-{ { VEX_W_TABLE (VEX_W_0F2E_P_0) }, { VEX_W_TABLE (VEX_W_0F2E_P_0) }, },
-
-/* VEX_LEN_0F2E_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F2E_P_2) }, { VEX_W_TABLE (VEX_W_0F2E_P_2) }, },
-
-/* VEX_LEN_0F2F_P_0 */
-{ { VEX_W_TABLE (VEX_W_0F2F_P_0) }, { VEX_W_TABLE (VEX_W_0F2F_P_0) }, },
-
-/* VEX_LEN_0F2F_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F2F_P_2) }, { VEX_W_TABLE (VEX_W_0F2F_P_2) }, },
-
-/* VEX_LEN_0F51_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F51_P_1) }, { VEX_W_TABLE (VEX_W_0F51_P_1) }, },
-
-/* VEX_LEN_0F51_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F51_P_3) }, { VEX_W_TABLE (VEX_W_0F51_P_3) }, },
-
-/* VEX_LEN_0F52_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F52_P_1) }, { VEX_W_TABLE (VEX_W_0F52_P_1) }, },
-
-/* VEX_LEN_0F53_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F53_P_1) }, { VEX_W_TABLE (VEX_W_0F53_P_1) }, },
-
-/* VEX_LEN_0F58_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F58_P_1) }, { VEX_W_TABLE (VEX_W_0F58_P_1) }, },
-
-/* VEX_LEN_0F58_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F58_P_3) }, { VEX_W_TABLE (VEX_W_0F58_P_3) }, },
-
-/* VEX_LEN_0F59_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F59_P_1) }, { VEX_W_TABLE (VEX_W_0F59_P_1) }, },
-
-/* VEX_LEN_0F59_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F59_P_3) }, { VEX_W_TABLE (VEX_W_0F59_P_3) }, },
-
-/* VEX_LEN_0F5A_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F5A_P_1) }, { VEX_W_TABLE (VEX_W_0F5A_P_1) }, },
-
-/* VEX_LEN_0F5A_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F5A_P_3) }, { VEX_W_TABLE (VEX_W_0F5A_P_3) }, },
-
-/* VEX_LEN_0F5C_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F5C_P_1) }, { VEX_W_TABLE (VEX_W_0F5C_P_1) }, },
-
-/* VEX_LEN_0F5C_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F5C_P_3) }, { VEX_W_TABLE (VEX_W_0F5C_P_3) }, },
-
-/* VEX_LEN_0F5D_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F5D_P_1) }, { VEX_W_TABLE (VEX_W_0F5D_P_1) }, },
-
-/* VEX_LEN_0F5D_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F5D_P_3) }, { VEX_W_TABLE (VEX_W_0F5D_P_3) }, },
-
-/* VEX_LEN_0F5E_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F5E_P_1) }, { VEX_W_TABLE (VEX_W_0F5E_P_1) }, },
-
-/* VEX_LEN_0F5E_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F5E_P_3) }, { VEX_W_TABLE (VEX_W_0F5E_P_3) }, },
-
-/* VEX_LEN_0F5F_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F5F_P_1) }, { VEX_W_TABLE (VEX_W_0F5F_P_1) }, },
-
-/* VEX_LEN_0F5F_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F5F_P_3) }, { VEX_W_TABLE (VEX_W_0F5F_P_3) }, },
-
-/* VEX_LEN_0F60_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F60_P_2) }, },
-
-/* VEX_LEN_0F61_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F61_P_2) }, },
-
-/* VEX_LEN_0F62_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F62_P_2) }, },
-
-/* VEX_LEN_0F63_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F63_P_2) }, },
-
-/* VEX_LEN_0F64_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F64_P_2) }, },
-
-/* VEX_LEN_0F65_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F65_P_2) }, },
-
-/* VEX_LEN_0F66_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F66_P_2) }, },
-
-/* VEX_LEN_0F67_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F67_P_2) }, },
-
-/* VEX_LEN_0F68_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F68_P_2) }, },
-
-/* VEX_LEN_0F69_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F69_P_2) }, },
-
-/* VEX_LEN_0F6A_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F6A_P_2) }, },
-
-/* VEX_LEN_0F6B_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F6B_P_2) }, },
-
-/* VEX_LEN_0F6C_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F6C_P_2) }, },
-
-/* VEX_LEN_0F6D_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F6D_P_2) }, },
-
-/* VEX_LEN_0F6E_P_2 */
-{ { "vmovK", { XMScalar, Edq } }, { "vmovK", { XMScalar, Edq } }, },
-
-/* VEX_LEN_0F70_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F70_P_1) }, },
-
-/* VEX_LEN_0F70_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F70_P_2) }, },
-
-/* VEX_LEN_0F70_P_3 */
-{ { VEX_W_TABLE (VEX_W_0F70_P_3) }, },
-
-/* VEX_LEN_0F71_R_2_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F71_R_2_P_2) }, },
-
-/* VEX_LEN_0F71_R_4_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F71_R_4_P_2) }, },
-
-/* VEX_LEN_0F71_R_6_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F71_R_6_P_2) }, },
-
-/* VEX_LEN_0F72_R_2_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F72_R_2_P_2) }, },
-
-/* VEX_LEN_0F72_R_4_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F72_R_4_P_2) }, },
-
-/* VEX_LEN_0F72_R_6_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F72_R_6_P_2) }, },
-
-/* VEX_LEN_0F73_R_2_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F73_R_2_P_2) }, },
-
-/* VEX_LEN_0F73_R_3_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F73_R_3_P_2) }, },
-
-/* VEX_LEN_0F73_R_6_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F73_R_6_P_2) }, },
-
-/* VEX_LEN_0F73_R_7_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F73_R_7_P_2) }, },
-
-/* VEX_LEN_0F74_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F74_P_2) }, },
-
-/* VEX_LEN_0F75_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F75_P_2) }, },
-
-/* VEX_LEN_0F76_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F76_P_2) }, },
-
-/* VEX_LEN_0F7E_P_1 */
-{ { VEX_W_TABLE (VEX_W_0F7E_P_1) }, { VEX_W_TABLE (VEX_W_0F7E_P_1) }, },
-
-/* VEX_LEN_0F7E_P_2 */
-{ { "vmovK", { Edq, XMScalar } }, { "vmovK", { Edq, XMScalar } }, },
-
-/* VEX_LEN_0FAE_R_2_M_0 */
-{ { VEX_W_TABLE (VEX_W_0FAE_R_2_M_0) }, },
-
-/* VEX_LEN_0FAE_R_3_M_0 */
-{ { VEX_W_TABLE (VEX_W_0FAE_R_3_M_0) }, },
-
-/* VEX_LEN_0FC2_P_1 */
-{ { VEX_W_TABLE (VEX_W_0FC2_P_1) }, { VEX_W_TABLE (VEX_W_0FC2_P_1) }, },
-
-/* VEX_LEN_0FC2_P_3 */
-{ { VEX_W_TABLE (VEX_W_0FC2_P_3) }, { VEX_W_TABLE (VEX_W_0FC2_P_3) }, },
-
-/* VEX_LEN_0FC4_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FC4_P_2) }, },
-
-/* VEX_LEN_0FC5_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FC5_P_2) }, },
-
-/* VEX_LEN_0FD1_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD1_P_2) }, },
-
-/* VEX_LEN_0FD2_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD2_P_2) }, },
-
-/* VEX_LEN_0FD3_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD3_P_2) }, },
-
-/* VEX_LEN_0FD4_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD4_P_2) }, },
-
-/* VEX_LEN_0FD5_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD5_P_2) }, },
-
-/* VEX_LEN_0FD6_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD6_P_2) }, { VEX_W_TABLE (VEX_W_0FD6_P_2) }, },
-
-/* VEX_LEN_0FD7_P_2_M_1 */
-{ { VEX_W_TABLE (VEX_W_0FD7_P_2_M_1) }, },
-
-/* VEX_LEN_0FD8_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD8_P_2) }, },
-
-/* VEX_LEN_0FD9_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FD9_P_2) }, },
-
-/* VEX_LEN_0FDA_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FDA_P_2) }, },
-
-/* VEX_LEN_0FDB_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FDB_P_2) }, },
-
-/* VEX_LEN_0FDC_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FDC_P_2) }, },
-
-/* VEX_LEN_0FDD_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FDD_P_2) }, },
-
-/* VEX_LEN_0FDE_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FDE_P_2) }, },
-
-/* VEX_LEN_0FDF_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FDF_P_2) }, },
-
-/* VEX_LEN_0FE0_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE0_P_2) }, },
-
-/* VEX_LEN_0FE1_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE1_P_2) }, },
-
-/* VEX_LEN_0FE2_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE2_P_2) }, },
-
-/* VEX_LEN_0FE3_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE3_P_2) }, },
-
-/* VEX_LEN_0FE4_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE4_P_2) }, },
-
-/* VEX_LEN_0FE5_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE5_P_2) }, },
-
-/* VEX_LEN_0FE8_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE8_P_2) }, },
-
-/* VEX_LEN_0FE9_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FE9_P_2) }, },
-
-/* VEX_LEN_0FEA_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FEA_P_2) }, },
-
-/* VEX_LEN_0FEB_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FEB_P_2) }, },
-
-/* VEX_LEN_0FEC_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FEC_P_2) }, },
-
-/* VEX_LEN_0FED_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FED_P_2) }, },
-
-/* VEX_LEN_0FEE_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FEE_P_2) }, },
-
-/* VEX_LEN_0FEF_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FEF_P_2) }, },
-
-/* VEX_LEN_0FF1_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF1_P_2) }, },
-
-/* VEX_LEN_0FF2_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF2_P_2) }, },
-
-/* VEX_LEN_0FF3_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF3_P_2) }, },
-
-/* VEX_LEN_0FF4_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF4_P_2) }, },
-
-/* VEX_LEN_0FF5_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF5_P_2) }, },
-
-/* VEX_LEN_0FF6_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF6_P_2) }, },
-
-/* VEX_LEN_0FF7_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF7_P_2) }, },
-
-/* VEX_LEN_0FF8_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF8_P_2) }, },
-
-/* VEX_LEN_0FF9_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FF9_P_2) }, },
-
-/* VEX_LEN_0FFA_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FFA_P_2) }, },
-
-/* VEX_LEN_0FFB_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FFB_P_2) }, },
-
-/* VEX_LEN_0FFC_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FFC_P_2) }, },
-
-/* VEX_LEN_0FFD_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FFD_P_2) }, },
-
-/* VEX_LEN_0FFE_P_2 */
-{ { VEX_W_TABLE (VEX_W_0FFE_P_2) }, },
-
-/* VEX_LEN_0F3800_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3800_P_2) }, },
-
-/* VEX_LEN_0F3801_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3801_P_2) }, },
-
-/* VEX_LEN_0F3802_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3802_P_2) }, },
-
-/* VEX_LEN_0F3803_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3803_P_2) }, },
-
-/* VEX_LEN_0F3804_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3804_P_2) }, },
-
-/* VEX_LEN_0F3805_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3805_P_2) }, },
-
-/* VEX_LEN_0F3806_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3806_P_2) }, },
-
-/* VEX_LEN_0F3807_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3807_P_2) }, },
-
-/* VEX_LEN_0F3808_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3808_P_2) }, },
-
-/* VEX_LEN_0F3809_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3809_P_2) }, },
-
-/* VEX_LEN_0F380A_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F380A_P_2) }, },
-
-/* VEX_LEN_0F380B_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F380B_P_2) }, },
-
-/* VEX_LEN_0F3819_P_2_M_0 */
-{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F3819_P_2_M_0) }, },
-
-/* VEX_LEN_0F381A_P_2_M_0 */
-{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F381A_P_2_M_0) }, },
-
-/* VEX_LEN_0F381C_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F381C_P_2) }, },
-
-/* VEX_LEN_0F381D_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F381D_P_2) }, },
-
-/* VEX_LEN_0F381E_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F381E_P_2) }, },
-
-/* VEX_LEN_0F3820_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3820_P_2) }, },
-
-/* VEX_LEN_0F3821_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3821_P_2) }, },
-
-/* VEX_LEN_0F3822_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3822_P_2) }, },
-
-/* VEX_LEN_0F3823_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3823_P_2) }, },
-
-/* VEX_LEN_0F3824_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3824_P_2) }, },
-
-/* VEX_LEN_0F3825_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3825_P_2) }, },
-
-/* VEX_LEN_0F3828_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3828_P_2) }, },
-
-/* VEX_LEN_0F3829_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3829_P_2) }, },
-
-/* VEX_LEN_0F382A_P_2_M_0 */
-{ { VEX_W_TABLE (VEX_W_0F382A_P_2_M_0) }, },
-
-/* VEX_LEN_0F382B_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F382B_P_2) }, },
-
-/* VEX_LEN_0F3830_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3830_P_2) }, },
-
-/* VEX_LEN_0F3831_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3831_P_2) }, },
-
-/* VEX_LEN_0F3832_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3832_P_2) }, },
-
-/* VEX_LEN_0F3833_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3833_P_2) }, },
-
-/* VEX_LEN_0F3834_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3834_P_2) }, },
-
-/* VEX_LEN_0F3835_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3835_P_2) }, },
-
-/* VEX_LEN_0F3837_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3837_P_2) }, },
-
-/* VEX_LEN_0F3838_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3838_P_2) }, },
-
-/* VEX_LEN_0F3839_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3839_P_2) }, },
-
-/* VEX_LEN_0F383A_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F383A_P_2) }, },
-
-/* VEX_LEN_0F383B_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F383B_P_2) }, },
-
-/* VEX_LEN_0F383C_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F383C_P_2) }, },
-
-/* VEX_LEN_0F383D_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F383D_P_2) }, },
-
-/* VEX_LEN_0F383E_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F383E_P_2) }, },
-
-/* VEX_LEN_0F383F_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F383F_P_2) }, },
-
-/* VEX_LEN_0F3840_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3840_P_2) }, },
-
-/* VEX_LEN_0F3841_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3841_P_2) }, },
-
-/* VEX_LEN_0F38DB_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F38DB_P_2) }, },
-
-/* VEX_LEN_0F38DC_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F38DC_P_2) }, },
-
-/* VEX_LEN_0F38DD_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F38DD_P_2) }, },
-
-/* VEX_LEN_0F38DE_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F38DE_P_2) }, },
-
-/* VEX_LEN_0F38DF_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F38DF_P_2) }, },
-
-/* VEX_LEN_0F38F2_P_0 */
-{ { "andnS", { Gdq, VexGdq, Edq } }, },
-
-/* VEX_LEN_0F38F3_R_1_P_0 */
-{ { "blsrS", { VexGdq, Edq } }, },
-
-/* VEX_LEN_0F38F3_R_2_P_0 */
-{ { "blsmskS", { VexGdq, Edq } }, },
-
-/* VEX_LEN_0F38F3_R_3_P_0 */
-{ { "blsiS", { VexGdq, Edq } }, },
-
-/* VEX_LEN_0F38F7_P_0 */
-{ { "bextrS", { Gdq, Edq, VexGdq } }, },
-
-/* VEX_LEN_0F3A06_P_2 */
-{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F3A06_P_2) }, },
-
-/* VEX_LEN_0F3A0A_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A0A_P_2) }, { VEX_W_TABLE (VEX_W_0F3A0A_P_2) }, },
-
-/* VEX_LEN_0F3A0B_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A0B_P_2) }, { VEX_W_TABLE (VEX_W_0F3A0B_P_2) }, },
-
-/* VEX_LEN_0F3A0E_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A0E_P_2) }, },
-
-/* VEX_LEN_0F3A0F_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A0F_P_2) }, },
-
-/* VEX_LEN_0F3A14_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A14_P_2) }, },
-
-/* VEX_LEN_0F3A15_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A15_P_2) }, },
-
-/* VEX_LEN_0F3A16_P_2  */
-{ { "vpextrK", { Edq, XM, Ib } }, },
-
-/* VEX_LEN_0F3A17_P_2 */
-{ { "vextractps", { Edqd, XM, Ib } }, },
-
-/* VEX_LEN_0F3A18_P_2 */
-{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F3A18_P_2) }, },
-
-/* VEX_LEN_0F3A19_P_2 */
-{ { Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F3A19_P_2) }, },
-
-/* VEX_LEN_0F3A20_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A20_P_2) }, },
-
-/* VEX_LEN_0F3A21_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A21_P_2) }, },
-
-/* VEX_LEN_0F3A22_P_2 */
-{ { "vpinsrK", { XM, Vex128, Edq, Ib } }, },
-
-/* VEX_LEN_0F3A41_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A41_P_2) }, },
-
-/* VEX_LEN_0F3A42_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A42_P_2) }, },
-
-/* VEX_LEN_0F3A44_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A44_P_2) }, },
-
-/* VEX_LEN_0F3A4C_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A4C_P_2) }, },
-
-/* VEX_LEN_0F3A60_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A60_P_2) }, },
-
-/* VEX_LEN_0F3A61_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A61_P_2) }, },
-
-/* VEX_LEN_0F3A62_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A62_P_2) }, },
-
-/* VEX_LEN_0F3A63_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3A63_P_2) }, },
-
-/* VEX_LEN_0F3A6A_P_2 */
-{ { "vfmaddss", { XMVexW, Vex128, EXdVexW, EXdVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3A6B_P_2 */
-{ { "vfmaddsd", { XMVexW, Vex128, EXqVexW, EXqVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3A6E_P_2 */
-{ { "vfmsubss", { XMVexW, Vex128, EXdVexW, EXdVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3A6F_P_2 */
-{ { "vfmsubsd", { XMVexW, Vex128, EXqVexW, EXqVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3A7A_P_2 */
-{ { "vfnmaddss", { XMVexW, Vex128, EXdVexW, EXdVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3A7B_P_2 */
-{ { "vfnmaddsd", { XMVexW, Vex128, EXqVexW, EXqVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3A7E_P_2 */
-{ { "vfnmsubss", { XMVexW, Vex128, EXdVexW, EXdVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3A7F_P_2 */
-{ { "vfnmsubsd", { XMVexW, Vex128, EXqVexW, EXqVexW, VexI4 } }, },
-
-/* VEX_LEN_0F3ADF_P_2 */
-{ { VEX_W_TABLE (VEX_W_0F3ADF_P_2) }, },
-
-/* VEX_LEN_0FXOP_09_80 */
-{ { "vfrczps", { XM, EXxmm } }, { "vfrczps", { XM, EXymmq } }, },
-
-/* VEX_LEN_0FXOP_09_81 */
-{ { "vfrczpd", { XM, EXxmm } }, { "vfrczpd", { XM, EXymmq } }, }, };
-
-static const struct dis386 vex_w_table[][2] = { {
-/* VEX_W_0F10_P_0 */
-{ "vmovups", { XM, EXx } }, }, {
-/* VEX_W_0F10_P_1 */
-{ "vmovss", { XMVexScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F10_P_2 */
-{ "vmovupd", { XM, EXx } }, }, {
-/* VEX_W_0F10_P_3 */
-{ "vmovsd", { XMVexScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F11_P_0 */
-{ "vmovups", { EXxS, XM } }, }, {
-/* VEX_W_0F11_P_1 */
-{ "vmovss", { EXdVexScalarS, VexScalar, XMScalar } }, }, {
-/* VEX_W_0F11_P_2 */
-{ "vmovupd", { EXxS, XM } }, }, {
-/* VEX_W_0F11_P_3 */
-{ "vmovsd", { EXqVexScalarS, VexScalar, XMScalar } }, }, {
-/* VEX_W_0F12_P_0_M_0 */
-{ "vmovlps", { XM, Vex128, EXq } }, }, {
-/* VEX_W_0F12_P_0_M_1 */
-{ "vmovhlps", { XM, Vex128, EXq } }, }, {
-/* VEX_W_0F12_P_1 */
-{ "vmovsldup", { XM, EXx } }, }, {
-/* VEX_W_0F12_P_2 */
-{ "vmovlpd", { XM, Vex128, EXq } }, }, {
-/* VEX_W_0F12_P_3 */
-{ "vmovddup", { XM, EXymmq } }, }, {
-/* VEX_W_0F13_M_0 */
-{ "vmovlpX", { EXq, XM } }, }, {
-/* VEX_W_0F14 */
-{ "vunpcklpX", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F15 */
-{ "vunpckhpX", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F16_P_0_M_0 */
-{ "vmovhps", { XM, Vex128, EXq } }, }, {
-/* VEX_W_0F16_P_0_M_1 */
-{ "vmovlhps", { XM, Vex128, EXq } }, }, {
-/* VEX_W_0F16_P_1 */
-{ "vmovshdup", { XM, EXx } }, }, {
-/* VEX_W_0F16_P_2 */
-{ "vmovhpd", { XM, Vex128, EXq } }, }, {
-/* VEX_W_0F17_M_0 */
-{ "vmovhpX", { EXq, XM } }, }, {
-/* VEX_W_0F28 */
-{ "vmovapX", { XM, EXx } }, }, {
-/* VEX_W_0F29 */
-{ "vmovapX", { EXxS, XM } }, }, {
-/* VEX_W_0F2B_M_0 */
-{ "vmovntpX", { Mx, XM } }, }, {
-/* VEX_W_0F2E_P_0 */
-{ "vucomiss", { XMScalar, EXdScalar } }, }, {
-/* VEX_W_0F2E_P_2 */
-{ "vucomisd", { XMScalar, EXqScalar } }, }, {
-/* VEX_W_0F2F_P_0 */
-{ "vcomiss", { XMScalar, EXdScalar } }, }, {
-/* VEX_W_0F2F_P_2 */
-{ "vcomisd", { XMScalar, EXqScalar } }, }, {
-/* VEX_W_0F50_M_0 */
-{ "vmovmskpX", { Gdq, XS } }, }, {
-/* VEX_W_0F51_P_0 */
-{ "vsqrtps", { XM, EXx } }, }, {
-/* VEX_W_0F51_P_1 */
-{ "vsqrtss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F51_P_2  */
-{ "vsqrtpd", { XM, EXx } }, }, {
-/* VEX_W_0F51_P_3 */
-{ "vsqrtsd", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F52_P_0 */
-{ "vrsqrtps", { XM, EXx } }, }, {
-/* VEX_W_0F52_P_1 */
-{ "vrsqrtss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F53_P_0  */
-{ "vrcpps", { XM, EXx } }, }, {
-/* VEX_W_0F53_P_1  */
-{ "vrcpss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F58_P_0  */
-{ "vaddps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F58_P_1  */
-{ "vaddss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F58_P_2  */
-{ "vaddpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F58_P_3  */
-{ "vaddsd", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F59_P_0  */
-{ "vmulps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F59_P_1  */
-{ "vmulss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F59_P_2  */
-{ "vmulpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F59_P_3  */
-{ "vmulsd", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F5A_P_0  */
-{ "vcvtps2pd", { XM, EXxmmq } }, }, {
-/* VEX_W_0F5A_P_1  */
-{ "vcvtss2sd", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F5A_P_3  */
-{ "vcvtsd2ss", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F5B_P_0  */
-{ "vcvtdq2ps", { XM, EXx } }, }, {
-/* VEX_W_0F5B_P_1  */
-{ "vcvttps2dq", { XM, EXx } }, }, {
-/* VEX_W_0F5B_P_2  */
-{ "vcvtps2dq", { XM, EXx } }, }, {
-/* VEX_W_0F5C_P_0  */
-{ "vsubps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5C_P_1  */
-{ "vsubss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F5C_P_2  */
-{ "vsubpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5C_P_3  */
-{ "vsubsd", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F5D_P_0  */
-{ "vminps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5D_P_1  */
-{ "vminss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F5D_P_2  */
-{ "vminpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5D_P_3  */
-{ "vminsd", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F5E_P_0  */
-{ "vdivps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5E_P_1  */
-{ "vdivss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F5E_P_2  */
-{ "vdivpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5E_P_3  */
-{ "vdivsd", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F5F_P_0  */
-{ "vmaxps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5F_P_1  */
-{ "vmaxss", { XMScalar, VexScalar, EXdScalar } }, }, {
-/* VEX_W_0F5F_P_2  */
-{ "vmaxpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F5F_P_3  */
-{ "vmaxsd", { XMScalar, VexScalar, EXqScalar } }, }, {
-/* VEX_W_0F60_P_2  */
-{ "vpunpcklbw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F61_P_2  */
-{ "vpunpcklwd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F62_P_2  */
-{ "vpunpckldq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F63_P_2  */
-{ "vpacksswb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F64_P_2  */
-{ "vpcmpgtb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F65_P_2  */
-{ "vpcmpgtw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F66_P_2  */
-{ "vpcmpgtd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F67_P_2  */
-{ "vpackuswb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F68_P_2  */
-{ "vpunpckhbw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F69_P_2  */
-{ "vpunpckhwd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F6A_P_2  */
-{ "vpunpckhdq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F6B_P_2  */
-{ "vpackssdw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F6C_P_2  */
-{ "vpunpcklqdq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F6D_P_2  */
-{ "vpunpckhqdq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F6F_P_1  */
-{ "vmovdqu", { XM, EXx } }, }, {
-/* VEX_W_0F6F_P_2  */
-{ "vmovdqa", { XM, EXx } }, }, {
-/* VEX_W_0F70_P_1 */
-{ "vpshufhw", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F70_P_2 */
-{ "vpshufd", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F70_P_3 */
-{ "vpshuflw", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F71_R_2_P_2  */
-{ "vpsrlw", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F71_R_4_P_2  */
-{ "vpsraw", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F71_R_6_P_2  */
-{ "vpsllw", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F72_R_2_P_2  */
-{ "vpsrld", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F72_R_4_P_2  */
-{ "vpsrad", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F72_R_6_P_2  */
-{ "vpslld", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F73_R_2_P_2  */
-{ "vpsrlq", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F73_R_3_P_2  */
-{ "vpsrldq", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F73_R_6_P_2  */
-{ "vpsllq", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F73_R_7_P_2  */
-{ "vpslldq", { Vex128, XS, Ib } }, }, {
-/* VEX_W_0F74_P_2 */
-{ "vpcmpeqb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F75_P_2 */
-{ "vpcmpeqw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F76_P_2 */
-{ "vpcmpeqd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F77_P_0 */
-{ "", { VZERO } }, }, {
-/* VEX_W_0F7C_P_2 */
-{ "vhaddpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F7C_P_3 */
-{ "vhaddps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F7D_P_2 */
-{ "vhsubpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F7D_P_3 */
-{ "vhsubps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F7E_P_1 */
-{ "vmovq", { XMScalar, EXqScalar } }, }, {
-/* VEX_W_0F7F_P_1 */
-{ "vmovdqu", { EXxS, XM } }, }, {
-/* VEX_W_0F7F_P_2 */
-{ "vmovdqa", { EXxS, XM } }, }, {
-/* VEX_W_0FAE_R_2_M_0 */
-{ "vldmxcsr", { Md } }, }, {
-/* VEX_W_0FAE_R_3_M_0 */
-{ "vstmxcsr", { Md } }, }, {
-/* VEX_W_0FC2_P_0 */
-{ "vcmpps", { XM, Vex, EXx, VCMP } }, }, {
-/* VEX_W_0FC2_P_1 */
-{ "vcmpss", { XMScalar, VexScalar, EXdScalar, VCMP } }, }, {
-/* VEX_W_0FC2_P_2 */
-{ "vcmppd", { XM, Vex, EXx, VCMP } }, }, {
-/* VEX_W_0FC2_P_3 */
-{ "vcmpsd", { XMScalar, VexScalar, EXqScalar, VCMP } }, }, {
-/* VEX_W_0FC4_P_2 */
-{ "vpinsrw", { XM, Vex128, Edqw, Ib } }, }, {
-/* VEX_W_0FC5_P_2 */
-{ "vpextrw", { Gdq, XS, Ib } }, }, {
-/* VEX_W_0FD0_P_2 */
-{ "vaddsubpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0FD0_P_3 */
-{ "vaddsubps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0FD1_P_2 */
-{ "vpsrlw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FD2_P_2 */
-{ "vpsrld", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FD3_P_2 */
-{ "vpsrlq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FD4_P_2 */
-{ "vpaddq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FD5_P_2 */
-{ "vpmullw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FD6_P_2 */
-{ "vmovq", { EXqScalarS, XMScalar } }, }, {
-/* VEX_W_0FD7_P_2_M_1 */
-{ "vpmovmskb", { Gdq, XS } }, }, {
-/* VEX_W_0FD8_P_2 */
-{ "vpsubusb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FD9_P_2 */
-{ "vpsubusw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FDA_P_2 */
-{ "vpminub", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FDB_P_2 */
-{ "vpand", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FDC_P_2 */
-{ "vpaddusb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FDD_P_2 */
-{ "vpaddusw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FDE_P_2 */
-{ "vpmaxub", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FDF_P_2 */
-{ "vpandn", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE0_P_2  */
-{ "vpavgb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE1_P_2  */
-{ "vpsraw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE2_P_2  */
-{ "vpsrad", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE3_P_2  */
-{ "vpavgw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE4_P_2  */
-{ "vpmulhuw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE5_P_2  */
-{ "vpmulhw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE6_P_1  */
-{ "vcvtdq2pd", { XM, EXxmmq } }, }, {
-/* VEX_W_0FE6_P_2  */
-{ "vcvttpd2dq%XY", { XMM, EXx } }, }, {
-/* VEX_W_0FE6_P_3  */
-{ "vcvtpd2dq%XY", { XMM, EXx } }, }, {
-/* VEX_W_0FE7_P_2_M_0 */
-{ "vmovntdq", { Mx, XM } }, }, {
-/* VEX_W_0FE8_P_2  */
-{ "vpsubsb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FE9_P_2  */
-{ "vpsubsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FEA_P_2  */
-{ "vpminsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FEB_P_2  */
-{ "vpor", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FEC_P_2  */
-{ "vpaddsb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FED_P_2  */
-{ "vpaddsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FEE_P_2  */
-{ "vpmaxsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FEF_P_2  */
-{ "vpxor", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF0_P_3_M_0 */
-{ "vlddqu", { XM, M } }, }, {
-/* VEX_W_0FF1_P_2 */
-{ "vpsllw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF2_P_2 */
-{ "vpslld", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF3_P_2 */
-{ "vpsllq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF4_P_2 */
-{ "vpmuludq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF5_P_2 */
-{ "vpmaddwd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF6_P_2 */
-{ "vpsadbw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF7_P_2 */
-{ "vmaskmovdqu", { XM, XS } }, }, {
-/* VEX_W_0FF8_P_2 */
-{ "vpsubb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FF9_P_2 */
-{ "vpsubw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FFA_P_2 */
-{ "vpsubd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FFB_P_2 */
-{ "vpsubq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FFC_P_2 */
-{ "vpaddb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FFD_P_2 */
-{ "vpaddw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0FFE_P_2 */
-{ "vpaddd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3800_P_2  */
-{ "vpshufb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3801_P_2  */
-{ "vphaddw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3802_P_2  */
-{ "vphaddd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3803_P_2  */
-{ "vphaddsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3804_P_2  */
-{ "vpmaddubsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3805_P_2  */
-{ "vphsubw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3806_P_2  */
-{ "vphsubd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3807_P_2  */
-{ "vphsubsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3808_P_2  */
-{ "vpsignb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3809_P_2  */
-{ "vpsignw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F380A_P_2  */
-{ "vpsignd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F380B_P_2  */
-{ "vpmulhrsw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F380C_P_2  */
-{ "vpermilps", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F380D_P_2  */
-{ "vpermilpd", { XM, Vex, EXx } }, }, {
-/* VEX_W_0F380E_P_2  */
-{ "vtestps", { XM, EXx } }, }, {
-/* VEX_W_0F380F_P_2  */
-{ "vtestpd", { XM, EXx } }, }, {
-/* VEX_W_0F3817_P_2 */
-{ "vptest", { XM, EXx } }, }, {
-/* VEX_W_0F3818_P_2_M_0 */
-{ "vbroadcastss", { XM, Md } }, }, {
-/* VEX_W_0F3819_P_2_M_0 */
-{ "vbroadcastsd", { XM, Mq } }, }, {
-/* VEX_W_0F381A_P_2_M_0 */
-{ "vbroadcastf128", { XM, Mxmm } }, }, {
-/* VEX_W_0F381C_P_2 */
-{ "vpabsb", { XM, EXx } }, }, {
-/* VEX_W_0F381D_P_2 */
-{ "vpabsw", { XM, EXx } }, }, {
-/* VEX_W_0F381E_P_2 */
-{ "vpabsd", { XM, EXx } }, }, {
-/* VEX_W_0F3820_P_2 */
-{ "vpmovsxbw", { XM, EXq } }, }, {
-/* VEX_W_0F3821_P_2 */
-{ "vpmovsxbd", { XM, EXd } }, }, {
-/* VEX_W_0F3822_P_2 */
-{ "vpmovsxbq", { XM, EXw } }, }, {
-/* VEX_W_0F3823_P_2 */
-{ "vpmovsxwd", { XM, EXq } }, }, {
-/* VEX_W_0F3824_P_2 */
-{ "vpmovsxwq", { XM, EXd } }, }, {
-/* VEX_W_0F3825_P_2 */
-{ "vpmovsxdq", { XM, EXq } }, }, {
-/* VEX_W_0F3828_P_2 */
-{ "vpmuldq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3829_P_2 */
-{ "vpcmpeqq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F382A_P_2_M_0 */
-{ "vmovntdqa", { XM, Mx } }, }, {
-/* VEX_W_0F382B_P_2 */
-{ "vpackusdw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F382C_P_2_M_0 */
-{ "vmaskmovps", { XM, Vex, Mx } }, }, {
-/* VEX_W_0F382D_P_2_M_0 */
-{ "vmaskmovpd", { XM, Vex, Mx } }, }, {
-/* VEX_W_0F382E_P_2_M_0 */
-{ "vmaskmovps", { Mx, Vex, XM } }, }, {
-/* VEX_W_0F382F_P_2_M_0 */
-{ "vmaskmovpd", { Mx, Vex, XM } }, }, {
-/* VEX_W_0F3830_P_2 */
-{ "vpmovzxbw", { XM, EXq } }, }, {
-/* VEX_W_0F3831_P_2 */
-{ "vpmovzxbd", { XM, EXd } }, }, {
-/* VEX_W_0F3832_P_2 */
-{ "vpmovzxbq", { XM, EXw } }, }, {
-/* VEX_W_0F3833_P_2 */
-{ "vpmovzxwd", { XM, EXq } }, }, {
-/* VEX_W_0F3834_P_2 */
-{ "vpmovzxwq", { XM, EXd } }, }, {
-/* VEX_W_0F3835_P_2 */
-{ "vpmovzxdq", { XM, EXq } }, }, {
-/* VEX_W_0F3837_P_2 */
-{ "vpcmpgtq", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3838_P_2 */
-{ "vpminsb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3839_P_2 */
-{ "vpminsd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F383A_P_2 */
-{ "vpminuw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F383B_P_2 */
-{ "vpminud", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F383C_P_2 */
-{ "vpmaxsb", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F383D_P_2 */
-{ "vpmaxsd", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F383E_P_2 */
-{ "vpmaxuw", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F383F_P_2 */
-{ "vpmaxud", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3840_P_2 */
-{ "vpmulld", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3841_P_2 */
-{ "vphminposuw", { XM, EXx } }, }, {
-/* VEX_W_0F38DB_P_2 */
-{ "vaesimc", { XM, EXx } }, }, {
-/* VEX_W_0F38DC_P_2 */
-{ "vaesenc", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F38DD_P_2 */
-{ "vaesenclast", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F38DE_P_2 */
-{ "vaesdec", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F38DF_P_2 */
-{ "vaesdeclast", { XM, Vex128, EXx } }, }, {
-/* VEX_W_0F3A04_P_2 */
-{ "vpermilps", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3A05_P_2 */
-{ "vpermilpd", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3A06_P_2 */
-{ "vperm2f128", { XM, Vex256, EXx, Ib } }, }, {
-/* VEX_W_0F3A08_P_2 */
-{ "vroundps", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3A09_P_2 */
-{ "vroundpd", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3A0A_P_2 */
-{ "vroundss", { XMScalar, VexScalar, EXdScalar, Ib } }, }, {
-/* VEX_W_0F3A0B_P_2 */
-{ "vroundsd", { XMScalar, VexScalar, EXqScalar, Ib } }, }, {
-/* VEX_W_0F3A0C_P_2 */
-{ "vblendps", { XM, Vex, EXx, Ib } }, }, {
-/* VEX_W_0F3A0D_P_2 */
-{ "vblendpd", { XM, Vex, EXx, Ib } }, }, {
-/* VEX_W_0F3A0E_P_2 */
-{ "vpblendw", { XM, Vex128, EXx, Ib } }, }, {
-/* VEX_W_0F3A0F_P_2 */
-{ "vpalignr", { XM, Vex128, EXx, Ib } }, }, {
-/* VEX_W_0F3A14_P_2 */
-{ "vpextrb", { Edqb, XM, Ib } }, }, {
-/* VEX_W_0F3A15_P_2 */
-{ "vpextrw", { Edqw, XM, Ib } }, }, {
-/* VEX_W_0F3A18_P_2 */
-{ "vinsertf128", { XM, Vex256, EXxmm, Ib } }, }, {
-/* VEX_W_0F3A19_P_2 */
-{ "vextractf128", { EXxmm, XM, Ib } }, }, {
-/* VEX_W_0F3A20_P_2 */
-{ "vpinsrb", { XM, Vex128, Edqb, Ib } }, }, {
-/* VEX_W_0F3A21_P_2 */
-{ "vinsertps", { XM, Vex128, EXd, Ib } }, }, {
-/* VEX_W_0F3A40_P_2 */
-{ "vdpps", { XM, Vex, EXx, Ib } }, }, {
-/* VEX_W_0F3A41_P_2 */
-{ "vdppd", { XM, Vex128, EXx, Ib } }, }, {
-/* VEX_W_0F3A42_P_2 */
-{ "vmpsadbw", { XM, Vex128, EXx, Ib } }, }, {
-/* VEX_W_0F3A44_P_2 */
-{ "vpclmulqdq", { XM, Vex128, EXx, PCLMUL } }, }, {
-/* VEX_W_0F3A48_P_2 */
-{ "vpermil2ps", { XMVexW, Vex, EXVexImmW, EXVexImmW, EXVexImmW } }, {
-		"vpermil2ps", { XMVexW, Vex, EXVexImmW, EXVexImmW, EXVexImmW } }, }, {
-/* VEX_W_0F3A49_P_2 */
-{ "vpermil2pd", { XMVexW, Vex, EXVexImmW, EXVexImmW, EXVexImmW } }, {
-		"vpermil2pd", { XMVexW, Vex, EXVexImmW, EXVexImmW, EXVexImmW } }, }, {
-/* VEX_W_0F3A4A_P_2 */
-{ "vblendvps", { XM, Vex, EXx, XMVexI4 } }, }, {
-/* VEX_W_0F3A4B_P_2 */
-{ "vblendvpd", { XM, Vex, EXx, XMVexI4 } }, }, {
-/* VEX_W_0F3A4C_P_2 */
-{ "vpblendvb", { XM, Vex128, EXx, XMVexI4 } }, }, {
-/* VEX_W_0F3A60_P_2 */
-{ "vpcmpestrm", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3A61_P_2 */
-{ "vpcmpestri", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3A62_P_2 */
-{ "vpcmpistrm", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3A63_P_2 */
-{ "vpcmpistri", { XM, EXx, Ib } }, }, {
-/* VEX_W_0F3ADF_P_2 */
-{ "vaeskeygenassist", { XM, EXx, Ib } }, }, };
-
-static const struct dis386 mod_table[][2] = { {
-/* MOD_8D */
-{ "leaS", { Gv, M } }, }, {
-/* MOD_0F01_REG_0 */
-{ X86_64_TABLE (X86_64_0F01_REG_0) }, { RM_TABLE (RM_0F01_REG_0) }, }, {
-/* MOD_0F01_REG_1 */
-{ X86_64_TABLE (X86_64_0F01_REG_1) }, { RM_TABLE (RM_0F01_REG_1) }, }, {
-/* MOD_0F01_REG_2 */
-{ X86_64_TABLE (X86_64_0F01_REG_2) }, { RM_TABLE (RM_0F01_REG_2) }, }, {
-/* MOD_0F01_REG_3 */
-{ X86_64_TABLE (X86_64_0F01_REG_3) }, { RM_TABLE (RM_0F01_REG_3) }, }, {
-/* MOD_0F01_REG_7 */
-{ "invlpg", { Mb } }, { RM_TABLE (RM_0F01_REG_7) }, }, {
-/* MOD_0F12_PREFIX_0 */
-{ "movlps", { XM, EXq } }, { "movhlps", { XM, EXq } }, }, {
-/* MOD_0F13 */
-{ "movlpX", { EXq, XM } }, }, {
-/* MOD_0F16_PREFIX_0 */
-{ "movhps", { XM, EXq } }, { "movlhps", { XM, EXq } }, }, {
-/* MOD_0F17 */
-{ "movhpX", { EXq, XM } }, }, {
-/* MOD_0F18_REG_0 */
-{ "prefetchnta", { Mb } }, }, {
-/* MOD_0F18_REG_1 */
-{ "prefetcht0", { Mb } }, }, {
-/* MOD_0F18_REG_2 */
-{ "prefetcht1", { Mb } }, }, {
-/* MOD_0F18_REG_3 */
-{ "prefetcht2", { Mb } }, }, {
-/* MOD_0F20 */
-{ Bad_Opcode }, { "movZ", { Rm, Cm } }, }, {
-/* MOD_0F21 */
-{ Bad_Opcode }, { "movZ", { Rm, Dm } }, }, {
-/* MOD_0F22 */
-{ Bad_Opcode }, { "movZ", { Cm, Rm } }, }, {
-/* MOD_0F23 */
-{ Bad_Opcode }, { "movZ", { Dm, Rm } }, }, {
-/* MOD_0F24 */
-{ Bad_Opcode }, { "movL", { Rd, Td } }, }, {
-/* MOD_0F26 */
-{ Bad_Opcode }, { "movL", { Td, Rd } }, }, {
-/* MOD_0F2B_PREFIX_0 */
-{ "movntps", { Mx, XM } }, }, {
-/* MOD_0F2B_PREFIX_1 */
-{ "movntss", { Md, XM } }, }, {
-/* MOD_0F2B_PREFIX_2 */
-{ "movntpd", { Mx, XM } }, }, {
-/* MOD_0F2B_PREFIX_3 */
-{ "movntsd", { Mq, XM } }, }, {
-/* MOD_0F51 */
-{ Bad_Opcode }, { "movmskpX", { Gdq, XS } }, }, {
-/* MOD_0F71_REG_2 */
-{ Bad_Opcode }, { "psrlw", { MS, Ib } }, }, {
-/* MOD_0F71_REG_4 */
-{ Bad_Opcode }, { "psraw", { MS, Ib } }, }, {
-/* MOD_0F71_REG_6 */
-{ Bad_Opcode }, { "psllw", { MS, Ib } }, }, {
-/* MOD_0F72_REG_2 */
-{ Bad_Opcode }, { "psrld", { MS, Ib } }, }, {
-/* MOD_0F72_REG_4 */
-{ Bad_Opcode }, { "psrad", { MS, Ib } }, }, {
-/* MOD_0F72_REG_6 */
-{ Bad_Opcode }, { "pslld", { MS, Ib } }, }, {
-/* MOD_0F73_REG_2 */
-{ Bad_Opcode }, { "psrlq", { MS, Ib } }, }, {
-/* MOD_0F73_REG_3 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_0F73_REG_3) }, }, {
-/* MOD_0F73_REG_6 */
-{ Bad_Opcode }, { "psllq", { MS, Ib } }, }, {
-/* MOD_0F73_REG_7 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_0F73_REG_7) }, }, {
-/* MOD_0FAE_REG_0 */
-{ "fxsave", { FXSAVE } }, { PREFIX_TABLE (PREFIX_0FAE_REG_0) }, }, {
-/* MOD_0FAE_REG_1 */
-{ "fxrstor", { FXSAVE } }, { PREFIX_TABLE (PREFIX_0FAE_REG_1) }, }, {
-/* MOD_0FAE_REG_2 */
-{ "ldmxcsr", { Md } }, { PREFIX_TABLE (PREFIX_0FAE_REG_2) }, }, {
-/* MOD_0FAE_REG_3 */
-{ "stmxcsr", { Md } }, { PREFIX_TABLE (PREFIX_0FAE_REG_3) }, }, {
-/* MOD_0FAE_REG_4 */
-{ "xsave", { FXSAVE } }, }, {
-/* MOD_0FAE_REG_5 */
-{ "xrstor", { FXSAVE } }, { RM_TABLE (RM_0FAE_REG_5) }, }, {
-/* MOD_0FAE_REG_6 */
-{ "xsaveopt", { FXSAVE } }, { RM_TABLE (RM_0FAE_REG_6) }, }, {
-/* MOD_0FAE_REG_7 */
-{ "clflush", { Mb } }, { RM_TABLE (RM_0FAE_REG_7) }, }, {
-/* MOD_0FB2 */
-{ "lssS", { Gv, Mp } }, }, {
-/* MOD_0FB4 */
-{ "lfsS", { Gv, Mp } }, }, {
-/* MOD_0FB5 */
-{ "lgsS", { Gv, Mp } }, }, {
-/* MOD_0FC7_REG_6 */
-{ PREFIX_TABLE (PREFIX_0FC7_REG_6) }, { "rdrand", { Ev } }, }, {
-/* MOD_0FC7_REG_7 */
-{ "vmptrst", { Mq } }, }, {
-/* MOD_0FD7 */
-{ Bad_Opcode }, { "pmovmskb", { Gdq, MS } }, }, {
-/* MOD_0FE7_PREFIX_2 */
-{ "movntdq", { Mx, XM } }, }, {
-/* MOD_0FF0_PREFIX_3 */
-{ "lddqu", { XM, M } }, }, {
-/* MOD_0F382A_PREFIX_2 */
-{ "movntdqa", { XM, Mx } }, }, {
-/* MOD_62_32BIT */
-{ "bound{S|}", { Gv, Ma } }, }, {
-/* MOD_C4_32BIT */
-{ "lesS", { Gv, Mp } }, { VEX_C4_TABLE (VEX_0F) }, }, {
-/* MOD_C5_32BIT */
-{ "ldsS", { Gv, Mp } }, { VEX_C5_TABLE (VEX_0F) }, }, {
-/* MOD_VEX_0F12_PREFIX_0 */
-{ VEX_LEN_TABLE (VEX_LEN_0F12_P_0_M_0) },
-		{ VEX_LEN_TABLE (VEX_LEN_0F12_P_0_M_1) }, }, {
-/* MOD_VEX_0F13 */
-{ VEX_LEN_TABLE (VEX_LEN_0F13_M_0) }, }, {
-/* MOD_VEX_0F16_PREFIX_0 */
-{ VEX_LEN_TABLE (VEX_LEN_0F16_P_0_M_0) },
-		{ VEX_LEN_TABLE (VEX_LEN_0F16_P_0_M_1) }, }, {
-/* MOD_VEX_0F17 */
-{ VEX_LEN_TABLE (VEX_LEN_0F17_M_0) }, }, {
-/* MOD_VEX_0F2B */
-{ VEX_W_TABLE (VEX_W_0F2B_M_0) }, }, {
-/* MOD_VEX_0F50 */
-{ Bad_Opcode }, { VEX_W_TABLE (VEX_W_0F50_M_0) }, }, {
-/* MOD_VEX_0F71_REG_2 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F71_REG_2) }, }, {
-/* MOD_VEX_0F71_REG_4 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F71_REG_4) }, }, {
-/* MOD_VEX_0F71_REG_6 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F71_REG_6) }, }, {
-/* MOD_VEX_0F72_REG_2 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F72_REG_2) }, }, {
-/* MOD_VEX_0F72_REG_4 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F72_REG_4) }, }, {
-/* MOD_VEX_0F72_REG_6 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F72_REG_6) }, }, {
-/* MOD_VEX_0F73_REG_2 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F73_REG_2) }, }, {
-/* MOD_VEX_0F73_REG_3 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F73_REG_3) }, }, {
-/* MOD_VEX_0F73_REG_6 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F73_REG_6) }, }, {
-/* MOD_VEX_0F73_REG_7 */
-{ Bad_Opcode }, { PREFIX_TABLE (PREFIX_VEX_0F73_REG_7) }, }, {
-/* MOD_VEX_0FAE_REG_2 */
-{ VEX_LEN_TABLE (VEX_LEN_0FAE_R_2_M_0) }, }, {
-/* MOD_VEX_0FAE_REG_3 */
-{ VEX_LEN_TABLE (VEX_LEN_0FAE_R_3_M_0) }, }, {
-/* MOD_VEX_0FD7_PREFIX_2 */
-{ Bad_Opcode }, { VEX_LEN_TABLE (VEX_LEN_0FD7_P_2_M_1) }, }, {
-/* MOD_VEX_0FE7_PREFIX_2 */
-{ VEX_W_TABLE (VEX_W_0FE7_P_2_M_0) }, }, {
-/* MOD_VEX_0FF0_PREFIX_3 */
-{ VEX_W_TABLE (VEX_W_0FF0_P_3_M_0) }, }, {
-/* MOD_VEX_0F3818_PREFIX_2 */
-{ VEX_W_TABLE (VEX_W_0F3818_P_2_M_0) }, }, {
-/* MOD_VEX_0F3819_PREFIX_2 */
-{ VEX_LEN_TABLE (VEX_LEN_0F3819_P_2_M_0) }, }, {
-/* MOD_VEX_0F381A_PREFIX_2 */
-{ VEX_LEN_TABLE (VEX_LEN_0F381A_P_2_M_0) }, }, {
-/* MOD_VEX_0F382A_PREFIX_2 */
-{ VEX_LEN_TABLE (VEX_LEN_0F382A_P_2_M_0) }, }, {
-/* MOD_VEX_0F382C_PREFIX_2 */
-{ VEX_W_TABLE (VEX_W_0F382C_P_2_M_0) }, }, {
-/* MOD_VEX_0F382D_PREFIX_2 */
-{ VEX_W_TABLE (VEX_W_0F382D_P_2_M_0) }, }, {
-/* MOD_VEX_0F382E_PREFIX_2 */
-{ VEX_W_TABLE (VEX_W_0F382E_P_2_M_0) }, }, {
-/* MOD_VEX_0F382F_PREFIX_2 */
-{ VEX_W_TABLE (VEX_W_0F382F_P_2_M_0) }, }, };
-
-static const struct dis386 rm_table[][8] = { {
-/* RM_0F01_REG_0 */
-{ Bad_Opcode }, { "vmcall", { Skip_MODRM } }, { "vmlaunch", { Skip_MODRM } }, {
-		"vmresume", { Skip_MODRM } }, { "vmxoff", { Skip_MODRM } }, }, {
-/* RM_0F01_REG_1 */
-{ "monitor", { { OP_Monitor, 0 } } }, { "mwait", { { OP_Mwait, 0 } } }, }, {
-/* RM_0F01_REG_2 */
-{ "xgetbv", { Skip_MODRM } }, { "xsetbv", { Skip_MODRM } }, }, {
-/* RM_0F01_REG_3 */
-{ "vmrun", { Skip_MODRM } }, { "vmmcall", { Skip_MODRM } }, { "vmload", {
-		Skip_MODRM } }, { "vmsave", { Skip_MODRM } },
-		{ "stgi", { Skip_MODRM } }, { "clgi", { Skip_MODRM } }, { "skinit", {
-				Skip_MODRM } }, { "invlpga", { Skip_MODRM } }, }, {
-/* RM_0F01_REG_7 */
-{ "swapgs", { Skip_MODRM } }, { "rdtscp", { Skip_MODRM } }, }, {
-/* RM_0FAE_REG_5 */
-{ "lfence", { Skip_MODRM } }, }, {
-/* RM_0FAE_REG_6 */
-{ "mfence", { Skip_MODRM } }, }, {
-/* RM_0FAE_REG_7 */
-{ "sfence", { Skip_MODRM } }, }, };
-
-#define INTERNAL_DISASSEMBLER_ERROR ("<internal disassembler error>")
-
-/* We use the high bit to indicate different name for the same
- prefix.  */
-#define ADDR16_PREFIX	(0x67 | 0x100)
-#define ADDR32_PREFIX	(0x67 | 0x200)
-#define DATA16_PREFIX	(0x66 | 0x100)
-#define DATA32_PREFIX	(0x66 | 0x200)
-#define REP_PREFIX	(0xf3 | 0x100)
-
-static int ckprefix(void) {
-	int newrex, i, length;
-	rex = 0;
-	rex_ignored = 0;
-	prefixes = 0;
-	used_prefixes = 0;
-	rex_used = 0;
-	last_lock_prefix = -1;
-	last_repz_prefix = -1;
-	last_repnz_prefix = -1;
-	last_data_prefix = -1;
-	last_addr_prefix = -1;
-	last_rex_prefix = -1;
-	last_seg_prefix = -1;
-	for (i = 0; i < (int) ARRAY_SIZE (all_prefixes); i++)
-		all_prefixes[i] = 0;
-	i = 0;
-	length = 0;
-	/* The maximum instruction length is 15bytes.  */
-	while (length < MAX_CODE_LENGTH - 1) {
-		FETCH_DATA(the_info, codep + 1);
-		newrex = 0;
-		switch (*codep) {
-		/* REX prefixes family.  */
-		case 0x40:
-		case 0x41:
-		case 0x42:
-		case 0x43:
-		case 0x44:
-		case 0x45:
-		case 0x46:
-		case 0x47:
-		case 0x48:
-		case 0x49:
-		case 0x4a:
-		case 0x4b:
-		case 0x4c:
-		case 0x4d:
-		case 0x4e:
-		case 0x4f:
-			if (address_mode == mode_64bit)
-				newrex = *codep;
-			else
-				return 1;
-			last_rex_prefix = i;
-			break;
-		case 0xf3:
-			prefixes |= PREFIX_REPZ;
-			last_repz_prefix = i;
-			break;
-		case 0xf2:
-			prefixes |= PREFIX_REPNZ;
-			last_repnz_prefix = i;
-			break;
-		case 0xf0:
-			prefixes |= PREFIX_LOCK;
-			last_lock_prefix = i;
-			break;
-		case 0x2e:
-			prefixes |= PREFIX_CS;
-			last_seg_prefix = i;
-			break;
-		case 0x36:
-			prefixes |= PREFIX_SS;
-			last_seg_prefix = i;
-			break;
-		case 0x3e:
-			prefixes |= PREFIX_DS;
-			last_seg_prefix = i;
-			break;
-		case 0x26:
-			prefixes |= PREFIX_ES;
-			last_seg_prefix = i;
-			break;
-		case 0x64:
-			prefixes |= PREFIX_FS;
-			last_seg_prefix = i;
-			break;
-		case 0x65:
-			prefixes |= PREFIX_GS;
-			last_seg_prefix = i;
-			break;
-		case 0x66:
-			prefixes |= PREFIX_DATA;
-			last_data_prefix = i;
-			break;
-		case 0x67:
-			prefixes |= PREFIX_ADDR;
-			last_addr_prefix = i;
-			break;
-		case FWAIT_OPCODE:
-			/* fwait is really an instruction.  If there are prefixes
-			 before the fwait, they belong to the fwait, *not* to the
-			 following instruction.  */
-			if (prefixes || rex) {
-				prefixes |= PREFIX_FWAIT;
-				codep++;
-				return 1;
-			}
-			prefixes = PREFIX_FWAIT;
-			break;
-		default:
-			return 1;
-		}
-		/* Rex is ignored when followed by another prefix.  */
-		if (rex) {
-			rex_used = rex;
-			return 1;
-		}
-		if (*codep != FWAIT_OPCODE)
-			all_prefixes[i++] = *codep;
-		rex = newrex;
-		codep++;
-		length++;
-	}
-	return 0;
-}
-
-static int seg_prefix(int pref) {
-	switch (pref) {
-	case 0x2e:
-		return PREFIX_CS;
-	case 0x36:
-		return PREFIX_SS;
-	case 0x3e:
-		return PREFIX_DS;
-	case 0x26:
-		return PREFIX_ES;
-	case 0x64:
-		return PREFIX_FS;
-	case 0x65:
-		return PREFIX_GS;
-	default:
-		return 0;
-	}
-}
-
-/* Return the name of the prefix byte PREF, or NULL if PREF is not a
- prefix byte.  */
-
-static const char *
-prefix_name(int pref, int sizeflag) {
-	static const char *rexes[16] = { "rex", /* 0x40 */
-	"rex.B", /* 0x41 */
-	"rex.X", /* 0x42 */
-	"rex.XB", /* 0x43 */
-	"rex.R", /* 0x44 */
-	"rex.RB", /* 0x45 */
-	"rex.RX", /* 0x46 */
-	"rex.RXB", /* 0x47 */
-	"rex.W", /* 0x48 */
-	"rex.WB", /* 0x49 */
-	"rex.WX", /* 0x4a */
-	"rex.WXB", /* 0x4b */
-	"rex.WR", /* 0x4c */
-	"rex.WRB", /* 0x4d */
-	"rex.WRX", /* 0x4e */
-	"rex.WRXB", /* 0x4f */
-	};
-
-	switch (pref) {
-	/* REX prefixes family.  */
-	case 0x40:
-	case 0x41:
-	case 0x42:
-	case 0x43:
-	case 0x44:
-	case 0x45:
-	case 0x46:
-	case 0x47:
-	case 0x48:
-	case 0x49:
-	case 0x4a:
-	case 0x4b:
-	case 0x4c:
-	case 0x4d:
-	case 0x4e:
-	case 0x4f:
-		return rexes[pref - 0x40];
-	case 0xf3:
-		return "repz";
-	case 0xf2:
-		return "repnz";
-	case 0xf0:
-		return "lock";
-	case 0x2e:
-		return "cs";
-	case 0x36:
-		return "ss";
-	case 0x3e:
-		return "ds";
-	case 0x26:
-		return "es";
-	case 0x64:
-		return "fs";
-	case 0x65:
-		return "gs";
-	case 0x66:
-		return (sizeflag & DFLAG) ? "data16" : "data32";
-	case 0x67:
-		if (address_mode == mode_64bit)
-			return (sizeflag & AFLAG) ? "addr32" : "addr64";
-		else
-			return (sizeflag & AFLAG) ? "addr16" : "addr32";
-	case FWAIT_OPCODE:
-		return "fwait";
-	case ADDR16_PREFIX:
-		return "addr16";
-	case ADDR32_PREFIX:
-		return "addr32";
-	case DATA16_PREFIX:
-		return "data16";
-	case DATA32_PREFIX:
-		return "data32";
-	case REP_PREFIX:
-		return "rep";
-	default:
-		return NULL;
-	}
-}
-
-static char op_out[MAX_OPERANDS][100];
-static int op_ad, op_index[MAX_OPERANDS];
-static int two_source_ops;
-static ULONG64 op_address[MAX_OPERANDS];
-static ULONG64 op_riprel[MAX_OPERANDS];
-static ULONG64 start_pc;
 
 /*
- *   On the 386's of 1988, the maximum length of an instruction is 15 bytes.
- *   (see topic "Redundant prefixes" in the "Differences from 8086"
- *   section of the "Virtual 8086 Mode" chapter.)
- * 'pc' should be the address of this instruction, it will
- *   be used to print the target address if this is a relative jump or call
- * The function returns the length of this instruction in bytes.
+ * Globals
  */
+// register table
+#define INIT_REG_ARRAY_SZ 32
+static struct ca_reg_table g_reg_table;
 
-static char intel_syntax = 0;
-static char intel_mnemonic = !SYSV386_COMPAT;
-static char open_char;
-static char close_char;
-static char separator_char;
-static char scale_char;
+// stack variables
+#define STACK_ARRAY_INIT_CAP 32
+static struct ca_stack_var* g_stack_vars = NULL;
+static unsigned int g_num_stack_vars = 0;
+static unsigned int g_stack_vars_capacity = 0;
 
-/* Bad opcode.  */
-static const struct dis386 bad_opcode = { "(bad)", { XX } };
+// disassembled instructions
+#define INSN_BUFFER_INIT_CAP 32
+static struct ca_dis_insn* g_insns_buffer = NULL;
+static unsigned int g_insns_buffer_capacity = 0;
+static unsigned int g_num_insns = 0;
 
-/* Get a pointer to struct dis386 with a valid name.  */
+/*
+ * Forward functions
+ */
+static int dump_insns(struct decode_control_block* decode_cb);
 
-static const struct dis386 *
-get_valid_dis386(const struct dis386 *dp, disassemble_info *info) {
-	int vindex, vex_table_index;
+// Instruction array
+static void init_dis_insn_buffer(void);
+static struct ca_dis_insn* get_new_dis_insn(void);
+static void process_one_insn(struct ca_dis_insn* insn, int current);
+static void process_mov_insn(struct ca_dis_insn* insn,
+								struct ca_operand* dst_op,
+								struct ca_operand* src_op);
+static void process_binary_op_insn(struct ca_dis_insn* insn,
+									struct ca_operand* dst_op,
+									struct ca_operand* src_op,
+									enum CA_OPERATOR op);
+static void process_unary_op_insn(struct ca_dis_insn* insn,
+									struct ca_operand* dst_op, enum CA_OPERATOR op);
+static void print_one_insn(struct ca_dis_insn* insn, struct ui_out* uiout);
 
-	if (dp->name != NULL)
-		return dp;
+// Instruction Operand
+static void print_one_operand(struct ui_out* uiout, struct ca_operand* op, size_t op_size);
+static int known_op_value(struct ca_operand* op);
+static bfd_vma get_address(struct ca_operand* op);
+static size_t get_op_value(struct ca_operand* op, size_t op_size);
+static void set_op_value(struct ca_operand* op, size_t val, CORE_ADDR pc);
+static void set_op_unknown(struct ca_operand* op, CORE_ADDR pc);
+static void get_op_symbol_type(struct ca_operand* op, int lea,
+							char** psymname, struct win_type* ptype, int* pvptr);
+static void set_dst_op(struct ca_dis_insn* insn, struct ca_operand* dst_op,
+		int has_value, size_t val, char* symname, struct win_type type, int is_vptr);
+static size_t bit_rotate(size_t val, size_t nbits, enum CA_OPERATOR dir, int size);
+static int is_stack_address(struct ca_operand* op);
+static void set_op_value_symbol_type(struct ca_dis_insn* insn,
+								struct ca_operand* sym_op, struct ca_operand* dst_op,
+								int has_value, size_t val);
 
-	switch (dp->op[0].bytemode) {
-	case USE_REG_TABLE:
-		dp = &reg_table[dp->op[1].bytemode][modrm.reg];
-		break;
+// Register table
+static void init_reg_table(struct ca_reg_value* regs);
+static void reset_reg_table(void);
+static void validate_reg_table(void);
+static void set_reg_table_at_pc(struct ca_reg_value* src, CORE_ADDR pc);
+static void set_current_reg_pointers(struct ca_dis_insn* insn);
+static void adjust_table_after_absolute_branch(CORE_ADDR pc);
+static struct ca_reg_value* get_new_reg(unsigned int reg_idx);
+static struct ca_reg_value* get_reg_at_pc(unsigned int reg_idx, CORE_ADDR pc);
+static void set_reg_unknown_at_pc(unsigned int reg_idx, CORE_ADDR pc);
+static void set_reg_value_at_pc(unsigned int reg_idx, size_t val, CORE_ADDR pc);
+static void set_cur_reg_value(unsigned int reg_idx, size_t val);
 
-	case USE_MOD_TABLE:
-		vindex = modrm.mod == 0x3 ? 1 : 0;
-		dp = &mod_table[dp->op[1].bytemode][vindex];
-		break;
+// Stack values
+static void init_stack_vars(void);
+static void reset_stack_vars(void);
+static struct ca_stack_var* get_new_stack_var(address_t saddr);
+static struct ca_stack_var* get_stack_var(address_t saddr);
+static void set_stack_sym_type(char* sym_name, struct win_type type, address_t saddr);
 
-	case USE_RM_TABLE:
-		dp = &rm_table[dp->op[1].bytemode][modrm.rm];
-		break;
+// Misc
+static int is_same_string(const char* str1, const char* str2);
 
-	case USE_PREFIX_TABLE:
-		if (need_vex) {
-			/* The prefix in VEX is implicit.  */
-			switch (vex.prefix) {
-			case 0:
-				vindex = 0;
-				break;
-			case REPE_PREFIX_OPCODE:
-				vindex = 1;
-				break;
-			case DATA_PREFIX_OPCODE:
-				vindex = 2;
-				break;
-			case REPNE_PREFIX_OPCODE:
-				vindex = 3;
-				break;
-			default:
-				abort();
-				break;
+/*
+ * First, disassemble all instructions of the function and store them in buffer
+ * Second, follow and calculate register values at each instruction
+ * Finally, display all disassembled instruction with annotation of object context
+ */
+int decode_insns(struct decode_control_block* decode_cb)
+{
+	unsigned int insn_index, i;
+	int num_insns = 0;
+	struct gdbarch *gdbarch = decode_cb->gdbarch;
+	struct ui_out *uiout = decode_cb->uiout;
+
+	// Disassemble the whole function even if user chooses
+	// only a subset of it
+	num_insns += dump_insns(decode_cb);
+
+	// copy known function parameters
+	init_reg_table(decode_cb->param_regs);
+	init_stack_vars();
+
+	g_reg_table.cur_regs[RIP]->has_value = 1;
+	// Annotate the context of each instruction
+	for (insn_index = 0; insn_index < g_num_insns; insn_index++)
+	{
+		int cur_insn = 0;
+		struct ca_dis_insn* insn = &g_insns_buffer[insn_index];
+
+		// update program counter for RIP-relative instruction
+		// RIP points to the address of the next instruction before executing current one
+		if (insn_index + 1 < g_num_insns)
+			set_reg_value_at_pc(RIP, (insn+1)->pc, insn->pc);
+
+		// user may set some register values deliberately
+		if (decode_cb->user_regs)
+		{
+			if (insn->pc == decode_cb->low
+				|| (insn_index + 1 < g_num_insns && g_insns_buffer[insn_index + 1].pc > decode_cb->low) )
+			{
+				if (insn->pc == decode_cb->func_start)
+					set_reg_table_at_pc(decode_cb->user_regs, 0);
+				else
+					set_reg_table_at_pc(decode_cb->user_regs, insn->pc);
 			}
-		} else {
-			vindex = 0;
-			used_prefixes |= (prefixes & PREFIX_REPZ);
-			if (prefixes & PREFIX_REPZ) {
-				vindex = 1;
-				all_prefixes[last_repz_prefix] = 0;
-			} else {
-				/* We should check PREFIX_REPNZ and PREFIX_REPZ before
-				 PREFIX_DATA.  */
-				used_prefixes |= (prefixes & PREFIX_REPNZ);
-				if (prefixes & PREFIX_REPNZ) {
-					vindex = 3;
-					all_prefixes[last_repnz_prefix] = 0;
-				} else {
-					used_prefixes |= (prefixes & PREFIX_DATA);
-					if (prefixes & PREFIX_DATA) {
-						vindex = 2;
-						all_prefixes[last_data_prefix] = 0;
-					}
+		}
+
+		// analyze and update register context affected by this instruction
+		if (decode_cb->innermost_frame)
+		{
+			if (insn->pc == decode_cb->current)
+				cur_insn = 1;
+		}
+		else if (insn_index + 1 < g_num_insns && g_insns_buffer[insn_index + 1].pc == decode_cb->current)
+			cur_insn = 1;
+
+		process_one_insn(insn, cur_insn);
+
+		if (cur_insn)
+		{
+			// return the register context back to caller
+			for (i = 0; i < TOTAL_REGS; i++)
+			{
+				struct ca_reg_value* reg = g_reg_table.cur_regs[i];
+				if (reg->has_value)
+				{
+					// only pass on values, symbol may be out of context in another function
+					struct ca_reg_value* dst = &decode_cb->param_regs[i];
+					memcpy(dst, reg, sizeof(struct ca_reg_value));
+					dst->sym_name = NULL;
 				}
 			}
 		}
-		dp = &prefix_table[dp->op[1].bytemode][vindex];
-		break;
+	}
+	if (decode_cb->verbose)
+		validate_reg_table();
 
-	case USE_X86_64_TABLE:
-		vindex = address_mode == mode_64bit ? 1 : 0;
-		dp = &x86_64_table[dp->op[1].bytemode][vindex];
-		break;
+	// display disassembled insns
+	for (insn_index = 0; insn_index < g_num_insns; insn_index++)
+	{
+		struct ca_dis_insn* insn = &g_insns_buffer[insn_index];
+		// parts of the symbolic representation of the address
+		int unmapped;
+		int offset;
+		int line;
+		char *filename = NULL;
+		char *name = NULL;
 
-	case USE_3BYTE_TABLE:
-		FETCH_DATA(info, codep + 2);
-		vindex = *codep++;
-		dp = &three_byte_table[dp->op[1].bytemode][vindex];
-		modrm.mod = (*codep >> 6) & 3;
-		modrm.reg = (*codep >> 3) & 7;
-		modrm.rm = *codep & 7;
-		break;
-
-	case USE_VEX_LEN_TABLE:
-		if (!need_vex)
-			abort();
-
-		switch (vex.length) {
-		case 128:
-			vindex = 0;
+		if (insn->pc >= decode_cb->high)
 			break;
-		case 256:
-			vindex = 1;
-			break;
-		default:
-			abort();
-			break;
+		else if (insn->pc >= decode_cb->low)
+		{
+			// instruction address + offset
+			ui_out_text(uiout, pc_prefix(insn->pc));
+			ui_out_field_core_addr(uiout, "address", gdbarch, insn->pc);
+
+			if (!build_address_symbolic(gdbarch, insn->pc, 0, &name, &offset, &filename,
+					&line, &unmapped))
+			{
+				ui_out_text(uiout, " <");
+				//if (decode_cb->verbose)
+				//	ui_out_field_string(uiout, "func-name", name);
+				ui_out_text(uiout, "+");
+				ui_out_field_int(uiout, "offset", offset);
+				ui_out_text(uiout, ">:\t");
+			} else
+				ui_out_message(uiout, 0, "<+%ld>:\t", insn->pc - decode_cb->func_start);
+
+			// disassembled instruction with annotation
+			print_one_insn(insn, uiout);
+
+			if (filename != NULL)
+				free(filename);
+			if (name != NULL)
+				free(name);
 		}
-
-		dp = &vex_len_table[dp->op[1].bytemode][vindex];
-		break;
-
-	case USE_XOP_8F_TABLE:
-		FETCH_DATA(info, codep + 3);
-		/* All bits in the REX prefix are ignored.  */
-		rex_ignored = rex;
-		rex = ~(*codep >> 5) & 0x7;
-
-		/* VEX_TABLE_INDEX is the mmmmm part of the XOP byte 1 "RCB.mmmmm".  */
-		switch ((*codep & 0x1f)) {
-		default:
-			dp = &bad_opcode;
-			return dp;
-		case 0x8:
-			vex_table_index = XOP_08;
-			break;
-		case 0x9:
-			vex_table_index = XOP_09;
-			break;
-		case 0xa:
-			vex_table_index = XOP_0A;
-			break;
-		}
-		codep++;
-		vex.w = *codep & 0x80;
-		if (vex.w && address_mode == mode_64bit)
-			rex |= REX_W;
-
-		vex.register_specifier = (~(*codep >> 3)) & 0xf;
-		if (address_mode != mode_64bit && vex.register_specifier > 0x7) {
-			dp = &bad_opcode;
-			return dp;
-		}
-
-		vex.length = (*codep & 0x4) ? 256 : 128;
-		switch ((*codep & 0x3)) {
-		case 0:
-			vex.prefix = 0;
-			break;
-		case 1:
-			vex.prefix = DATA_PREFIX_OPCODE;
-			break;
-		case 2:
-			vex.prefix = REPE_PREFIX_OPCODE;
-			break;
-		case 3:
-			vex.prefix = REPNE_PREFIX_OPCODE;
-			break;
-		}
-		need_vex = 1;
-		need_vex_reg = 1;
-		codep++;
-		vindex = *codep++;
-		dp = &xop_table[vex_table_index][vindex];
-
-		FETCH_DATA(info, codep + 1);
-		modrm.mod = (*codep >> 6) & 3;
-		modrm.reg = (*codep >> 3) & 7;
-		modrm.rm = *codep & 7;
-		break;
-
-	case USE_VEX_C4_TABLE:
-		FETCH_DATA(info, codep + 3);
-		/* All bits in the REX prefix are ignored.  */
-		rex_ignored = rex;
-		rex = ~(*codep >> 5) & 0x7;
-		switch ((*codep & 0x1f)) {
-		default:
-			dp = &bad_opcode;
-			return dp;
-		case 0x1:
-			vex_table_index = VEX_0F;
-			break;
-		case 0x2:
-			vex_table_index = VEX_0F38;
-			break;
-		case 0x3:
-			vex_table_index = VEX_0F3A;
-			break;
-		}
-		codep++;
-		vex.w = *codep & 0x80;
-		if (vex.w && address_mode == mode_64bit)
-			rex |= REX_W;
-
-		vex.register_specifier = (~(*codep >> 3)) & 0xf;
-		if (address_mode != mode_64bit && vex.register_specifier > 0x7) {
-			dp = &bad_opcode;
-			return dp;
-		}
-
-		vex.length = (*codep & 0x4) ? 256 : 128;
-		switch ((*codep & 0x3)) {
-		case 0:
-			vex.prefix = 0;
-			break;
-		case 1:
-			vex.prefix = DATA_PREFIX_OPCODE;
-			break;
-		case 2:
-			vex.prefix = REPE_PREFIX_OPCODE;
-			break;
-		case 3:
-			vex.prefix = REPNE_PREFIX_OPCODE;
-			break;
-		}
-		need_vex = 1;
-		need_vex_reg = 1;
-		codep++;
-		vindex = *codep++;
-		dp = &vex_table[vex_table_index][vindex];
-		/* There is no MODRM byte for VEX [82|77].  */
-		if (vindex != 0x77 && vindex != 0x82) {
-			FETCH_DATA(info, codep + 1);
-			modrm.mod = (*codep >> 6) & 3;
-			modrm.reg = (*codep >> 3) & 7;
-			modrm.rm = *codep & 7;
-		}
-		break;
-
-	case USE_VEX_C5_TABLE:
-		FETCH_DATA(info, codep + 2);
-		/* All bits in the REX prefix are ignored.  */
-		rex_ignored = rex;
-		rex = (*codep & 0x80) ? 0 : REX_R;
-
-		vex.register_specifier = (~(*codep >> 3)) & 0xf;
-		if (address_mode != mode_64bit && vex.register_specifier > 0x7) {
-			dp = &bad_opcode;
-			return dp;
-		}
-
-		vex.w = 0;
-
-		vex.length = (*codep & 0x4) ? 256 : 128;
-		switch ((*codep & 0x3)) {
-		case 0:
-			vex.prefix = 0;
-			break;
-		case 1:
-			vex.prefix = DATA_PREFIX_OPCODE;
-			break;
-		case 2:
-			vex.prefix = REPE_PREFIX_OPCODE;
-			break;
-		case 3:
-			vex.prefix = REPNE_PREFIX_OPCODE;
-			break;
-		}
-		need_vex = 1;
-		need_vex_reg = 1;
-		codep++;
-		vindex = *codep++;
-		dp = &vex_table[dp->op[1].bytemode][vindex];
-		/* There is no MODRM byte for VEX [82|77].  */
-		if (vindex != 0x77 && vindex != 0x82) {
-			FETCH_DATA(info, codep + 1);
-			modrm.mod = (*codep >> 6) & 3;
-			modrm.reg = (*codep >> 3) & 7;
-			modrm.rm = *codep & 7;
-		}
-		break;
-
-	case USE_VEX_W_TABLE:
-		if (!need_vex)
-			abort();
-
-		dp = &vex_w_table[dp->op[1].bytemode][vex.w ? 1 : 0];
-		break;
-
-	case 0:
-		dp = &bad_opcode;
-		break;
-
-	default:
-		abort();
 	}
 
-	if (dp->name != NULL)
-		return dp;
+	reset_reg_table();
+	reset_stack_vars();
+
+	return num_insns;
+}
+
+#define MAX_SPACING 34
+/*
+ * Display a disassembled instruction with annotation
+ */
+static void print_one_insn(struct ca_dis_insn* insn, struct ui_out* uiout)
+{
+	int i, pos;
+	struct ca_operand* dst_op;
+
+	ui_out_text(uiout, insn->dis_string);
+
+	pos = strlen(insn->dis_string);
+	if (pos < MAX_SPACING)
+		ui_out_spaces(uiout, MAX_SPACING - pos);
+	ui_out_text(uiout, " ## ");
+
+	if (insn->num_operand == 0)
+	{
+		ui_out_text(uiout, "\n");
+		return;
+	}
+
+	// special case
+	/*if (insn->call)
+	{
+		// reminder that $rax is set to return value after a "call" instruction
+		// if the called function has an integer return value
+		// (unfortunately return type is not known for a function)
+		ui_out_text(uiout, "(%rax=? on return) ");
+	}*/
+
+	dst_op = &insn->operands[0];
+	// annotation of object context
+	if (insn->annotate)
+	{
+		size_t ptr_sz = g_ptr_bit >> 3;
+		int has_value = 0;
+		size_t val = 0xcdcdcdcd;
+		int op_size = insn->op_size;
+		const char* symname = NULL;
+		struct win_type type = {0,0};
+		int is_vptr         = 0;
+		char* name_to_free = NULL;
+
+		// update register context by "pc"
+		set_current_reg_pointers(insn);
+
+		// Get the instruction's destination value/symbol/type
+		if (dst_op->type == CA_OP_MEMORY)
+		{
+			// if the destination is a known local variable
+			if (is_stack_address(dst_op))
+			{
+				address_t addr = get_address(dst_op);
+				struct ca_stack_var* sval = get_stack_var(addr);
+				if (sval)
+				{
+					symname = sval->sym_name;
+					type = sval->type;
+				}
+				else
+				{
+					/*struct symbol* sym;
+					struct object_reference aref;
+					memset(&aref, 0, sizeof(aref));
+					aref.vaddr = addr;
+					aref.value = 0;
+					aref.target_index = -1;
+					sym = get_stack_sym(&aref, NULL, NULL);
+					if (sym)
+					{
+						symname = SYMBOL_PRINT_NAME (sym);
+						type = SYMBOL_TYPE(sym);
+					}*/
+					get_stack_sym_and_type(addr, &symname, &type);
+				}
+			}
+			// could it be a known heap object
+			if (!symname && !type.mod_base)
+			{
+				// this function will allocate buffer for the symbol name if any, remember to free it
+				get_op_symbol_type(dst_op, 0, &name_to_free, &type, NULL);
+				symname = name_to_free;
+			}
+			// Since flag insn->annotate is set, dst_op's value should be calculated
+			val = get_op_value(dst_op, op_size);
+			has_value = 1;
+		}
+		else if (dst_op->type == CA_OP_REGISTER)
+		{
+			struct ca_reg_value* dst_reg = get_reg_at_pc(dst_op->reg.index, insn->pc);
+			if (dst_reg)
+			{
+				symname = dst_reg->sym_name;
+				type    = dst_reg->type;
+				is_vptr = dst_reg->vptr;
+				if (dst_reg->has_value)
+				{
+					has_value = 1;
+					val = dst_reg->value;
+				}
+			}
+		}
+		else if (dst_op->type == CA_OP_IMMEDIATE)
+		{
+			val = get_op_value(dst_op, op_size);
+			has_value = 1;
+		}
+
+		if (dst_op->type != CA_OP_IMMEDIATE)
+		{
+			// Name and value (if known) of destination
+			print_one_operand(uiout, dst_op, op_size);
+			if (has_value)
+				ui_out_message(uiout, 0, "="PRINT_FORMAT_POINTER, val);
+			else
+				ui_out_text(uiout, "=?");
+		}
+
+		// Symbol or type of destination
+		if (dst_op->type == CA_OP_REGISTER
+			&& dst_op->reg.index == RSP)
+		{
+			if (val == g_debug_context.sp)
+				ui_out_text(uiout, " End of function prologue");
+			ui_out_text(uiout, "\n");
+		}
+		else
+		{
+			// symbol or type is known
+			if (symname || type.mod_base)
+			{
+				ui_out_text(uiout, "(");
+				if (symname)
+				{
+					ui_out_message(uiout, 0, "symbol=\"%s\"", symname);
+				}
+				if (type.mod_base)
+				{
+					//CHECK_TYPEDEF(type);
+					if (symname)
+						ui_out_text(uiout, " ");
+					ui_out_text(uiout, "type=\"");
+					/*if (is_vptr)
+					{
+						const char * type_name = type_name_no_tag(type);
+						if (type_name)
+							ui_out_message(uiout, 0, "vtable for %s", type_name);
+						else
+						{
+							ui_out_text(uiout, "vtable for ");
+							print_type_name (type);
+						}
+					}
+					else*/
+						print_type_name (type);
+					ui_out_text(uiout, "\"");
+				}
+				ui_out_text(uiout, ")\n");
+			}
+			// whatever we can get form the value
+			else
+			{
+				address_t location = 0;
+				int offset = 0;
+
+				//if (insn->num_operand > 1)
+				//{
+				//	struct ca_operand* src_op = &insn->operands[1];
+				//	get_location(src_op, &location, &offset);
+				//}
+
+				print_op_value_context (val,
+						op_size > 0 ? op_size : ptr_sz,
+						location, offset, insn->lea);
+			}
+		}
+		if (name_to_free)
+			free (name_to_free);
+	}
 	else
-		return get_valid_dis386(dp, info);
-}
-
-static void get_sib(disassemble_info *info) {
-	/* If modrm.mod == 3, operand must be register.  */
-	if (need_modrm && address_mode != mode_16bit && modrm.mod != 3
-			&& modrm.rm == 4) {
-		FETCH_DATA(info, codep + 2);
-		sib.index = (codep[1] >> 3) & 7;
-		sib.scale = (codep[1] >> 6) & 3;
-		sib.base = codep[1] & 7;
+	{
+		if (dst_op->type == CA_OP_REGISTER)
+		{
+			struct ca_reg_value* dst_reg = get_reg_at_pc(dst_op->reg.index, insn->pc);
+			// The destination register is changed from known to unknown state at this instruction
+			if (dst_reg)
+				ui_out_message(uiout, 0, "%s=?", dst_op->reg.name);
+		}
+		ui_out_text(uiout, "\n");
 	}
 }
 
-/* myan */
-static bool g_dis_silent;
+/*
+ *  The key function to discover an instruction's object context
+ */
+static void process_one_insn(struct ca_dis_insn* insn, int current)
+{
+	size_t ptr_sz = g_ptr_bit >> 3;
+	size_t val;
+	int op_size = insn->op_size;
+	size_t mask = (size_t)(-1);
+	int islea = 0;
+	struct ca_operand* dst_op = NULL;
+	struct ca_operand* src_op = NULL;
 
-enum ca_operand_type {
-	CA_OP_UNSET,
-	CA_OP_REGISTER,
-	CA_OP_IMMEDIATE,
-	CA_OP_MEMORY,
-};
+	if (*insn->opcode_name == 0)
+		return;
 
-struct ca_op_register {
-	const char* name;
-	int size;
-	int index;
-};
+	if (op_size > 0)
+		mask = mask >> ((8 - op_size) * 8);
 
-struct ca_op_immediate {
-	ULONG64 immediate;
-};
+	// this instruction is the target of a previous "jmp" instruction
+	if (insn->jmp_target)
+		adjust_table_after_absolute_branch(insn->pc);
 
-struct ca_op_memory {
-	struct ca_op_register  base_reg;
-	struct ca_op_register  index_reg;
-	struct ca_op_immediate disp;
-	int scale;
-};
+	// 1st operand(insn->operands[0]) is the destination
+	// (and possibly source) in most cases
+	dst_op = &insn->operands[0];
+	src_op = &insn->operands[1];
 
-struct ca_operand {
-	enum ca_operand_type type;
-	union {
-		struct ca_op_register  reg;
-		struct ca_op_immediate immed;
-		struct ca_op_memory    mem;
-	};
-};
+	// Switch on op_code
+	// roughly in the order of most popular to least likely
+	if (strncmp(insn->opcode_name, "mov", 3) == 0
+			|| strncmp(insn->opcode_name, "cvt", 3) == 0)
+	{
+		//   "movd"  move doubleword or quadword
+		//   "movnti" move non-temporal doubleword or quadword
+		//   "movs" "movs[b/w/d/q] move string
+		//   "movsx" move with sign-extension
+		//   "movsxd" move with sign-extend doubleword
+		//   "movzx" move with zero-extension
+		process_mov_insn(insn, dst_op, src_op);
+	}
+	/*else if (strncmp(insn->opcode_name, "test", 4) == 0)
+	{
+		if (insn->operands[0].type == CA_OP_REGISTER && insn->operands[1].type == CA_OP_REGISTER
+			&& insn->operands[0].reg.index == insn->operands[1].reg.index)
+		{
+			// test zero
+			//print_one_operand(&insn->operands[1], uiout, CA_TRUE);
+			//ui_out_text(uiout, "==0");
+		}
+		else if (known_op_value(&insn->operands[1]) && known_op_value(&insn->operands[0]))
+		{
+			//print_one_operand(&insn->operands[1], uiout, CA_TRUE);
+			//ui_out_text(uiout, "==");
+			//print_one_operand(&insn->operands[0], uiout, CA_TRUE);
+		}
+	}
+	else if (strncmp(insn->opcode_name, "cmp", 3) == 0)
+	{
+		if (known_op_value(&insn->operands[1]) && known_op_value(&insn->operands[0]))
+		{
+			//print_one_operand(&insn->operands[1], uiout, CA_TRUE);
+			//ui_out_text(uiout, "<=>");
+			//print_one_operand(&insn->operands[0], uiout, CA_TRUE);
+		}
+	}
+	else if (strncmp(insn->opcode_name, "leave", 5) == 0)
+	{
+		// this has to be before "lea" instr to avoid ambiguity
+		// it is equivelent to two instruction
+		//     mov rbp, rsp
+		//     pop rbp
+	}*/
+	else if (strncmp(insn->opcode_name, "lea", 3) == 0)
+	{
+		// load effective address
+		// source must be memory and destination must be register
+		insn->lea = 1;
+		process_mov_insn(insn, dst_op, src_op);
+	}
+	else if (strncmp(insn->opcode_name, "call", 4) == 0)
+	{
+		insn->call = 1;
+		if (dst_op->type != CA_OP_IMMEDIATE && known_op_value(dst_op))
+		{
+			insn->annotate = 1;
+		}
+		if (!current)
+		{
+			// rax is used for return value most of the time
+			set_reg_unknown_at_pc(RAX, insn->pc+1);
+			// when the function returns, all volatile registers may have been changed
+			//
+			// In a second thought, even if the called function does change a volatile register,
+			// the code after the "call" should reload it before using it.
+			// The code following "call" instruction could be the destination of branch/jmp instruction,
+			// which skips "call". If we set all volatile registers unknown, we will lose them in that case.
+			set_reg_unknown_at_pc(RCX, insn->pc+1);
+			set_reg_unknown_at_pc(RDX, insn->pc+1);
+			set_reg_unknown_at_pc(RSI, insn->pc+1);
+			set_reg_unknown_at_pc(RDI, insn->pc+1);
+			set_reg_unknown_at_pc(R8, insn->pc+1);
+			set_reg_unknown_at_pc(R9, insn->pc+1);
+			set_reg_unknown_at_pc(R10, insn->pc+1);
+			set_reg_unknown_at_pc(R11, insn->pc+1);
+		}
+	}
+	else if (strncmp(insn->opcode_name, "jmp", 3) == 0)
+	{
+		// Non-conditional branch, need to adjust register context
+		insn->jmp = 1;
+		if (known_op_value(dst_op))
+		{
+			insn->branch_pc = get_op_value(dst_op, op_size);
+			if (insn->branch_pc < insn->pc)
+			{
+				// Get previous register context if jmp back
+				adjust_table_after_absolute_branch(insn->pc);
+			}
+			else
+			{
+				// Prepare for the target-addressed instruction if jmp forward
+				struct ca_dis_insn* last_insn = &g_insns_buffer[g_num_insns];
+				struct ca_dis_insn* cursor = insn + 1;
+				while (cursor < last_insn)
+				{
+					if (cursor->pc == insn->branch_pc)
+					{
+						cursor->jmp_target = 1;
+						break;
+					}
+					cursor++;
+				}
+				if (cursor == last_insn)	// jmp target is not within current function
+					adjust_table_after_absolute_branch(insn->pc);
+			}
+		}
+		else
+			adjust_table_after_absolute_branch(insn->pc);
+	}
+	else if (insn->opcode_name[0] == 'j' &&
+			(insn->opcode_name[1] == 'e'
+				|| (insn->opcode_name[1] == 'n' && insn->opcode_name[2] == 'e')
+				|| insn->opcode_name[1] == 'a'
+				|| insn->opcode_name[1] == 'b'
+				|| insn->opcode_name[1] == 's'
+				|| (insn->opcode_name[1] == 'n' && insn->opcode_name[2] == 's')
+				|| insn->opcode_name[1] == 'p'
+				|| (insn->opcode_name[1] == 'n' && insn->opcode_name[2] == 'p')
+				|| insn->opcode_name[1] == 'l'
+				|| (insn->opcode_name[1] == 'l' && insn->opcode_name[2] == 'e')
+				|| insn->opcode_name[1] == 'g'
+				|| insn->opcode_name[1] == 'o'
+				|| (insn->opcode_name[1] == 'n' && insn->opcode_name[2] == 'o') ) )
+	{
+		// Branch instructions
+		// "je", "jne", "ja", "jb", "js", "jns", "jp", "jnp", "jl", "jle",
+		// "jg", "jo", "jno"
+		insn->branch = 1;
+		if (known_op_value(dst_op))
+			insn->branch_pc = get_op_value(dst_op, op_size);
+	}
+	else if (strncmp(insn->opcode_name, "push", 4) == 0)
+	{
+		// "push" is equivalent to "sub 8, %rsp" and "mov src, (%rsp)"
+		// update RSP value
+		size_t rsp = g_reg_table.cur_regs[RSP]->value - ptr_sz;
+		set_reg_value_at_pc(RSP, rsp, insn->pc);
 
-static int g_num_operand;
-static struct ca_operand g_operands[MAX_OPERANDS];
-static int g_op_size;
+		insn->num_operand = 2;
+		insn->push = 1;
+		memcpy(src_op, dst_op, sizeof(struct ca_operand));	// dst_op(operand[0]) is actually src
+		dst_op->type = CA_OP_MEMORY;
+		dst_op->mem.base_reg.index = RSP;
+		dst_op->mem.base_reg.name = "rsp";
+		dst_op->mem.base_reg.size = ptr_sz;
+		dst_op->mem.disp.immediate = 0;
+		dst_op->mem.index_reg.name = NULL;
+		dst_op->mem.scale = 0;
+		process_mov_insn(insn, dst_op, src_op);
+
+		insn->annotate = 1;
+	}
+	else if (strncmp(insn->opcode_name, "pop", 3) == 0)
+	{
+		// "pop" is equivalent to "mov (%rsp), dst" and "add 8, %rsp"
+		size_t rsp = g_reg_table.cur_regs[RSP]->value;
+
+		insn->num_operand = 2;
+		src_op->type = CA_OP_MEMORY;
+		src_op->mem.base_reg.index = RSP;
+		src_op->mem.base_reg.name = "rsp";
+		src_op->mem.base_reg.size = ptr_sz;
+		src_op->mem.disp.immediate = 0;
+		src_op->mem.index_reg.name = NULL;
+		src_op->mem.scale = 0;
+		process_mov_insn(insn, dst_op, src_op);
+
+		// update RSP value
+		set_reg_value_at_pc(RSP, rsp +  ptr_sz, insn->pc);
+		insn->annotate = 1;
+	}
+	else if (strncmp(insn->opcode_name, "cmov", 4) == 0)
+	{
+		// conditional move
+		set_op_unknown(dst_op, insn->pc);
+	}
+	else if (strncmp(insn->opcode_name, "add", 3) == 0
+			|| strncmp(insn->opcode_name, "adc", 3) == 0)
+	{
+		process_binary_op_insn(insn, dst_op, src_op, ADD);
+	}
+	else if (strncmp(insn->opcode_name, "sub", 3) == 0
+			|| strncmp(insn->opcode_name, "sbb", 3) == 0)
+	{
+		if (dst_op->type == CA_OP_REGISTER && src_op->type == CA_OP_REGISTER
+				&& dst_op->reg.index == src_op->reg.index)
+		{
+			insn->annotate = 1;
+			val = 0;
+			set_op_value(dst_op, 0, insn->pc);
+		}
+		else
+			process_binary_op_insn(insn, dst_op, src_op, SUBTRACT);
+	}
+	else if (strncmp(insn->opcode_name, "imul", 4) == 0)
+	{
+		// two operands multiplication
+		if (insn->num_operand == 2)
+		{
+			process_binary_op_insn(insn, dst_op, src_op, MULTIPLY);
+		}
+		else
+		{
+			if (insn->num_operand == 3 && known_op_value(&insn->operands[1]) && known_op_value(&insn->operands[2]))
+			{
+				insn->annotate = 1;
+				val = get_op_value(&insn->operands[1], op_size) * get_op_value(&insn->operands[2], op_size);
+				val &= mask;
+				set_op_value(dst_op, val, insn->pc);
+			}
+			else if (insn->num_operand == 1 && known_op_value(dst_op) && g_reg_table.cur_regs[RAX]->has_value)
+			{
+				// rax instead of operands[0] is the destination
+				insn->annotate = 1;
+				val = g_reg_table.cur_regs[RAX]->value * get_op_value(dst_op, op_size);
+				val &= mask;
+				set_reg_value_at_pc(RAX, val, insn->pc);
+			}
+			else
+			{
+				if (insn->num_operand == 1)
+					set_reg_unknown_at_pc(RAX, insn->pc);
+				else
+					set_op_unknown(dst_op, insn->pc);
+			}
+		}
+	}
+	else if (strncmp(insn->opcode_name, "idiv", 4) == 0)
+	{
+		process_binary_op_insn(insn, dst_op, src_op, DIVIDE);
+	}
+	else if (strncmp(insn->opcode_name, "inc", 3) == 0)
+	{
+		process_unary_op_insn(insn, dst_op, INCREMENT);
+	}
+	else if (strncmp(insn->opcode_name, "dec", 3) == 0)
+	{
+		process_unary_op_insn(insn, dst_op, DECREMENT);
+	}
+	else if (strncmp(insn->opcode_name, "and", 3) == 0)
+	{
+		process_binary_op_insn(insn, dst_op, src_op, BITWISE_AND);
+	}
+	else if (strncmp(insn->opcode_name, "or", 2) == 0)
+	{
+		process_binary_op_insn(insn, dst_op, src_op, BITWISE_OR);
+	}
+	else if (strncmp(insn->opcode_name, "not", 3) == 0)
+	{
+		process_unary_op_insn(insn, dst_op, BITWISE_NOT);
+	}
+	else if (strncmp(insn->opcode_name, "xor", 3) == 0)
+	{
+		if (insn->operands[0].type == CA_OP_REGISTER && insn->operands[1].type == CA_OP_REGISTER
+			&& insn->operands[0].reg.index == insn->operands[1].reg.index)
+		{
+			insn->annotate = 1;
+			val = 0;
+			set_op_value(dst_op, 0, insn->pc);
+		}
+		else
+			process_binary_op_insn(insn, dst_op, src_op, BITWISE_XOR);
+	}
+	else if (strncmp(insn->opcode_name, "shr", 3) == 0
+			|| strncmp(insn->opcode_name, "sar", 3) == 0)
+	{
+		// shift right
+		process_binary_op_insn(insn, dst_op, src_op, BITWISE_SHIFT_RIGHT);
+	}
+	else if (strncmp(insn->opcode_name, "shl", 3) == 0
+			|| strncmp(insn->opcode_name, "sal", 3) == 0)
+	{
+		// shift left
+		process_binary_op_insn(insn, dst_op, src_op, BITWISE_SHIFT_LEFT);
+	}
+	else if (strncmp(insn->opcode_name, "rol", 3) == 0)
+	{
+		// rotate left
+		process_binary_op_insn(insn, dst_op, src_op, ROTATE_LEFT);
+	}
+	else if (strncmp(insn->opcode_name, "ror", 3) == 0)
+	{
+		// rotate right
+		process_binary_op_insn(insn, dst_op, src_op, ROTATE_RIGHT);
+	}
+	else if (strncmp(insn->opcode_name, "rcl", 3) == 0
+			|| strncmp(insn->opcode_name, "rcr", 3) == 0)
+	{
+		// rotate through carry left/right
+		set_op_unknown(dst_op, insn->pc);
+	}
+	else if (strncmp(insn->opcode_name, "set", 3) == 0)
+	{
+		// conditional set instruction
+		if (insn->operands[0].type == CA_OP_MEMORY && known_op_value(dst_op))
+		{
+			insn->annotate = 1;
+		}
+		set_op_unknown(dst_op, insn->pc);
+	}
+	else if (strncmp(insn->opcode_name, "ret", 3) == 0)
+	{
+		// If we are here, this "ret" can't be the last instruction of the function
+		// i.e. there are multiple exits, we need to find out how we are branched here
+		adjust_table_after_absolute_branch(insn->pc);
+	}
+	else if (strncmp(insn->opcode_name, "enter", 5) == 0)
+	{
+		// it is equivelent to three instructions
+		//     push rbp
+		//     mov rbp, rsp
+		//     sub nbytes, rsp
+		if (insn->operands[0].type == CA_OP_IMMEDIATE)
+		{
+			size_t rsp = g_reg_table.cur_regs[RSP]->value;
+			val = get_op_value(&insn->operands[0], op_size);
+			set_reg_value_at_pc(RSP, rsp - val, insn->pc);
+		}
+		//else
+		//	(*info->fprintf_func)(info->stream, "internal error: unexpected operand");
+	}
+	// nop is alias to "xchg eax,eax"
+	/*else if (strncmp(insn->opcode_name, "xchg", 4) == 0
+		&& (insn->num_operand == 0
+			|| (insn->num_operand == 2 && insn->operands[0].type == CA_OP_REGISTER && insn->operands[1].type == CA_OP_REGISTER && insn->operands[0].reg.index == RAX && insn->operands[1].reg.index == RAX) ) )
+	{
+	}*/
+}
+
+/*
+ * Callback functions for disassembler
+ */
+static char dis_text[NAME_BUF_SZ];
+static int  dis_text_pos;
+
+static int
+fprintf_disasm (void *stream, const char *format, ...)
+{
+	va_list args;
+
+	va_start (args, format);
+	//dprintf(format, args);
+	vsprintf(&dis_text[dis_text_pos], format, args);
+	dis_text_pos = strlen(dis_text);
+	va_end (args);
+	/* Something non -ve.  */
+	return 0;
+}
+
+static void
+dis_asm_memory_error (int status, bfd_vma memaddr,
+		      struct disassemble_info *info)
+{
+	//memory_error (status, memaddr);
+	sprintf(&dis_text[dis_text_pos], "Failed to read memory at %p (status=%d)\n", memaddr, status);
+	dis_text_pos = strlen(dis_text);
+}
+
+static void
+dis_asm_print_address (bfd_vma addr, struct disassemble_info *info)
+{
+	//struct gdbarch *gdbarch = info->application_data;
+	//print_address (gdbarch, addr, info->stream);
+	sprintf(&dis_text[dis_text_pos], "0x%I64x  ", addr);
+	dis_text_pos = strlen(dis_text);
+	print_func_address(addr, &dis_text[dis_text_pos], NAME_BUF_SZ - dis_text_pos);
+	dis_text_pos = strlen(dis_text);
+}
+
+static int
+dis_asm_read_memory (ULONG64 memaddr,
+		unsigned char *myaddr,
+		unsigned int length,
+		struct disassemble_info *dinfo)
+{
+	ULONG cb;
+	if (!ReadMemory(memaddr, myaddr, length, &cb) || cb != length)
+		return -1;
+	return 0;
+}
+
+/*static void
+mem_ui_file_put (void *object, const char *buffer, long length)
+{
+	char** strp = (char**) object;
+	char* dupstr = (char*) malloc(length + 1);
+	strncpy(dupstr, buffer, length);
+	dupstr[length] = '\0';
+	*strp = dupstr;
+}*/
+
+/*
+ * 	Return number of instructions disassembled
+ */
+static int dump_insns(struct decode_control_block* decode_cb)
+{
+	//struct gdbarch *gdbarch = decode_cb->gdbarch;
+	CORE_ADDR low = decode_cb->func_start;
+	CORE_ADDR high = decode_cb->func_end;
+	CA_BOOL verbose = decode_cb->verbose;
+
+	int num_insns = 0;
+	CORE_ADDR pc;
+
+	struct disassemble_info di;
+	/*struct ui_file *mem_file = mem_fileopen();
+
+	init_disassemble_info (&di, mem_file, fprintf_disasm);
+	di.flavour = bfd_target_unknown_flavour;
+	di.memory_error_func = dis_asm_memory_error;
+	di.print_address_func = dis_asm_print_address;
+	di.read_memory_func = dis_asm_read_memory;
+	di.arch = gdbarch_bfd_arch_info (gdbarch)->arch;
+	di.mach = gdbarch_bfd_arch_info (gdbarch)->mach;
+	di.endian = gdbarch_byte_order (gdbarch);
+	di.endian_code = gdbarch_byte_order_for_code (gdbarch);
+	di.application_data = gdbarch;
+	di.disassembler_options = "att"; //att_flavor;
+	disassemble_init_for_target (&di);*/
+	di.fprintf_func = fprintf_disasm;
+	di.stream = NULL;
+	di.disassembler_options = "intel"; //att_flavor;
+	di.read_memory_func  = dis_asm_read_memory;
+	di.memory_error_func = dis_asm_memory_error;
+	di.print_address_func = dis_asm_print_address;
+	decode_cb->di = &di;
+
+	// Set to initial state
+	init_dis_insn_buffer();
+
+	for (pc = low; pc < high;)
+	{
+		struct ca_dis_insn* insn;
+
+		// bail out if user breaks
+		if (user_request_break())
+			break;
+
+		insn = get_new_dis_insn();
+		memset(insn, 0, sizeof(struct ca_dis_insn));
+		decode_cb->insn = insn;
+		insn->pc = pc;
+		// disassemble one instruction
+		dis_text_pos = 0;
+		pc += ca_print_insn_i386 (pc, decode_cb);
+		dis_text[dis_text_pos] = '\0';
+		insn->dis_string = strdup(dis_text);
+		// record the result
+		//ui_file_put (mem_file, mem_ui_file_put, &insn->dis_string);
+		//ui_file_rewind(mem_file);
+		num_insns++;
+	}
+
+	// clean up
+	//ui_file_delete(mem_file);
+
+	return num_insns;
+}
+
+/*
+ * Stack values are spots on thread stack memory,
+ *   where local variables, temporaries are places
+ */
+static void init_stack_vars(void)
+{
+	g_num_stack_vars = 0;
+}
+
+static void reset_stack_vars(void)
+{
+	unsigned int i;
+	for (i = 0; i < g_num_stack_vars; i++)
+	{
+		struct ca_stack_var* sval = &g_stack_vars[i];
+		if (sval->sym_name)
+			free(sval->sym_name);
+	}
+	if (g_num_stack_vars > 0)
+		memset(g_stack_vars, 0, g_num_stack_vars * sizeof(struct ca_stack_var));
+	g_num_stack_vars = 0;
+}
+
+static struct ca_stack_var* get_stack_var(address_t saddr)
+{
+	unsigned int i;
+	for (i = 0; i < g_num_stack_vars; i++)
+	{
+		struct ca_stack_var* sval = &g_stack_vars[i];
+		if (sval->stack_addr == saddr)
+			return sval;
+	}
+	return NULL;
+}
+
+static struct ca_stack_var* get_new_stack_var(address_t saddr)
+{
+	struct ca_stack_var* sval = get_stack_var(saddr);
+	if (sval)
+		return sval;
+
+	// the address is first seen
+	if (g_num_stack_vars >= g_stack_vars_capacity)
+	{
+		if (g_stack_vars_capacity == 0)
+			g_stack_vars_capacity = STACK_ARRAY_INIT_CAP;
+		else
+			g_stack_vars_capacity *= 2;
+		g_stack_vars = (struct ca_stack_var*)realloc(g_stack_vars, g_stack_vars_capacity * sizeof(struct ca_stack_var));
+		memset(g_stack_vars + g_num_stack_vars, 0, (g_stack_vars_capacity - g_num_stack_vars) * sizeof(struct ca_stack_var));
+	}
+	return &g_stack_vars[g_num_stack_vars++];
+}
+
+static void set_stack_sym_type(char* sym_name, struct win_type type, address_t saddr)
+{
+	if (sym_name || type.mod_base)
+	{
+		// get_new_stack_var may return an existing one
+		struct ca_stack_var* sval = get_new_stack_var(saddr);
+		sval->stack_addr = saddr;
+		// Assume one stack address is for one local variable only
+		// we don't change its sym/type once it is set
+		// Note: this is a simplistic approach for now
+		if (sym_name && !sval->sym_name)
+			sval->sym_name = strdup(sym_name);
+		if (type.mod_base && !sval->type.mod_base)
+			sval->type = type;
+	}
+}
+
+/*
+ * Initialize register table before analyzing instructions
+ * set all registers to input values
+ */
+static void init_reg_table(struct ca_reg_value* regs)
+{
+	unsigned int i;
+	for (i = 0; i < TOTAL_REGS; i++)
+	{
+		struct ca_reg_value* reg = get_new_reg(i);
+		memcpy(reg, &regs[i], sizeof(struct ca_reg_value));
+		reg->pc = 0;
+	}
+	// ground source references
+	memset(regs, 0, REG_SET_SZ);
+}
+
+/*
+ * Reset a register table
+ */
+static void reset_reg_table(void)
+{
+	struct ca_reg_table* table = &g_reg_table;
+	unsigned int i;
+	for (i = 0; i < TOTAL_REGS; i++)
+	{
+		struct ca_reg_vector* vec = &table->vecs[i];
+		if (vec->finish > vec->start)
+		{
+			struct ca_reg_value* cursor;
+			for (cursor = vec->start; cursor < vec->finish; cursor++)
+			{
+				if (cursor->sym_name)
+					free(cursor->sym_name);
+			}
+			// clean the memory and reset finish pointer
+			memset(vec->start, 0, (char*)vec->end_of_storage - (char*)vec->start);
+			vec->finish = vec->start;
+		}
+	}
+}
+
+/*
+ * Check invariants of the register table
+ */
+static void validate_reg_table(void)
+{
+	struct ca_reg_table* table = &g_reg_table;
+	unsigned int i;
+	for (i = 0; i < TOTAL_REGS; i++)
+	{
+		struct ca_reg_vector* vec = &table->vecs[i];
+		if (vec->finish > vec->start)
+		{
+			struct ca_reg_value* cursor;
+			for (cursor = vec->start + 1; cursor < vec->finish; cursor++)
+			{
+				if (cursor->pc <= (cursor - 1)->pc)
+				{
+					CA_PRINT("Internal error: register table is inconsistent\n");
+					CA_PRINT("\tregister(%d) pc="PRINT_FORMAT_POINTER"\n", i, cursor->pc);
+					break;
+				}
+			}
+		}
+	}
+}
+
+/*
+ * Add a new value
+ */
+static void set_reg_value_at_pc(unsigned int reg_idx, size_t val, CORE_ADDR pc)
+{
+	struct ca_reg_value* cur = get_new_reg(reg_idx);
+	cur->pc = pc;
+	cur->has_value = 1;
+	cur->value = val;
+}
+
+static void set_cur_reg_value(unsigned int reg_idx, size_t val)
+{
+	struct ca_reg_value* reg = g_reg_table.cur_regs[reg_idx];
+	if (!reg->has_value)
+	{
+		reg->has_value = 1;
+		reg->value = val;
+	}
+}
+
+/*
+ * Register is unknown at pc
+ */
+void set_reg_unknown_at_pc(unsigned int reg_idx, CORE_ADDR pc)
+{
+	struct ca_reg_value* cur = g_reg_table.cur_regs[reg_idx];
+	// if current value is known already, skip it.
+	if (!REG_KNOWN(cur))
+		return;
+	// A new register value is unknown at born
+	cur = get_new_reg(reg_idx);
+	cur->pc = pc;
+}
+
+/*
+ * Return a register's value structure at given instruction address "pc"
+ */
+static struct ca_reg_value* get_reg_at_pc(unsigned int reg_idx, CORE_ADDR pc)
+{
+	struct ca_reg_vector* vec = &g_reg_table.vecs[reg_idx];
+	struct ca_reg_value* cursor;
+	for (cursor = vec->start; cursor < vec->finish; cursor++)
+	{
+		// exact match of address
+		if (cursor->pc == pc)
+			return cursor;
+		// we have passed the address
+		else if (cursor->pc > pc)
+			break;
+	}
+	return NULL;
+}
+
+/*
+ * Create a new value at the end of given reigister's vector in table
+ * 	handle buffer expansion; update current register pointer as well
+ */
+static struct ca_reg_value* get_new_reg(unsigned int reg_idx)
+{
+	struct ca_reg_value* reg;
+	struct ca_reg_vector* vec = &g_reg_table.vecs[reg_idx];
+	if (vec->finish == vec->end_of_storage)
+	{
+		size_t capacity;
+		size_t old_size;
+		if (vec->start)
+		{
+			old_size = vec->finish - vec->start;
+			capacity = old_size * 2;
+		}
+		else
+		{
+			old_size = 0;
+			capacity = INIT_REG_ARRAY_SZ;
+		}
+		vec->start = (struct ca_reg_value*) realloc(vec->start, capacity * sizeof(struct ca_reg_value));
+		vec->finish = vec->start + old_size;
+		// zero new memory
+		memset(vec->finish, 0, (capacity - old_size) * sizeof(struct ca_reg_value));
+		vec->end_of_storage = vec->start + capacity;
+	}
+	reg = vec->finish++;
+	g_reg_table.cur_regs[reg_idx] = reg;
+	return reg;
+}
+
+/*
+ * We just see an absolute branch instruction, e.g. "jmp", "ret", etc.
+ *  therefore, function execution is NOT contiguous at this spot
+ * 	find the instruction that branches to here and set the register context
+ */
+static void adjust_table_after_absolute_branch(CORE_ADDR pc)
+{
+	unsigned int insn_index, reg_index;
+	CORE_ADDR offset = 0;
+	struct ca_dis_insn* branch_insn = NULL;
+
+	// find a branch instruction that branches to an address after "pc"
+	for (insn_index = 0; insn_index < g_num_insns; insn_index++)
+	{
+		struct ca_dis_insn* insn = &g_insns_buffer[insn_index];
+		if (insn->pc >= pc)
+			break;
+		if (insn->jmp && insn->branch_pc == pc)
+		{
+			branch_insn = insn;
+			break;
+		}
+		else if (insn->branch && insn->branch_pc >= pc)
+		{
+			if (!branch_insn || offset > insn->branch_pc - pc)
+			{
+				branch_insn = insn;
+				if (insn->branch_pc == pc)
+					break;
+				offset = insn->branch_pc - pc;
+			}
+		}
+	}
+	if (!branch_insn)
+		return;
+
+	// position current pointers to branch spot
+	set_current_reg_pointers(branch_insn);
+
+	// revert values in register table to those that before branch spot
+	for (reg_index = 0; reg_index < TOTAL_REGS; reg_index++)
+	{
+		struct ca_reg_vector* vec = &g_reg_table.vecs[reg_index];
+		struct ca_reg_value* reg = g_reg_table.cur_regs[reg_index];
+		struct ca_reg_value* latest = vec->finish - 1;
+		// adjust only the old value is different from current one
+		if (reg_index != RIP && reg != latest &&
+			(reg->type.type_id != latest->type.type_id || reg->type.mod_base != latest->type.mod_base || !is_same_string(reg->sym_name, latest->sym_name)))
+		{
+			// Register value has changed since branch spot, revert it
+			struct ca_reg_value* new_reg = get_new_reg(reg_index);
+			memcpy(new_reg, reg, sizeof(struct ca_reg_value));
+			new_reg->pc = pc - 1;	// fake an address slightly before "pc"
+			if (new_reg->sym_name)
+				new_reg->sym_name = strdup(new_reg->sym_name);
+		}
+	}
+}
+
+/*
+ * Set all current pointers in table point to values right before "pc"
+ * 		beware: value at "pc" is the result of instruction
+ */
+static void set_current_reg_pointers(struct ca_dis_insn* insn)
+{
+	struct ca_reg_table* table = &g_reg_table;
+	unsigned int i;
+	for (i = 0; i < TOTAL_REGS; i++)
+	{
+		struct ca_reg_vector* vec = &table->vecs[i];
+		struct ca_reg_value* reg = table->cur_regs[i];
+		if (reg->pc >= insn->pc)
+			reg = vec->start + 1;
+		while (reg < vec->finish)
+		{
+			if (reg->pc >= insn->pc)
+			{
+				if (!insn->push)	// push instruction is an exception
+					reg--;
+				break;
+			}
+			reg++;
+		}
+		if (reg >= vec->finish)
+			reg = vec->finish - 1;
+		table->cur_regs[i] = reg;
+	}
+}
+
+static void set_reg_table_at_pc(struct ca_reg_value* regs, CORE_ADDR pc)
+{
+	struct ca_reg_table* table = &g_reg_table;
+	unsigned int i;
+	for (i = 0; i < TOTAL_REGS; i++)
+	{
+		struct ca_reg_value* reg = &regs[i];
+		if (REG_KNOWN(reg))
+		{
+			struct ca_reg_value* cur_reg = g_reg_table.cur_regs[i];
+			struct ca_reg_value* dst;
+			if (cur_reg->pc == pc)
+			{
+				dst = cur_reg;
+				if (dst->sym_name)
+					free(dst->sym_name);
+			}
+			else
+				dst = get_new_reg(i);
+			// shallow copy, ownership is transfered
+			memcpy(dst, reg, sizeof(struct ca_reg_value));
+			dst->pc = pc;
+		}
+	}
+	// ground source references
+	memset(regs, 0, REG_SET_SZ);
+}
+
+/*
+ * Instruction buffer
+ */
+static struct ca_dis_insn* get_new_dis_insn(void)
+{
+	struct ca_dis_insn* insn;
+	// prepare buffer
+	if (g_num_insns >= g_insns_buffer_capacity)
+	{
+		if (g_insns_buffer_capacity == 0)
+			g_insns_buffer_capacity = INSN_BUFFER_INIT_CAP;
+		else
+			g_insns_buffer_capacity *= 2;
+		g_insns_buffer = (struct ca_dis_insn*) realloc(g_insns_buffer, g_insns_buffer_capacity * sizeof(struct ca_dis_insn));
+	}
+	if (!g_insns_buffer)
+	{
+		CA_PRINT("Fatal: Out-of_memory\n");
+		return NULL;
+	}
+
+	insn = &g_insns_buffer[g_num_insns];
+	g_num_insns++;
+	return insn;
+}
+
+static void init_dis_insn_buffer(void)
+{
+	unsigned int i;
+	for (i = 0; i < g_num_insns; i++)
+	{
+		struct ca_dis_insn* insn = &g_insns_buffer[i];
+		if (insn->dis_string)
+		{
+			free(insn->dis_string);
+			insn->dis_string = NULL;
+		}
+	}
+	g_num_insns = 0;
+}
+
+/*
+ * Instruction operands
+ */
 
 // return the virtual address of memory operand,
 //        0 if it has unknown base or index register value
-static ULONG64 get_address(struct ca_operand* op)
+static bfd_vma get_address(struct ca_operand* op)
 {
 	if (op->type == CA_OP_MEMORY)
 	{
-		ULONG64 base, index, mem_addr;
+		bfd_vma base, index, mem_addr;
 		if (op->mem.base_reg.name)
 		{
-			if (g_regs[op->mem.base_reg.index].known)
-				base = g_regs[op->mem.base_reg.index].value;
+			struct ca_reg_value* base_reg = g_reg_table.cur_regs[op->mem.base_reg.index];
+			if (base_reg->has_value)
+				base = base_reg->value;
 			else
 				return 0;
 		}
@@ -7326,8 +1378,9 @@ static ULONG64 get_address(struct ca_operand* op)
 			base = 0;
 		if (op->mem.index_reg.name)
 		{
-			if (g_regs[op->mem.index_reg.index].known)
-				index = g_regs[op->mem.index_reg.index].value;
+			struct ca_reg_value* index_reg = g_reg_table.cur_regs[op->mem.index_reg.index];
+			if (index_reg->has_value)
+				index = index_reg->value;
 			else
 				return 0;
 		}
@@ -7339,36 +1392,22 @@ static ULONG64 get_address(struct ca_operand* op)
 	return 0;
 }
 
-// return the operand in the form of [base_reg + offset]
-static void get_location(struct ca_operand* op, address_t* location, int* offset)
-{
-	if (op->type == CA_OP_MEMORY)
-	{
-		if (op->mem.base_reg.name && g_regs[op->mem.base_reg.index].known
-			&& !op->mem.index_reg.name)
-		{
-			*location = g_regs[op->mem.base_reg.index].value;
-			*offset = op->mem.disp.immediate;
-		}
-	}
-}
-
 // return true if the operand's value is known
-static int known_value(struct ca_operand* op, disassemble_info *info)
+static int known_op_value(struct ca_operand* op)
 {
 	int rc = 0;
 
 	if (op->type == CA_OP_REGISTER)
-		rc = g_regs[op->reg.index].known;
+		rc = g_reg_table.cur_regs[op->reg.index]->has_value;
 	else if (op->type == CA_OP_IMMEDIATE)
 		rc = 1;
 	else if (op->type == CA_OP_MEMORY)
 	{
-		ULONG64 mem_addr = get_address(op);
+		bfd_vma mem_addr = get_address(op);
 		if (mem_addr)
 		{
 			char val;
-			if ((*info->read_memory_func)(mem_addr, (unsigned char*)&val, sizeof(val), info) == 0)
+			if (read_memory_wrapper(NULL, mem_addr, (bfd_byte*)&val, sizeof(val)))
 				rc = 1;
 		}
 	}
@@ -7376,162 +1415,433 @@ static int known_value(struct ca_operand* op, disassemble_info *info)
 }
 
 // return true if the operand's value is on stack and known
-static int known_stack_value(struct ca_operand* op, disassemble_info *info)
+static int is_stack_address(struct ca_operand* op)
 {
-	int rs = 0;
-
-	if (op->type == CA_OP_MEMORY)
+	bfd_vma mem_addr = get_address(op);
+	if (mem_addr >= g_debug_context.sp
+		&& mem_addr < g_debug_context.segment->m_vaddr + g_debug_context.segment->m_vsize)
 	{
-		ULONG64 mem_addr = get_address(op);
-		if (mem_addr)
-		{
-			struct object_reference aref;
-			memset(&aref, 0, sizeof(aref));
-			aref.vaddr = mem_addr;
-			aref.value = 0;
-			aref.target_index = -1;
-			fill_ref_location(&aref);
-			if (aref.storage_type == ENUM_STACK)
-				rs = 1;
-		}
+		return 1;
 	}
-	return rs;
+	return 0;
 }
 
-// mark the operand is unknown from now on
-static void set_unknown(struct ca_operand* op, disassemble_info *info)
+// Return symbol/type of the operand if known
+static void
+get_op_symbol_type(struct ca_operand* op, int lea,
+				char** psymname, struct win_type* ptype, int* pvptr)
 {
 	if (op->type == CA_OP_REGISTER)
 	{
-		if (g_regs[op->reg.index].known)
+		struct ca_reg_value* reg = g_reg_table.cur_regs[op->reg.index];
+		if (reg->sym_name && psymname)
+			*psymname = strdup(reg->sym_name);
+		*ptype = reg->type;
+	}
+	else if (op->type == CA_OP_MEMORY)
+	{
+		struct ca_stack_var* sval;
+		address_t addr = get_address(op);
+		// if the destination is a known local variable, print it out
+		if (is_stack_address(op) && (sval = get_stack_var(addr)) )
 		{
-			g_regs[op->reg.index].known = 0;
-			//g_regs[op->reg.index].sym = NULL;
-			//g_regs[op->reg.index].type = NULL;
-			if (!g_dis_silent)
-				dprintf("%s?", op->reg.name);
+			if (sval->sym_name)
+				*psymname = strdup(sval->sym_name);
+			*ptype = sval->type;
+		}
+		// The source is in the form of [base+offset]
+		else if (op->mem.base_reg.name && !op->mem.index_reg.name)
+		{
+			struct ca_reg_value* base_reg = g_reg_table.cur_regs[op->mem.base_reg.index];
+			struct win_type type = base_reg->type;
+			enum SymTagEnum tag = get_type_code(type, base_reg->value);
+			// operand should be a pointer type
+			if (type.mod_base && tag == SymTagPointerType)
+			{
+				int is_vptr = 0;
+				char namebuf[NAME_BUF_SZ];
+				address_t base_addr = base_reg->has_value ? base_reg->value : 0;
+				size_t    sym_sz = 0;
+				struct win_type field_type = get_struct_field_type_and_name(type, op->mem.disp.immediate, &base_addr, &sym_sz, namebuf, NAME_BUF_SZ);
+				if (field_type.mod_base)
+				{
+					if (pvptr)
+						*pvptr = is_vptr;
+					// type
+					//if (lea)
+					//	field_type = lookup_pointer_type(field_type);
+					*ptype = field_type;
+					// symbol name
+					if (psymname && base_reg->sym_name)
+					{
+						// new symbol is '&' + base_name + "->" + field_name + '\0'
+						size_t baselen = strlen(base_reg->sym_name);
+						size_t namelen = (lea ? 1 : 0) + baselen + 2 + strlen(namebuf) + 1;
+						char* cursor = (char*) malloc(namelen);
+						*psymname = cursor;
+						if (lea)
+							*cursor++ = '&';
+						strncpy(cursor, base_reg->sym_name, baselen);
+						cursor += baselen;
+						if (tag == SymTagPointerType)
+						{
+							*cursor++ = '-';
+							*cursor++ = '>';
+						}
+						else
+							*cursor++ = '.';
+						strcpy(cursor, namebuf);
+					}
+				}
+			}
 		}
 	}
-	/*else if (op->type == CA_OP_IMMEDIATE)
-	else if (op->type == CA_OP_MEMORY)*/
 }
 
 // return the operand's value, assuming it is known or can be computed
-static size_t get_value(struct ca_operand* op, disassemble_info *info)
+static size_t get_op_value(struct ca_operand* op, size_t op_size)
 {
 	size_t rs = 0;
 	unsigned int sz = sizeof(rs);
 
-	if (g_op_size > 0)
-		sz = g_op_size;
+	if (op_size > 0)
+		sz = op_size;
 
 	if (op->type == CA_OP_REGISTER)
 	{
 		size_t mask = (size_t)(-1);
 		mask = mask >> ((sz - 8) * 8);
-		rs = g_regs[op->reg.index].value & mask;
+		rs = g_reg_table.cur_regs[op->reg.index]->value & mask;
 	}
 	else if (op->type == CA_OP_IMMEDIATE)
 		rs = (size_t) op->immed.immediate;
 	else if (op->type == CA_OP_MEMORY)
 	{
-		ULONG64 mem_addr = get_address(op);
+		bfd_vma mem_addr = get_address(op);
 		if (g_ptr_bit == 32)
 			sz = 4;
-		(*info->read_memory_func)(mem_addr, (unsigned char*)&rs, sz, info);
+		read_memory_wrapper(NULL, mem_addr, (bfd_byte*)&rs, sz);
 	}
 	return rs;
 }
 
-/*// update the register context
-static int set_value_with_type(struct ca_operand* op, size_t val, struct symbol* sym, struct type* type)
+static void set_op_value(struct ca_operand* op, size_t val, CORE_ADDR pc)
 {
 	if (op->type == CA_OP_REGISTER)
 	{
-		if (g_regs[op->reg.index].saved)
-			g_regs[op->reg.index].saved_value = g_regs[op->reg.index].value;
-		g_regs[op->reg.index].value = val;
-		g_regs[op->reg.index].known = 1;
-		g_regs[op->reg.index].sym = sym;
-		g_regs[op->reg.index].type = type;
+		set_reg_value_at_pc(op->reg.index, val, pc);
 	}
-	return 1;
-}*/
-
-static int set_value(struct ca_operand* op, size_t val)
-{
-	if (op->type == CA_OP_REGISTER)
-	{
-		if (g_regs[op->reg.index].saved)
-			g_regs[op->reg.index].saved_value = g_regs[op->reg.index].value;
-		g_regs[op->reg.index].value = val;
-		g_regs[op->reg.index].known = 1;
-		//g_regs[op->reg.index].sym = NULL;
-		//g_regs[op->reg.index].type = NULL;
-	}
-	/*else if (op->type == CA_OP_IMMEDIATE)
-		return 0;
-	else if (op->type == CA_OP_MEMORY)
+	/*else if (op->type == CA_OP_MEMORY)
 	{
 		// remember values of local (stack) variables ?
 	}*/
-	return 1;
 }
 
-static void print_one_operand(struct ca_operand* op, disassemble_info *info, CA_BOOL printval)
+// mark the operand is unknown from now on
+static void set_op_unknown(struct ca_operand* op, CORE_ADDR pc)
 {
-	if (g_dis_silent)
-		return;
-
 	if (op->type == CA_OP_REGISTER)
 	{
-		dprintf("%s", op->reg.name);
+		set_reg_unknown_at_pc(op->reg.index, pc);
+	}
+	/*else if (op->type == CA_OP_MEMORY)*/
+}
+
+/*
+ * The most common instruction of all is the "mov" family
+ * This function handles the propagation of value/symbol/type for src to dst
+ */
+static void
+process_mov_insn(struct ca_dis_insn* insn,
+				struct ca_operand* dst_op,
+				struct ca_operand* src_op)
+{
+	size_t val = 0;
+	size_t op_size = insn->op_size;
+	int has_value = 0;
+	int is_stack = 0;
+
+	if (dst_op->type == CA_OP_MEMORY && is_stack_address(dst_op))
+		is_stack = 1;
+
+	// Value propagation rules
+	if (insn->lea)
+	{
+		val = get_address(src_op);
+		if (val)
+			has_value = 1;
+	}
+	else if (src_op->type == CA_OP_IMMEDIATE
+		|| (src_op->type == CA_OP_MEMORY && known_op_value(src_op)))
+	{
+		// source is an immediate or readable memory
+		val = get_op_value(src_op, op_size);
+		has_value = 1;
+	}
+	else if (is_stack)
+	{
+		// destination is readable stack memory
+		val = get_op_value(dst_op, op_size);
+		has_value = 1;
+		// source operand deduced from destination
+		// this should be true for x86 arch since dst is memory type
+		if (src_op->type == CA_OP_REGISTER)
+			set_cur_reg_value(src_op->reg.index, val);
+	}
+	else if (known_op_value(src_op))
+	{
+		// source is known register
+		val = get_op_value(src_op, op_size);
+		has_value = 1;
+	}
+	else if (dst_op->type == CA_OP_MEMORY && known_op_value(dst_op))
+	{
+		// destination is readable non-stack memory
+		val = get_op_value(dst_op, op_size);
+		has_value = 1;
+		// this should be true for x86 arch since dst is memory type
+		if (src_op->type == CA_OP_REGISTER)
+			set_cur_reg_value(src_op->reg.index, val);
+	}
+
+	set_op_value_symbol_type(insn, src_op, dst_op, has_value, val);
+}
+
+static void
+set_op_value_symbol_type(struct ca_dis_insn* insn,
+		struct ca_operand* sym_op,
+		struct ca_operand* dst_op,
+		int has_value,
+		size_t val)
+{
+	char* sym_name = NULL;
+	struct win_type type = {0, 0};
+	int is_vptr = 0;
+
+	// source symbol/type
+	get_op_symbol_type(sym_op, insn->lea, &sym_name, &type, &is_vptr);
+	// Record the information transfered from source to destination
+	set_dst_op(insn, dst_op, has_value, val, sym_name, type, is_vptr);
+
+	// free symbol string if any
+	if (sym_name)
+		free (sym_name);
+}
+
+static void process_unary_op_insn(struct ca_dis_insn* insn,
+		struct ca_operand* dst_op, enum CA_OPERATOR op)
+{
+	size_t val = 0;
+	int op_size = insn->op_size;
+	size_t mask = (size_t)(-1);
+	int has_value = 0;
+
+	if (op_size > 0)
+		mask = mask >> ((8 - op_size) * 8);
+
+	if (known_op_value(dst_op))
+	{
+		insn->annotate = 1;
+		switch (op)
+		{
+		case INCREMENT:
+			val = get_op_value(dst_op, op_size) + 1;
+			break;
+		case DECREMENT:
+			val = get_op_value(dst_op, op_size) - 1;
+			break;
+		case BITWISE_NOT:
+			val = ~get_op_value(dst_op, op_size);
+			break;
+		default:
+			break;
+		}
+		val &= mask;
+		has_value = 1;
+	}
+
+	set_op_value_symbol_type(insn, dst_op, dst_op, has_value, val);
+}
+
+/*
+ * Common binary operation are: "+,-,*,/", i.e. "dst op src => dst"
+ */
+static void
+process_binary_op_insn(struct ca_dis_insn* insn,
+						struct ca_operand* dst_op,
+						struct ca_operand* src_op,
+						enum CA_OPERATOR op)
+{
+	size_t val = 0;
+	int op_size = insn->op_size;
+	size_t mask = (size_t)(-1);
+	int has_value = 0;
+	struct ca_reg_value* dst_reg = NULL;
+	char* sym_name = NULL;
+	struct win_type type = {0, 0};
+	int is_vptr = 0;
+
+	if (dst_op->type == CA_OP_REGISTER)
+		dst_reg = g_reg_table.cur_regs[dst_op->reg.index];
+
+	if (op_size > 0)
+		mask = mask >> ((8 - op_size) * 8);
+
+	// value can be computed only both operands are known
+	if (known_op_value(src_op) && known_op_value(dst_op))
+	{
+		size_t dst_val = get_op_value(dst_op, op_size) & mask;
+		size_t src_val = get_op_value(src_op, op_size) & mask;
+		has_value = 1;
+		switch(op)
+		{
+		case ADD:
+			val = dst_val + src_val;
+			break;
+		case SUBTRACT:
+			val = dst_val - src_val;
+			break;
+		case MULTIPLY:
+			val = dst_val * src_val;
+			break;
+		case DIVIDE:
+			val = dst_val / src_val;
+			break;
+		case BITWISE_AND:
+			val = dst_val & src_val;
+			break;
+		case BITWISE_OR:
+			val = dst_val | src_val;
+			break;
+		case BITWISE_XOR:
+			val = dst_val ^ src_val;
+			break;
+		case BITWISE_SHIFT_RIGHT:
+			val = dst_val >> src_val;
+			break;
+		case BITWISE_SHIFT_LEFT:
+			val = dst_val << src_val;
+			break;
+		case ROTATE_LEFT:
+		case ROTATE_RIGHT:
+			val = bit_rotate (dst_val, src_val, op, op_size);
+			break;
+		default:	// we shouldn't be here
+			break;
+		}
+		val &= mask;
+	}
+
+	// Special cases
+	if (dst_reg && dst_reg->type.mod_base)	// dst is a register with known type
+	{
+		if (op == ADD && src_op->type == CA_OP_IMMEDIATE)
+		{
+			// A pointer to an object is added with a fixed offset, e.g. "add 0x20, %rdi"
+			// this is equivalent to "lea 0x20(%rdi), %rdi"
+			struct ca_operand my_src;
+			my_src.type = CA_OP_MEMORY;
+			my_src.mem.base_reg.index = dst_op->reg.index;
+			my_src.mem.base_reg.name  = dst_op->reg.name;
+			my_src.mem.base_reg.size  = dst_op->reg.size;
+			my_src.mem.disp.immediate = src_op->immed.immediate;
+			my_src.mem.index_reg.name = NULL;
+			my_src.mem.scale = 0;
+			get_op_symbol_type(&my_src, 1, &sym_name, &type, NULL);
+		}
+		else
+			type = dst_reg->type;
+	}
+
+	// Set value/symbol/type
+	set_dst_op(insn, dst_op, has_value, val, sym_name, type, is_vptr);
+
+	// free symbol string if any
+	if (sym_name)
+		free (sym_name);
+}
+
+static void set_dst_op(struct ca_dis_insn* insn, struct ca_operand* dst_op,
+		int has_value, size_t val, char* symname, struct win_type type, int is_vptr)
+{
+	if (has_value || symname || type.mod_base)
+	{
+		insn->annotate = 1;
+		if (dst_op->type == CA_OP_REGISTER)
+		{
+			struct ca_reg_value* dst_reg = get_new_reg(dst_op->reg.index);
+			dst_reg->has_value = has_value;
+			dst_reg->pc = insn->pc;
+			if (symname)
+				dst_reg->sym_name = strdup(symname);
+			dst_reg->type = type;
+			dst_reg->value = val;
+			dst_reg->vptr = is_vptr;
+		}
+		if (dst_op->type == CA_OP_MEMORY && is_stack_address(dst_op))
+		{
+			address_t saddr = get_address(dst_op);
+			set_stack_sym_type(symname, type, saddr);
+		}
+	}
+	else
+		set_op_unknown(dst_op, insn->pc);
+}
+
+/* Put DISP in BUF as signed hex number.  */
+static void print_displacement(char *buf, bfd_vma disp)
+{
+	bfd_signed_vma val = disp;
+	int j = 0;
+
+	if (val < 0)
+	{
+		buf[j++] = '-';
+		val = -val;
+	}
+	snprintf(buf + j, 30, PRINT_FORMAT_LONG_OFFSET, (bfd_vma) val);
+}
+
+static void print_one_operand(struct ui_out* uiout, struct ca_operand* op, size_t op_size)
+{
+	char dispbuf[32];
+	if (op->type == CA_OP_REGISTER)
+	{
+		ui_out_text(uiout, op->reg.name);
 	}
 	else if (op->type == CA_OP_IMMEDIATE)
 	{
-		print_displacement(scratchbuf, op->immed.immediate);
-		dprintf("%s", scratchbuf);
+		print_displacement(dispbuf, op->immed.immediate);
+		ui_out_text(uiout, dispbuf);
 	}
 	else if (op->type == CA_OP_MEMORY)
 	{
 		int need_addition_sign = 0;
-		dprintf("%s", "[");
+		ui_out_text(uiout, "[");
 		if (op->mem.base_reg.name)
 		{
-			dprintf("%s", op->mem.base_reg.name);
+			ui_out_text(uiout,  op->mem.base_reg.name);
 			need_addition_sign = 1;
 		}
 		if (op->mem.index_reg.name)
 		{
 			if (need_addition_sign)
-				dprintf("%s", "+");
+				ui_out_text(uiout, "+");
 			need_addition_sign = 1;
-			dprintf("%s*%d", op->mem.index_reg.name, 1 << op->mem.scale);
+			ui_out_message(uiout, 0, "%s*%d", op->mem.index_reg.name, 1 << op->mem.scale);
 		}
 		if (op->mem.disp.immediate != 0)
 		{
-			print_displacement(scratchbuf, op->mem.disp.immediate);
-			if ((LONG64)op->mem.disp.immediate > 0)
-				dprintf("%s", "+");
-			dprintf("%s", scratchbuf);
+			print_displacement(dispbuf, op->mem.disp.immediate);
+			if ((bfd_signed_vma)op->mem.disp.immediate > 0)
+				ui_out_text(uiout, "+");
+			ui_out_text(uiout, dispbuf);
 		}
-		dprintf("%s", "]");
-	}
-	// print operand's value
-	if (printval && op->type != CA_OP_IMMEDIATE && known_value(op, info))
-	{
-		size_t val = get_value(op, info);
-		dprintf("(0x%I64x)", val);
+		ui_out_text(uiout, "]");
 	}
 }
 
-enum rotate_direction
-{
-	ROTATE_RIGHT,
-	ROTATE_LEFT
-};
-
-static size_t rotate(size_t val, size_t nbits, enum rotate_direction dir, int size)
+static size_t bit_rotate(size_t val, size_t nbits, enum CA_OPERATOR dir, int size)
 {
 	int bits_travel = size * 8 - 1;
 	for(; nbits > 0; nbits--)
@@ -7553,4711 +1863,21 @@ static size_t rotate(size_t val, size_t nbits, enum rotate_direction dir, int si
 	return val;
 }
 
-static int print_insn(ULONG64 pc, disassemble_info *info) {
-	const struct dis386 *dp;
-	int i;
-	char *op_txt[MAX_OPERANDS];
-	int needcomma;
-	int sizeflag;
-	const char *p;
-	struct dis_private priv;
-	int prefix_length;
-	int default_prefixes;
-	int num_op, inexcutable=0, twobyte_opcode=0, annotated=0;
-	unsigned char opcode_val=0xff;
-	int ptr_bit = g_ptr_bit;
-	size_t ptr_sz = ptr_bit >> 3;
-
-	if (ptr_bit == 64)
-		address_mode = mode_64bit;
-	else
-		address_mode = mode_32bit;
-
-	/*if (info->mach == bfd_mach_i386_i386 || info->mach == bfd_mach_x86_64
-			|| info->mach == bfd_mach_x64_32 || info->mach == bfd_mach_l1om
-			|| info->mach == bfd_mach_i386_i386_intel_syntax
-			|| info->mach == bfd_mach_x86_64_intel_syntax
-			|| info->mach == bfd_mach_x64_32_intel_syntax
-			|| info->mach == bfd_mach_l1om_intel_syntax)
-		priv.orig_sizeflag = AFLAG | DFLAG;
-	else if (info->mach == bfd_mach_i386_i8086)
-		priv.orig_sizeflag = 0;
-	else
-		abort();*/
-	priv.orig_sizeflag = AFLAG | DFLAG;
-
-	for (p = info->disassembler_options; p != NULL;) {
-		if (CONST_STRNEQ (p, "x86-64")) {
-			address_mode = mode_64bit;
-			priv.orig_sizeflag = AFLAG | DFLAG;
-		} else if (CONST_STRNEQ (p, "i386")) {
-			address_mode = mode_32bit;
-			priv.orig_sizeflag = AFLAG | DFLAG;
-		} else if (CONST_STRNEQ (p, "i8086")) {
-			address_mode = mode_16bit;
-			priv.orig_sizeflag = 0;
-		} else if (CONST_STRNEQ (p, "intel")) {
-			intel_syntax = 1;
-			if (CONST_STRNEQ (p + 5, "-mnemonic"))
-				intel_mnemonic = 1;
-		} else if (CONST_STRNEQ (p, "att")) {
-			intel_syntax = 0;
-			if (CONST_STRNEQ (p + 3, "-mnemonic"))
-				intel_mnemonic = 0;
-		} else if (CONST_STRNEQ (p, "addr")) {
-			if (address_mode == mode_64bit) {
-				if (p[4] == '3' && p[5] == '2')
-					priv.orig_sizeflag &= ~AFLAG;
-				else if (p[4] == '6' && p[5] == '4')
-					priv.orig_sizeflag |= AFLAG;
-			} else {
-				if (p[4] == '1' && p[5] == '6')
-					priv.orig_sizeflag &= ~AFLAG;
-				else if (p[4] == '3' && p[5] == '2')
-					priv.orig_sizeflag |= AFLAG;
-			}
-		} else if (CONST_STRNEQ (p, "data")) {
-			if (p[4] == '1' && p[5] == '6')
-				priv.orig_sizeflag &= ~DFLAG;
-			else if (p[4] == '3' && p[5] == '2')
-				priv.orig_sizeflag |= DFLAG;
-		} else if (CONST_STRNEQ (p, "suffix"))
-			priv.orig_sizeflag |= SUFFIX_ALWAYS;
-
-		p = strchr(p, ',');
-		if (p != NULL)
-			p++;
-	}
-
-	if (intel_syntax) {
-		names64 = intel_names64;
-		names32 = intel_names32;
-		names16 = intel_names16;
-		names8 = intel_names8;
-		names8rex = intel_names8rex;
-		names_seg = intel_names_seg;
-		names_mm = intel_names_mm;
-		names_xmm = intel_names_xmm;
-		names_ymm = intel_names_ymm;
-		index64 = intel_index64;
-		index32 = intel_index32;
-		index16 = intel_index16;
-		open_char = '[';
-		close_char = ']';
-		separator_char = '+';
-		scale_char = '*';
-	} else {
-		names64 = att_names64;
-		names32 = att_names32;
-		names16 = att_names16;
-		names8 = att_names8;
-		names8rex = att_names8rex;
-		names_seg = att_names_seg;
-		names_mm = att_names_mm;
-		names_xmm = att_names_xmm;
-		names_ymm = att_names_ymm;
-		index64 = att_index64;
-		index32 = att_index32;
-		index16 = att_index16;
-		open_char = '(';
-		close_char = ')';
-		separator_char = ',';
-		scale_char = ',';
-	}
-
-	info->bytes_per_line = 7;
-
-	info->private_data = &priv;
-	priv.max_fetched = priv.the_buffer;
-	priv.insn_start = pc;
-
-	obuf[0] = 0;
-	for (i = 0; i < MAX_OPERANDS; ++i) {
-		op_out[i][0] = 0;
-		op_index[i] = -1;
-	}
-
-	the_info = info;
-	start_pc = pc;
-	start_codep = priv.the_buffer;
-	codep = priv.the_buffer;
-
-	if (setjmp(priv.bailout) != 0) {
-		const char *name;
-
-		/* Getting here means we tried for data but didn't get it.  That
-		 means we have an incomplete instruction of some sort.  Just
-		 print the first byte as a prefix or a .byte pseudo-op.  */
-		if (codep > priv.the_buffer) {
-			name = prefix_name(priv.the_buffer[0], priv.orig_sizeflag);
-			if (name != NULL)
-				dprintf("%s", name);
-			else {
-				/* Just print the first byte as a .byte instruction.  */
-				dprintf(".byte 0x%x",
-						(unsigned int) priv.the_buffer[0]);
-			}
-
-			return 1;
-		}
-
-		return -1;
-	}
-
-	obufp = obuf;
-	sizeflag = priv.orig_sizeflag;
-
-	if (!ckprefix() || rex_used) {
-		/* Too many prefixes or unused REX prefixes.  */
-		for (i = 0; all_prefixes[i] && i < (int) ARRAY_SIZE (all_prefixes); i++)
-			dprintf("%s",
-					prefix_name(all_prefixes[i], sizeflag));
-		return 1;
-	}
-
-	insn_codep = codep;
-
-	FETCH_DATA(info, codep + 1);
-	two_source_ops = (*codep == 0x62) || (*codep == 0xc8);
-
-	if (((prefixes & PREFIX_FWAIT) && ((*codep < 0xd8) || (*codep > 0xdf)))) {
-		dprintf("%s", "fwait");
-		return 1;
-	}
-
-	// myan
-	// remember the code value, one-byte or two-byte
-	if (*codep == 0x0f) {
-		unsigned char threebyte;
-		FETCH_DATA(info, codep + 2);
-		threebyte = *++codep;
-		twobyte_opcode = 1;
-		opcode_val = threebyte;
-		dp = &dis386_twobyte[threebyte];
-		need_modrm = twobyte_has_modrm[*codep];
-		codep++;
-	} else {
-		opcode_val = *codep;
-		dp = &dis386[*codep];
-		need_modrm = onebyte_has_modrm[*codep];
-		codep++;
-	}
-
-	if ((prefixes & PREFIX_REPZ))
-		used_prefixes |= PREFIX_REPZ;
-	if ((prefixes & PREFIX_REPNZ))
-		used_prefixes |= PREFIX_REPNZ;
-	if ((prefixes & PREFIX_LOCK))
-		used_prefixes |= PREFIX_LOCK;
-
-	default_prefixes = 0;
-	if (prefixes & PREFIX_ADDR) {
-		sizeflag ^= AFLAG;
-		if (dp->op[2].bytemode != loop_jcxz_mode || intel_syntax) {
-			if ((sizeflag & AFLAG) || address_mode == mode_64bit)
-				all_prefixes[last_addr_prefix] = ADDR32_PREFIX;
-			else
-				all_prefixes[last_addr_prefix] = ADDR16_PREFIX;
-			default_prefixes |= PREFIX_ADDR;
-		}
-	}
-
-	if ((prefixes & PREFIX_DATA)) {
-		sizeflag ^= DFLAG;
-		if (dp->op[2].bytemode == cond_jump_mode && dp->op[0].bytemode == v_mode
-				&& !intel_syntax) {
-			if (sizeflag & DFLAG)
-				all_prefixes[last_data_prefix] = DATA32_PREFIX;
-			else
-				all_prefixes[last_data_prefix] = DATA16_PREFIX;
-			default_prefixes |= PREFIX_DATA;
-		} else if (rex & REX_W) {
-			/* REX_W will override PREFIX_DATA.  */
-			default_prefixes |= PREFIX_DATA;
-		}
-	}
-
-	if (need_modrm) {
-		FETCH_DATA(info, codep + 1);
-		modrm.mod = (*codep >> 6) & 3;
-		modrm.reg = (*codep >> 3) & 7;
-		modrm.rm = *codep & 7;
-	}
-
-	need_vex = 0;
-	need_vex_reg = 0;
-	vex_w_done = 0;
-
-	/* myan */
-	// parse and collect all operands
-	g_num_operand = 0;
-	memset(g_operands, 0, sizeof(g_operands));
-	g_op_size = -1;
-
-	if (dp->name == NULL && dp->op[0].bytemode == FLOATCODE) {
-		get_sib(info);
-		dofloat(sizeflag);
-	} else {
-		dp = get_valid_dis386(dp, info);
-		if (dp != NULL && putop(dp->name, sizeflag) == 0) {
-			get_sib(info);
-			for (i = 0; i < MAX_OPERANDS; ++i) {
-				obufp = op_out[i];
-				op_ad = MAX_OPERANDS - 1 - i;
-				if (dp->op[i].rtn)
-					(*dp->op[i].rtn)(dp->op[i].bytemode, sizeflag);
-			}
-		}
-	}
-
-	/* See if any prefixes were not used.  If so, print the first one
-	 separately.  If we don't do this, we'll wind up printing an
-	 instruction stream which does not precisely correspond to the
-	 bytes we are disassembling.  */
-	if ((prefixes & ~(used_prefixes | default_prefixes)) != 0) {
-		for (i = 0; i < (int) ARRAY_SIZE (all_prefixes); i++)
-			if (all_prefixes[i]) {
-				const char *name;
-				name = prefix_name(all_prefixes[i], priv.orig_sizeflag);
-				if (name == NULL)
-					name = INTERNAL_DISASSEMBLER_ERROR;
-				dprintf("%s", name);
-				return 1;
-			}
-	}
-
-	/* Check if the REX prefix is used.  */
-	if (rex_ignored == 0 && (rex ^ rex_used) == 0)
-		all_prefixes[last_rex_prefix] = 0;
-
-	/* Check if the SEG prefix is used.  */
-	if ((prefixes
-			& (PREFIX_CS | PREFIX_SS | PREFIX_DS | PREFIX_ES | PREFIX_FS
-					| PREFIX_GS)) != 0
-			&& (used_prefixes & seg_prefix(all_prefixes[last_seg_prefix])) != 0)
-		all_prefixes[last_seg_prefix] = 0;
-
-	/* Check if the ADDR prefix is used.  */
-	if ((prefixes & PREFIX_ADDR) != 0 && (used_prefixes & PREFIX_ADDR) != 0)
-		all_prefixes[last_addr_prefix] = 0;
-
-	/* Check if the DATA prefix is used.  */
-	if ((prefixes & PREFIX_DATA) != 0 && (used_prefixes & PREFIX_DATA) != 0)
-		all_prefixes[last_data_prefix] = 0;
-
-	prefix_length = 0;
-	for (i = 0; i < (int) ARRAY_SIZE (all_prefixes); i++)
-		if (all_prefixes[i]) {
-			const char *name;
-			name = prefix_name(all_prefixes[i], sizeflag);
-			if (name == NULL)
-				abort();
-			prefix_length += strlen(name) + 1;
-			if (!g_dis_silent)
-				dprintf("%s ", name);
-			if (strncmp(name, "data", 4) == 0)
-				inexcutable = 1;
-		}
-
-	/* Check maximum code length.  */
-	if ((codep - start_codep) > MAX_CODE_LENGTH) {
-		dprintf("%s", "(bad)");
-		return MAX_CODE_LENGTH;
-	}
-
-	obufp = mnemonicendp;
-	for (i = strlen(obuf) + prefix_length; i < 6; i++)
-		oappend(" ");
-	oappend(" ");
-	if (!g_dis_silent)
-		dprintf("%s", obuf);
-
-	/* The enter and bound instructions are printed with operands in the same
-	 order as the intel book; everything else is printed in reverse order.  */
-	if (intel_syntax || two_source_ops) {
-		ULONG64 riprel;
-
-		for (i = 0; i < MAX_OPERANDS; ++i)
-			op_txt[i] = op_out[i];
-
-		for (i = 0; i < (MAX_OPERANDS >> 1); ++i) {
-			op_ad = op_index[i];
-			op_index[i] = op_index[MAX_OPERANDS - 1 - i];
-			op_index[MAX_OPERANDS - 1 - i] = op_ad;
-			riprel = op_riprel[i];
-			op_riprel[i] = op_riprel[MAX_OPERANDS - 1 - i];
-			op_riprel[MAX_OPERANDS - 1 - i] = riprel;
-		}
-	} else {
-		for (i = 0; i < MAX_OPERANDS; ++i)
-			op_txt[MAX_OPERANDS - 1 - i] = op_out[i];
-	}
-
-	if (!g_dis_silent)
-	{
-		needcomma = 0;
-		for (i = 0; i < MAX_OPERANDS; ++i)
-			if (*op_txt[i]) {
-				if (needcomma)
-					dprintf("%s", ",");
-				/*if (op_index[i] != -1 && !op_riprel[i])
-					(*info->print_address_func)((ULONG64) op_address[op_index[i]],
-							info);
-				else*/
-					dprintf("%s", op_txt[i]);
-				needcomma = 1;
-			}
-
-		for (i = 0; i < MAX_OPERANDS; i++)
-			if (op_index[i] != -1 && op_riprel[i]) {
-				dprintf("%s", "        # ");
-				(*info->print_address_func)(
-						(ULONG64) (start_pc + codep - start_codep
-								+ op_address[op_index[i]]), info);
-				break;
-			}
-	}
-
-	// myan
-	g_regs[RIP].value += codep - priv.the_buffer;	// update program counter
-
-	num_op = 0;
-	if (dp)
-	{
-		for (i = 0; i < MAX_OPERANDS; ++i) {
-			if (dp->op[i].rtn)
-				num_op++;
-		}
-	}
-
-	// ignore some instructions
-	// nop is alias to "xchg eax,eax"
-	if (dp->name == NULL && dp->op[0].bytemode == FLOATCODE)
-		inexcutable = 1;
-	else if (strncmp(dp->name, "xchg", 4) == 0
-		&& (g_num_operand == 0
-			|| (g_num_operand == 2 && g_operands[0].type == CA_OP_REGISTER && g_operands[1].type == CA_OP_REGISTER && g_operands[0].reg.index == RAX && g_operands[1].reg.index == RAX) ) )
-		inexcutable = 1;
-
-	annotated = 0;
-#define MAX_SPACING 32
-	if (!inexcutable)
-	{
-		int pos = 0;
-		int skip_verbose_print = 0;
-		// calc the current stream position
-		{
-			needcomma = 0;
-			for (i = 0; i < MAX_OPERANDS; ++i)
-				if (*op_txt[i]) {
-					if (needcomma)
-						pos++;
-					/*if (op_index[i] != -1 && !op_riprel[i])
-					{
-						// An absolute address, let gdb print it
-						skip_verbose_print = 1;
-						pos = MAX_SPACING;
-					}
-					else
-						pos += strlen(op_txt[i]);*/
-					pos += strlen(op_txt[i]);
-					needcomma = 1;
-				}
-
-			for (i = 0; i < MAX_OPERANDS; i++)
-				if (op_index[i] != -1 && op_riprel[i]) {
-					// A rip-relative address
-					pos = MAX_SPACING;
-					break;
-				}
-		}
-		if (num_op != g_num_operand)
-		{
-			if (ptr_bit == 64)
-				dprintf("  ## Internal error: %d operand is expected instead of %d", num_op, g_num_operand);
-			if (g_num_operand > 0)
-			{
-				if (!g_dis_silent)
-					dprintf("%s", "  ## ");
-				set_unknown(&g_operands[0], info);
-			}
-		}
-		else
-		{
-			size_t val;
-			int print_val = 0;
-			int op_size;
-			size_t mask = (size_t)(-1);
-			int offset = 0;
-			address_t location = 0;
-			int islea = 0;
-			struct ca_operand* dest_op = NULL;
-
-			// set operand size if the opcode tells
-			if (twobyte_opcode)
-				op_size = twobyte_size_map[opcode_val];
-			else
-				op_size = onebyte_size_map[opcode_val];
-			if (op_size)
-				g_op_size = op_size;
-			else
-			{
-				for (i=0; i<g_num_operand; i++)
-				{
-					if (g_operands[i].type == CA_OP_REGISTER)
-					{
-						// take the smallest register size of all operands
-						if (g_op_size < 0 || g_op_size > g_operands[i].reg.size)
-							g_op_size = g_operands[i].reg.size;
-					}
-				}
-			}
-			if (g_op_size > 0)
-				mask = mask >> ((g_op_size - 8) * 8);
-
-			if (!g_dis_silent)
-			{
-				for (i=pos; i<MAX_SPACING; i++)
-					dprintf("%s", " ");
-				dprintf("%s", " ## ");
-			}
-
-			// op_code
-			// roughly in the order of most popular to least likely
-			// 1st operand(g_operands[0]) is the destination (and source) for most instructions
-			if (strncmp(dp->name, "mov", 3) == 0
-					|| strncmp(dp->name, "cvt", 3) == 0)
-			{
-				// include
-				//   "movd"  move doubleword or quadword
-				//   "movnti" move non-temporal doubleword or quadword
-				//   "movs" "movs[b/w/d/q] move string
-				//   "movsx" move with sign-extension
-				//   "movsxd" move with sign-extend doubleword
-				//   "movzx" move with zero-extension
-
-				dest_op = &g_operands[0];
-				// value propagation rules
-				if (g_operands[1].type == CA_OP_IMMEDIATE
-					|| (g_operands[1].type == CA_OP_MEMORY && known_value(&g_operands[1], info)))
-				{
-					// source is an immediate or readable memory
-					get_location(&g_operands[1], &location, &offset);
-					print_val = 1;
-					val = get_value(&g_operands[1], info);
-					set_value (&g_operands[0], val);
-				}
-				else if (g_operands[0].type == CA_OP_MEMORY && known_stack_value(&g_operands[0], info))
-				{
-					// destination is readable stack memory
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-					set_value (&g_operands[1], val);	// source operand deduced from destination
-				}
-				else if (known_value(&g_operands[1], info))
-				{
-					// source is known register
-					print_val = 1;
-					val = get_value(&g_operands[1], info);
-					set_value (&g_operands[0], val);
-				}
-				else if (g_operands[0].type == CA_OP_MEMORY && known_value(&g_operands[0], info))
-				{
-					// destination is readable non-stack memory
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-					set_value (&g_operands[1], val);
-				}
-				else
-				{
-					// can't deduce the value moved into destination
-					set_unknown(&g_operands[0], info);
-				}
-			}
-			else if (strncmp(dp->name, "test", 4) == 0)
-			{
-				if (g_operands[0].type == CA_OP_REGISTER && g_operands[1].type == CA_OP_REGISTER
-					&& g_operands[0].reg.index == g_operands[1].reg.index)
-				{
-					// test zero
-					if (!g_dis_silent)
-					{
-						print_one_operand(&g_operands[1], info, CA_TRUE);
-						dprintf("%s", "==0");
-					}
-				}
-				else if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					if (!g_dis_silent)
-					{
-						print_one_operand(&g_operands[1], info, CA_TRUE);
-						dprintf("%s", "==");
-						print_one_operand(&g_operands[0], info, CA_TRUE);
-					}
-				}
-			}
-			else if (strncmp(dp->name, "cmp", 3) == 0)
-			{
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					if (!g_dis_silent)
-					{
-						print_one_operand(&g_operands[1], info, CA_TRUE);
-						dprintf("%s", "<=>");
-						print_one_operand(&g_operands[0], info, CA_TRUE);
-					}
-				}
-			}
-			else if (strncmp(dp->name, "leave", 5) == 0)
-			{
-				// this has to be before "lea" instr to avoid ambiguity
-				// it is equivelent to two instruction
-				//     mov rbp, rsp
-				//     pop rbp
-			}
-			else if (strncmp(dp->name, "lea", 3) == 0)
-			{
-				// load effective address
-				// source must be memory and destination must be register
-				islea = 1;
-				dest_op = &g_operands[0];
-				val = get_address(&g_operands[1]);
-				if (val)
-				{
-					print_val = 1;
-					get_location(&g_operands[1], &location, &offset);
-					set_value (&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "call", 4) == 0)
-			{
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-				// rax is used for return value most of the time
-				g_regs[RAX].known = 0;
-				// when the function returns, all volatile registers may have been changed
-				//
-				// In a second thought, even if the called function does chagne a volatile register,
-				// the code after the "call" should reload it before using it.
-				// The code following "call" instruction could be the destination of branch/jmp instruction,
-				// which skips "call". If we set all volatile regsiters unknown, we will lose them in that case.
-				/*g_regs[RCX].known = 0;
-				g_regs[RDX].known = 0;
-				g_regs[RSI].known = 0;
-				g_regs[RDI].known = 0;
-				g_regs[R8].known = 0;
-				g_regs[R9].known = 0;
-				g_regs[R10].known = 0;
-				g_regs[R11].known = 0;*/
-			}
-			else if (strncmp(dp->name, "jmp", 3) == 0
-					|| strncmp(dp->name, "jo", 2) == 0
-					|| strncmp(dp->name, "jno", 3) == 0
-					|| strncmp(dp->name, "jb", 2) == 0
-					|| strncmp(dp->name, "jae", 3) == 0
-					|| strncmp(dp->name, "je", 2) == 0
-					|| strncmp(dp->name, "jne", 3) == 0
-					|| strncmp(dp->name, "jbe", 3) == 0
-					|| strncmp(dp->name, "ja", 2) == 0
-					|| strncmp(dp->name, "js", 2) == 0
-					|| strncmp(dp->name, "jns", 3) == 0
-					|| strncmp(dp->name, "jp", 2) == 0
-					|| strncmp(dp->name, "jnp", 3) == 0
-					|| strncmp(dp->name, "jl", 2) == 0
-					|| strncmp(dp->name, "jge", 3) == 0
-					|| strncmp(dp->name, "jle", 3) == 0
-					|| strncmp(dp->name, "jg", 2) == 0)
-			{
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			}
-			else if (strncmp(dp->name, "push", 4) == 0)
-			{
-				if (g_operands[0].type == CA_OP_REGISTER)
-					dest_op = &g_operands[0];	// it is actually src, not dst.
-				g_regs[RSP].value -= ptr_sz;
-				val = 0;
-				(*info->read_memory_func)(g_regs[RSP].value, (unsigned char*)&val, ptr_sz, info);
-				set_value(&g_operands[0], val);
-				print_val = 1;
-			}
-			else if (strncmp(dp->name, "pop", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				val = 0;
-				(*info->read_memory_func)(g_regs[RSP].value, (unsigned char*)&val, ptr_sz, info);
-				set_value(&g_operands[0], val);
-				g_regs[RSP].value += ptr_sz;
-				print_val = 1;
-			}
-			else if (strncmp(dp->name, "cmov", 4) == 0)
-			{
-				// conditional move
-				set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "add", 3) == 0
-					|| strncmp(dp->name, "adc", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// value propagation
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[1], info) + get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (g_operands[0].type == CA_OP_MEMORY && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			}
-			else if (strncmp(dp->name, "sub", 3) == 0
-					|| strncmp(dp->name, "sbb", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// value propagation
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info) - get_value(&g_operands[1], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else if (g_operands[0].type == CA_OP_REGISTER && g_operands[1].type == CA_OP_REGISTER
-						&& g_operands[0].reg.index == g_operands[1].reg.index)
-				{
-					print_val = 1;
-					val = 0;
-					set_value(&g_operands[0], 0);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			}
-			else if (strncmp(dp->name, "inc", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// value propagation
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info) + 1;
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "dec", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// value propagation
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info) - 1;
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "imul", 4) == 0)
-			{
-				dest_op = &g_operands[0];
-				// value propagation
-				if (g_num_operand == 2 && known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[1], info) * get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else if (g_num_operand == 3 && known_value(&g_operands[1], info) && known_value(&g_operands[2], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[1], info) * get_value(&g_operands[2], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else if (g_num_operand == 1 && known_value(&g_operands[0], info) && g_regs[RAX].known)
-				{
-					// rax instead of g_operands[0] is the destination
-					//print_val = 1;
-					val = g_regs[RAX].value * get_value(&g_operands[0], info);
-					val &= mask;
-					g_regs[RAX].value = val;
-				}
-				else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			}
-			else if (strncmp(dp->name, "idiv", 4) == 0)
-			{
-				dest_op = &g_operands[0];
-				// value propagation
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[1], info) / get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-				// target may be memory value
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info);
-				}
-			}
-			else if (strncmp(dp->name, "and", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[1], info) & get_value(&g_operands[0], info);
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "or", 2) == 0)
-			{
-				dest_op = &g_operands[0];
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[1], info) | get_value(&g_operands[0], info);
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "not", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				if (known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = ~get_value(&g_operands[0], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "xor", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[1], info) ^ get_value(&g_operands[0], info);
-					set_value(&g_operands[0], val);
-				}
-				else if (g_operands[0].type == CA_OP_REGISTER && g_operands[1].type == CA_OP_REGISTER
-					&& g_operands[0].reg.index == g_operands[1].reg.index)
-				{
-					print_val = 1;
-					val = 0;
-					set_value(&g_operands[0], 0);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "shr", 3) == 0
-					|| strncmp(dp->name, "sar", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// shift right
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info) >> get_value(&g_operands[1], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "shl", 3) == 0
-					|| strncmp(dp->name, "sal", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// shift left
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = get_value(&g_operands[0], info) << get_value(&g_operands[1], info);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "rol", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// rotate left
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = rotate (get_value(&g_operands[0], info), get_value(&g_operands[1], info), ROTATE_LEFT, g_op_size);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "ror", 3) == 0)
-			{
-				dest_op = &g_operands[0];
-				// rotate right
-				if (known_value(&g_operands[1], info) && known_value(&g_operands[0], info))
-				{
-					print_val = 1;
-					val = rotate(get_value(&g_operands[0], info), get_value(&g_operands[1], info), ROTATE_RIGHT, g_op_size);
-					val &= mask;
-					set_value(&g_operands[0], val);
-				}
-				else
-					set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "rcl", 3) == 0
-					|| strncmp(dp->name, "rcr", 3) == 0)
-			{
-				// rotate through carry left/right
-				set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "set", 3) == 0)
-			{
-				// conditional set instruction
-				if (g_operands[0].type == CA_OP_MEMORY && known_value(&g_operands[0], info))
-				{
-					val = get_value(&g_operands[0], info);
-					print_val = 1;
-				}
-				set_unknown(&g_operands[0], info);
-			}
-			else if (strncmp(dp->name, "ret", 3) == 0)
-			{
-				int my_regno;
-				// in case the "ret" instruction is not the last instrunction of the function
-				// or there are multiple exits, we need to roll back saved registers popped by epilogue
-				for (my_regno = 0; my_regno < TOTAL_REGS; my_regno++)
-				{
-					if (my_regno != RIP && g_regs[my_regno].saved)
-						g_regs[my_regno].value = g_regs[my_regno].saved_value;
-				}
-				g_regs[RAX].known = 0;	// return register is likely set to something
-			}
-			else if (strncmp(dp->name, "enter", 5) == 0)
-			{
-				// it is equivelent to three instructions
-				//     push rbp
-				//     mov rbp, rsp
-				//     sub nbytes, rsp
-				if (g_operands[0].type == CA_OP_IMMEDIATE)
-				{
-					val = get_value(&g_operands[0], info);
-					g_regs[RSP].value -= val;
-				}
-				else
-					dprintf("%s", "internal error: unexpected operand");
-			}
-
-			// annotation of object context
-			if (print_val && !skip_verbose_print && !g_dis_silent)
-			{
-				annotated = 1;
-				if (dest_op)
-				{
-					print_one_operand(dest_op, info, CA_FALSE);	// destination
-					if (g_operands[0].type == CA_OP_MEMORY)
-					{
-						// if the destination is a known local variable, print it out
-						address_t addr = get_address(&g_operands[0]);
-						struct object_reference aref;
-						memset(&aref, 0, sizeof(aref));
-						aref.vaddr = addr;
-						aref.value = 0;
-						aref.target_index = -1;
-						fill_ref_location(&aref);
-						if (aref.storage_type == ENUM_STACK && known_stack_sym(&aref, NULL, NULL))
-						{
-							dprintf("%s", "(");
-							print_stack_ref(&aref);
-							dprintf("%s", ")");
-						}
-					}
-					dprintf("=0x%I64x", val);
-				}
-				if (dest_op && dest_op->type == CA_OP_REGISTER
-					&& dest_op->reg.index == RSP
-					&& strncmp(dp->name, "sub", 3) == 0)
-					dprintf("%s", " End of function prologue\n");
-				else
-					print_op_value_context (val, g_op_size > 0 ? g_op_size : ptr_sz, location, offset, islea);
-			}
-		}
-	}
-	if (!annotated && !g_dis_silent)
-		dprintf("%s", "\n");
-
-	return codep - priv.the_buffer;
-}
-
-static const char *float_mem[] = {
-/* d8 */
-"fadd{s|}", "fmul{s|}", "fcom{s|}", "fcomp{s|}", "fsub{s|}", "fsubr{s|}",
-		"fdiv{s|}", "fdivr{s|}",
-		/* d9 */
-		"fld{s|}", "(bad)", "fst{s|}", "fstp{s|}", "fldenvIC", "fldcw",
-		"fNstenvIC", "fNstcw",
-		/* da */
-		"fiadd{l|}", "fimul{l|}", "ficom{l|}", "ficomp{l|}", "fisub{l|}",
-		"fisubr{l|}", "fidiv{l|}", "fidivr{l|}",
-		/* db */
-		"fild{l|}", "fisttp{l|}", "fist{l|}", "fistp{l|}", "(bad)",
-		"fld{t||t|}", "(bad)", "fstp{t||t|}",
-		/* dc */
-		"fadd{l|}", "fmul{l|}", "fcom{l|}", "fcomp{l|}", "fsub{l|}",
-		"fsubr{l|}", "fdiv{l|}", "fdivr{l|}",
-		/* dd */
-		"fld{l|}", "fisttp{ll|}", "fst{l||}", "fstp{l|}", "frstorIC", "(bad)",
-		"fNsaveIC", "fNstsw",
-		/* de */
-		"fiadd", "fimul", "ficom", "ficomp", "fisub", "fisubr", "fidiv",
-		"fidivr",
-		/* df */
-		"fild", "fisttp", "fist", "fistp", "fbld", "fild{ll|}", "fbstp",
-		"fistp{ll|}", };
-
-static const unsigned char float_mem_mode[] = {
-/* d8 */
-d_mode, d_mode, d_mode, d_mode, d_mode, d_mode, d_mode, d_mode,
-/* d9 */
-d_mode, 0, d_mode, d_mode, 0, w_mode, 0, w_mode,
-/* da */
-d_mode, d_mode, d_mode, d_mode, d_mode, d_mode, d_mode, d_mode,
-/* db */
-d_mode, d_mode, d_mode, d_mode, 0, t_mode, 0, t_mode,
-/* dc */
-q_mode, q_mode, q_mode, q_mode, q_mode, q_mode, q_mode, q_mode,
-/* dd */
-q_mode, q_mode, q_mode, q_mode, 0, 0, 0, w_mode,
-/* de */
-w_mode, w_mode, w_mode, w_mode, w_mode, w_mode, w_mode, w_mode,
-/* df */
-w_mode, w_mode, w_mode, w_mode, t_mode, q_mode, t_mode, q_mode };
-
-#define ST { OP_ST, 0 }
-#define STi { OP_STi, 0 }
-
-#define FGRPd9_2 NULL, { { NULL, 0 } }
-#define FGRPd9_4 NULL, { { NULL, 1 } }
-#define FGRPd9_5 NULL, { { NULL, 2 } }
-#define FGRPd9_6 NULL, { { NULL, 3 } }
-#define FGRPd9_7 NULL, { { NULL, 4 } }
-#define FGRPda_5 NULL, { { NULL, 5 } }
-#define FGRPdb_4 NULL, { { NULL, 6 } }
-#define FGRPde_3 NULL, { { NULL, 7 } }
-#define FGRPdf_4 NULL, { { NULL, 8 } }
-
-static const struct dis386 float_reg[][8] = {
-/* d8 */
-{ { "fadd", { ST, STi } }, { "fmul", { ST, STi } }, { "fcom", { STi } }, {
-		"fcomp", { STi } }, { "fsub", { ST, STi } }, { "fsubr", { ST, STi } }, {
-		"fdiv", { ST, STi } }, { "fdivr", { ST, STi } }, },
-/* d9 */
-{ { "fld", { STi } }, { "fxch", { STi } }, { FGRPd9_2 }, { Bad_Opcode }, {
-		FGRPd9_4 }, { FGRPd9_5 }, { FGRPd9_6 }, { FGRPd9_7 }, },
-/* da */
-{ { "fcmovb", { ST, STi } }, { "fcmove", { ST, STi } },
-		{ "fcmovbe", { ST, STi } }, { "fcmovu", { ST, STi } }, { Bad_Opcode }, {
-				FGRPda_5 }, { Bad_Opcode }, { Bad_Opcode }, },
-/* db */
-{ { "fcmovnb", { ST, STi } }, { "fcmovne", { ST, STi } }, { "fcmovnbe", { ST,
-		STi } }, { "fcmovnu", { ST, STi } }, { FGRPdb_4 }, { "fucomi",
-		{ ST, STi } }, { "fcomi", { ST, STi } }, { Bad_Opcode }, },
-/* dc */
-{ { "fadd", { STi, ST } }, { "fmul", { STi, ST } }, { Bad_Opcode },
-		{ Bad_Opcode }, { "fsub!M", { STi, ST } }, { "fsubM", { STi, ST } }, {
-				"fdiv!M", { STi, ST } }, { "fdivM", { STi, ST } }, },
-/* dd */
-{ { "ffree", { STi } }, { Bad_Opcode }, { "fst", { STi } }, { "fstp", { STi } },
-		{ "fucom", { STi } }, { "fucomp", { STi } }, { Bad_Opcode }, {
-				Bad_Opcode }, },
-/* de */
-{ { "faddp", { STi, ST } }, { "fmulp", { STi, ST } }, { Bad_Opcode },
-		{ FGRPde_3 }, { "fsub!Mp", { STi, ST } }, { "fsubMp", { STi, ST } }, {
-				"fdiv!Mp", { STi, ST } }, { "fdivMp", { STi, ST } }, },
-/* df */
-{ { "ffreep", { STi } }, { Bad_Opcode }, { Bad_Opcode }, { Bad_Opcode }, {
-		FGRPdf_4 }, { "fucomip", { ST, STi } }, { "fcomip", { ST, STi } }, {
-		Bad_Opcode }, }, };
-
-static char *fgrps[][8] = {
-/* d9_2  0 */
-{ "fnop", "(bad)", "(bad)", "(bad)", "(bad)", "(bad)", "(bad)", "(bad)", },
-
-/* d9_4  1 */
-{ "fchs", "fabs", "(bad)", "(bad)", "ftst", "fxam", "(bad)", "(bad)", },
-
-/* d9_5  2 */
-{ "fld1", "fldl2t", "fldl2e", "fldpi", "fldlg2", "fldln2", "fldz", "(bad)", },
-
-		/* d9_6  3 */
-		{ "f2xm1", "fyl2x", "fptan", "fpatan", "fxtract", "fprem1", "fdecstp",
-				"fincstp", },
-
-		/* d9_7  4 */
-		{ "fprem", "fyl2xp1", "fsqrt", "fsincos", "frndint", "fscale", "fsin",
-				"fcos", },
-
-		/* da_5  5 */
-		{ "(bad)", "fucompp", "(bad)", "(bad)", "(bad)", "(bad)", "(bad)",
-				"(bad)", },
-
-		/* db_4  6 */
-		{ "fNeni(8087 only)", "fNdisi(8087 only)", "fNclex", "fNinit",
-				"fNsetpm(287 only)", "frstpm(287 only)", "(bad)", "(bad)", },
-
-		/* de_3  7 */
-		{ "(bad)", "fcompp", "(bad)", "(bad)", "(bad)", "(bad)", "(bad)",
-				"(bad)", },
-
-		/* df_4  8 */
-		{ "fNstsw", "(bad)", "(bad)", "(bad)", "(bad)", "(bad)", "(bad)",
-				"(bad)", }, };
-
-static void swap_operand(void) {
-	mnemonicendp[0] = '.';
-	mnemonicendp[1] = 's';
-	mnemonicendp += 2;
-}
-
-static void OP_Skip_MODRM(int bytemode,
-		int sizeflag) {
-	/* Skip mod/rm byte.  */
-	MODRM_CHECK;
-	codep++;
-}
-
-static void dofloat(int sizeflag) {
-	const struct dis386 *dp;
-	unsigned char floatop;
-
-	floatop = codep[-1];
-
-	if (modrm.mod != 3) {
-		int fp_indx = (floatop - 0xd8) * 8 + modrm.reg;
-
-		putop(float_mem[fp_indx], sizeflag);
-		obufp = op_out[0];
-		op_ad = 2;
-		OP_E(float_mem_mode[fp_indx], sizeflag);
-		return;
-	}
-	/* Skip mod/rm byte.  */MODRM_CHECK;
-	codep++;
-
-	dp = &float_reg[floatop - 0xd8][modrm.reg];
-	if (dp->name == NULL) {
-		putop(fgrps[dp->op[0].bytemode][modrm.rm], sizeflag);
-
-		/* Instruction fnstsw is only one with strange arg.  */
-		if (floatop == 0xdf && codep[-1] == 0xe0)
-			strcpy(op_out[0], names16[0]);
-	} else {
-		putop(dp->name, sizeflag);
-
-		obufp = op_out[0];
-		op_ad = 2;
-		if (dp->op[0].rtn)
-			(*dp->op[0].rtn)(dp->op[0].bytemode, sizeflag);
-
-		obufp = op_out[1];
-		op_ad = 1;
-		if (dp->op[1].rtn)
-			(*dp->op[1].rtn)(dp->op[1].bytemode, sizeflag);
-	}
-}
-
-static void OP_ST(int bytemode, int sizeflag) {
-	oappend("%st" + intel_syntax);
-}
-
-static void OP_STi(int bytemode, int sizeflag) {
-	sprintf(scratchbuf, "%%st(%d)", modrm.rm);
-	oappend(scratchbuf + intel_syntax);
-}
-
-/* Capital letters in template are macros.  */
-static int putop(const char *in_template, int sizeflag) {
-	const char *p;
-	int alt = 0;
-	int cond = 1;
-	unsigned int l = 0, len = 1;
-	char last[4];
-
-#define SAVE_LAST(c)			\
-  if (l < len && l < sizeof (last))	\
-    last[l++] = c;			\
-  else					\
-    abort ();
-
-	for (p = in_template; *p; p++) {
-		switch (*p) {
-		default:
-			*obufp++ = *p;
-			break;
-		case '%':
-			len++;
-			break;
-		case '!':
-			cond = 0;
-			break;
-		case '{':
-			alt = 0;
-			if (intel_syntax) {
-				while (*++p != '|')
-					if (*p == '}' || *p == '\0')
-						abort();
-			}
-			/* Fall through.  */
-		case 'I':
-			alt = 1;
-			continue;
-		case '|':
-			while (*++p != '}') {
-				if (*p == '\0')
-					abort();
-			}
-			break;
-		case '}':
-			break;
-		case 'A':
-			if (intel_syntax)
-				break;
-			if (modrm.mod != 3 || (sizeflag & SUFFIX_ALWAYS))
-			{
-				*obufp++ = 'b';
-				g_op_size = 1;
-			}
-			break;
-		case 'B':
-			if (l == 0 && len == 1) {
-				case_B: if (intel_syntax)
-					break;
-				if (sizeflag & SUFFIX_ALWAYS)
-				{
-					*obufp++ = 'b';
-					g_op_size = 1;
-				}
-			} else {
-				if (l != 1 || len != 2 || last[0] != 'L') {
-					SAVE_LAST(*p);
-					break;
-				}
-
-				if (address_mode == mode_64bit && !(prefixes & PREFIX_ADDR)) {
-					*obufp++ = 'a';
-					*obufp++ = 'b';
-					*obufp++ = 's';
-				}
-
-				goto case_B;
-			}
-			break;
-		case 'C':
-			if (intel_syntax && !alt)
-				break;
-			if ((prefixes & PREFIX_DATA) || (sizeflag & SUFFIX_ALWAYS)) {
-				if (sizeflag & DFLAG)
-				{
-					*obufp++ = intel_syntax ? 'd' : 'l';
-					g_op_size = 4;
-				}
-				else
-					*obufp++ = intel_syntax ? 'w' : 's';
-				used_prefixes |= (prefixes & PREFIX_DATA);
-			}
-			break;
-		case 'D':
-			if (intel_syntax || !(sizeflag & SUFFIX_ALWAYS))
-				break;
-			USED_REX(REX_W);
-			if (modrm.mod == 3) {
-				if (rex & REX_W)
-				{
-					*obufp++ = 'q';
-					g_op_size = 8;
-				}
-				else {
-					if (sizeflag & DFLAG)
-					{
-						*obufp++ = intel_syntax ? 'd' : 'l';
-						g_op_size = 4;
-					}
-					else
-						*obufp++ = 'w';
-					used_prefixes |= (prefixes & PREFIX_DATA);
-				}
-			} else
-				*obufp++ = 'w';
-			break;
-		case 'E': /* For jcxz/jecxz */
-			if (address_mode == mode_64bit) {
-				if (sizeflag & AFLAG)
-					*obufp++ = 'r';
-				else
-					*obufp++ = 'e';
-			} else if (sizeflag & AFLAG)
-				*obufp++ = 'e';
-			used_prefixes |= (prefixes & PREFIX_ADDR);
-			break;
-		case 'F':
-			if (intel_syntax)
-				break;
-			if ((prefixes & PREFIX_ADDR) || (sizeflag & SUFFIX_ALWAYS)) {
-				if (sizeflag & AFLAG)
-					*obufp++ = address_mode == mode_64bit ? 'q' : 'l';
-				else
-					*obufp++ = address_mode == mode_64bit ? 'l' : 'w';
-				used_prefixes |= (prefixes & PREFIX_ADDR);
-			}
-			break;
-		case 'G':
-			if (intel_syntax
-					|| (obufp[-1] != 's' && !(sizeflag & SUFFIX_ALWAYS)))
-				break;
-			if ((rex & REX_W) || (sizeflag & DFLAG))
-				*obufp++ = 'l';
-			else
-				*obufp++ = 'w';
-			if (!(rex & REX_W))
-				used_prefixes |= (prefixes & PREFIX_DATA);
-			break;
-		case 'H':
-			if (intel_syntax)
-				break;
-			if ((prefixes & (PREFIX_CS | PREFIX_DS)) == PREFIX_CS
-					|| (prefixes & (PREFIX_CS | PREFIX_DS)) == PREFIX_DS) {
-				used_prefixes |= prefixes & (PREFIX_CS | PREFIX_DS);
-				*obufp++ = ',';
-				*obufp++ = 'p';
-				if (prefixes & PREFIX_DS)
-					*obufp++ = 't';
-				else
-					*obufp++ = 'n';
-			}
-			break;
-		case 'J':
-			if (intel_syntax)
-				break;
-			*obufp++ = 'l';
-			break;
-		case 'K':
-			USED_REX(REX_W);
-			if (rex & REX_W)
-			{
-				*obufp++ = 'q';
-				g_op_size = 8;
-			}
-			else
-			{
-				*obufp++ = 'd';
-				g_op_size = 4;
-			}
-			break;
-		case 'Z':
-			if (intel_syntax)
-				break;
-			if (address_mode == mode_64bit && (sizeflag & SUFFIX_ALWAYS)) {
-				*obufp++ = 'q';
-				g_op_size = 8;
-				break;
-			}
-			/* Fall through.  */
-			goto case_L;
-		case 'L':
-			if (l != 0 || len != 1) {
-				SAVE_LAST(*p);
-				break;
-			}
-			case_L: if (intel_syntax)
-				break;
-			if (sizeflag & SUFFIX_ALWAYS)
-				*obufp++ = 'l';
-			break;
-		case 'M':
-			if (intel_mnemonic != cond)
-				*obufp++ = 'r';
-			break;
-		case 'N':
-			if ((prefixes & PREFIX_FWAIT) == 0)
-				*obufp++ = 'n';
-			else
-				used_prefixes |= PREFIX_FWAIT;
-			break;
-		case 'O':
-			USED_REX(REX_W);
-			if (rex & REX_W)
-				*obufp++ = 'o';
-			else if (intel_syntax && (sizeflag & DFLAG))
-			{
-				*obufp++ = 'q';
-				g_op_size = 8;
-			}
-			else
-			{
-				*obufp++ = 'd';
-				g_op_size = 2;
-			}
-			if (!(rex & REX_W))
-				used_prefixes |= (prefixes & PREFIX_DATA);
-			break;
-		case 'T':
-			if (!intel_syntax && address_mode == mode_64bit
-					&& (sizeflag & DFLAG)) {
-				*obufp++ = 'q';
-				g_op_size = 8;
-				break;
-			}
-			/* Fall through.  */
-		case 'P':
-			if (intel_syntax) {
-				if ((rex & REX_W) == 0 && (prefixes & PREFIX_DATA)) {
-					if ((sizeflag & DFLAG) == 0)
-					{
-						*obufp++ = 'w';
-						g_op_size = 2;
-					}
-					used_prefixes |= (prefixes & PREFIX_DATA);
-				}
-				break;
-			}
-			if ((prefixes & PREFIX_DATA) || (rex & REX_W)
-					|| (sizeflag & SUFFIX_ALWAYS)) {
-				USED_REX(REX_W);
-				if (rex & REX_W)
-				{
-					*obufp++ = 'q';
-					g_op_size = 8;
-				}
-				else {
-					if (sizeflag & DFLAG)
-					{
-						*obufp++ = 'l';
-						g_op_size = 4;
-					}
-					else
-					{
-						*obufp++ = 'w';
-						g_op_size = 2;
-					}
-					used_prefixes |= (prefixes & PREFIX_DATA);
-				}
-			}
-			break;
-		case 'U':
-			if (intel_syntax)
-				break;
-			if (address_mode == mode_64bit && (sizeflag & DFLAG)) {
-				if (modrm.mod != 3 || (sizeflag & SUFFIX_ALWAYS))
-				{
-					*obufp++ = 'q';
-					g_op_size = 8;
-				}
-				break;
-			}
-			/* Fall through.  */
-			goto case_Q;
-		case 'Q':
-			if (l == 0 && len == 1) {
-				case_Q: if (intel_syntax && !alt)
-					break;USED_REX(REX_W);
-				if (modrm.mod != 3 || (sizeflag & SUFFIX_ALWAYS)) {
-					if (rex & REX_W)
-					{
-						*obufp++ = 'q';
-						g_op_size = 8;
-					}
-					else {
-						if (sizeflag & DFLAG)
-						{
-							*obufp++ = intel_syntax ? 'd' : 'l';
-							g_op_size = 4;
-						}
-						else
-						{
-							*obufp++ = 'w';
-							g_op_size = 2;
-						}
-						used_prefixes |= (prefixes & PREFIX_DATA);
-					}
-				}
-			} else {
-				if (l != 1 || len != 2 || last[0] != 'L') {
-					SAVE_LAST(*p);
-					break;
-				}
-				if (intel_syntax
-						|| (modrm.mod == 3 && !(sizeflag & SUFFIX_ALWAYS)))
-					break;
-				if ((rex & REX_W)) {
-					USED_REX(REX_W);
-					*obufp++ = 'q';
-					g_op_size = 8;
-				} else
-				{
-					*obufp++ = 'l';
-					g_op_size = 4;
-				}
-			}
-			break;
-		case 'R':
-			USED_REX(REX_W);
-			if (rex & REX_W)
-			{
-				*obufp++ = 'q';
-				g_op_size = 8;
-			}
-			else if (sizeflag & DFLAG) {
-				if (intel_syntax)
-					*obufp++ = 'd';
-				else
-					*obufp++ = 'l';
-				g_op_size = 4;
-			} else
-			{
-				*obufp++ = 'w';
-				g_op_size = 2;
-			}
-			if (intel_syntax && !p[1] && ((rex & REX_W) || (sizeflag & DFLAG)))
-				*obufp++ = 'e';
-			if (!(rex & REX_W))
-				used_prefixes |= (prefixes & PREFIX_DATA);
-			break;
-		case 'V':
-			if (l == 0 && len == 1) {
-				if (intel_syntax)
-					break;
-				if (address_mode == mode_64bit && (sizeflag & DFLAG)) {
-					if (sizeflag & SUFFIX_ALWAYS)
-					{
-						*obufp++ = 'q';
-						g_op_size = 8;
-					}
-					break;
-				}
-			} else {
-				if (l != 1 || len != 2 || last[0] != 'L') {
-					SAVE_LAST(*p);
-					break;
-				}
-
-				if (rex & REX_W) {
-					*obufp++ = 'a';
-					*obufp++ = 'b';
-					*obufp++ = 's';
-				}
-			}
-			/* Fall through.  */
-			goto case_S;
-		case 'S':
-			if (l == 0 && len == 1) {
-				case_S: if (intel_syntax)
-					break;
-				if (sizeflag & SUFFIX_ALWAYS) {
-					if (rex & REX_W)
-					{
-						*obufp++ = 'q';
-						g_op_size = 8;
-					}
-					else {
-						if (sizeflag & DFLAG)
-						{
-							*obufp++ = 'l';
-							g_op_size = 4;
-						}
-						else
-						{
-							*obufp++ = 'w';
-							g_op_size = 2;
-						}
-						used_prefixes |= (prefixes & PREFIX_DATA);
-					}
-				}
-			} else {
-				if (l != 1 || len != 2 || last[0] != 'L') {
-					SAVE_LAST(*p);
-					break;
-				}
-
-				if (address_mode == mode_64bit && !(prefixes & PREFIX_ADDR)) {
-					*obufp++ = 'a';
-					*obufp++ = 'b';
-					*obufp++ = 's';
-				}
-
-				goto case_S;
-			}
-			break;
-		case 'X':
-			if (l != 0 || len != 1) {
-				SAVE_LAST(*p);
-				break;
-			}
-			if (need_vex && vex.prefix) {
-				if (vex.prefix == DATA_PREFIX_OPCODE)
-					*obufp++ = 'd';
-				else
-					*obufp++ = 's';
-			} else {
-				if (prefixes & PREFIX_DATA)
-					*obufp++ = 'd';
-				else
-					*obufp++ = 's';
-				used_prefixes |= (prefixes & PREFIX_DATA);
-			}
-			break;
-		case 'Y':
-			if (l == 0 && len == 1) {
-				if (intel_syntax || !(sizeflag & SUFFIX_ALWAYS))
-					break;
-				if (rex & REX_W) {
-					USED_REX(REX_W);
-					*obufp++ = 'q';
-					g_op_size = 8;
-				}
-				break;
-			} else {
-				if (l != 1 || len != 2 || last[0] != 'X') {
-					SAVE_LAST(*p);
-					break;
-				}
-				if (!need_vex)
-					abort();
-				if (intel_syntax
-						|| (modrm.mod == 3 && !(sizeflag & SUFFIX_ALWAYS)))
-					break;
-				switch (vex.length) {
-				case 128:
-					*obufp++ = 'x';
-					break;
-				case 256:
-					*obufp++ = 'y';
-					break;
-				default:
-					abort();
-				}
-			}
-			break;
-		case 'W':
-			if (l == 0 && len == 1) {
-				/* operand size flag for cwtl, cbtw */
-				USED_REX(REX_W);
-				if (rex & REX_W) {
-					if (intel_syntax)
-						*obufp++ = 'd';
-					else
-						*obufp++ = 'l';
-				} else if (sizeflag & DFLAG)
-					*obufp++ = 'w';
-				else
-					*obufp++ = 'b';
-				if (!(rex & REX_W))
-					used_prefixes |= (prefixes & PREFIX_DATA);
-			} else {
-				if (l != 1 || len != 2 || last[0] != 'X') {
-					SAVE_LAST(*p);
-					break;
-				}
-				if (!need_vex)
-					abort();
-				*obufp++ = vex.w ? 'd' : 's';
-			}
-			break;
-		}
-		alt = 0;
-	}
-	*obufp = 0;
-	mnemonicendp = obufp;
-	return 0;
-}
-
-static char *stpcpy(char *dest, const char *src)
+// arguments may be NIL
+static int is_same_string(const char* str1, const char* str2)
 {
-	size_t len = strlen(src);
-	strcpy(dest, src);
-	return dest + len;
-}
-
-static void oappend(const char *s) {
-	obufp = stpcpy(obufp, s);
-}
-
-static void append_seg(void) {
-	if (prefixes & PREFIX_CS) {
-		used_prefixes |= PREFIX_CS;
-		oappend("%cs:" + intel_syntax);
-	}
-	if (prefixes & PREFIX_DS) {
-		used_prefixes |= PREFIX_DS;
-		oappend("%ds:" + intel_syntax);
-	}
-	if (prefixes & PREFIX_SS) {
-		used_prefixes |= PREFIX_SS;
-		oappend("%ss:" + intel_syntax);
-	}
-	if (prefixes & PREFIX_ES) {
-		used_prefixes |= PREFIX_ES;
-		oappend("%es:" + intel_syntax);
-	}
-	if (prefixes & PREFIX_FS) {
-		used_prefixes |= PREFIX_FS;
-		oappend("%fs:" + intel_syntax);
-	}
-	if (prefixes & PREFIX_GS) {
-		used_prefixes |= PREFIX_GS;
-		oappend("%gs:" + intel_syntax);
-	}
-}
-
-static void OP_indirE(int bytemode, int sizeflag) {
-	if (!intel_syntax)
-		oappend("*");
-	OP_E(bytemode, sizeflag);
-}
-
-static void print_operand_value(char *buf, int hex, __int64 disp) {
-	if (address_mode == mode_64bit) {
-		if (hex) {
-			char tmp[30];
-			int i;
-			buf[0] = '0';
-			buf[1] = 'x';
-			sprintf(tmp, "%I64x", disp);
-			for (i = 0; tmp[i] == '0' && tmp[i + 1]; i++)
-				;
-			strcpy(buf + 2, tmp + i);
-		} else {
-			__int64 v = disp;
-			char tmp[30];
-			int i;
-			if (v < 0) {
-				*(buf++) = '-';
-				v = -disp;
-				/* Check for possible overflow on 0x8000000000000000.  */
-				if (v < 0) {
-					strcpy(buf, "9223372036854775808");
-					return;
-				}
-			}
-			if (!v) {
-				strcpy(buf, "0");
-				return;
-			}
-
-			i = 0;
-			tmp[29] = 0;
-			while (v) {
-				tmp[28 - i] = (v % 10) + '0';
-				v /= 10;
-				i++;
-			}
-			strcpy(buf, tmp + 29 - i);
-		}
-	} else {
-		if (hex)
-			sprintf(buf, "0x%x", (unsigned int) disp);
-		else
-			sprintf(buf, "%d", (int) disp);
-	}
-}
-
-/* Put DISP in BUF as signed hex number.  */
-
-static void print_displacement(char *buf, __int64 disp) {
-	__int64 val = disp;
-	char tmp[30];
-	int i, j = 0;
-
-	if (val < 0) {
-		buf[j++] = '-';
-		val = -disp;
-
-		/* Check for possible overflow.  */
-		if (val < 0) {
-			switch (address_mode) {
-			case mode_64bit:
-				strcpy(buf + j, "0x8000000000000000");
-				break;
-			case mode_32bit:
-				strcpy(buf + j, "0x80000000");
-				break;
-			case mode_16bit:
-				strcpy(buf + j, "0x8000");
-				break;
-			}
-			return;
-		}
-	}
-
-	buf[j++] = '0';
-	buf[j++] = 'x';
-
-	sprintf(tmp, "%I64x", (ULONG64) val);
-	for (i = 0; tmp[i] == '0'; i++)
-		continue;
-	if (tmp[i] == '\0')
-		i--;
-	strcpy(buf + j, tmp + i);
-}
-
-static void intel_operand_size(int bytemode, int sizeflag) {
-	switch (bytemode) {
-	case b_mode:
-	case b_swap_mode:
-	case dqb_mode:
-		g_op_size = 1;
-		oappend("BYTE PTR ");
-		break;
-	case w_mode:
-	case dqw_mode:
-		g_op_size = 2;
-		oappend("WORD PTR ");
-		break;
-	case stack_v_mode:
-		if (address_mode == mode_64bit && (sizeflag & DFLAG)) {
-			g_op_size = 8;
-			oappend("QWORD PTR ");
-			break;
-		}
-		/* FALLTHRU */
-	case v_mode:
-	case v_swap_mode:
-	case dq_mode:
-		USED_REX(REX_W);
-		if (rex & REX_W)
-		{
-			g_op_size = 8;
-			oappend("QWORD PTR ");
-		}
-		else {
-			if ((sizeflag & DFLAG) || bytemode == dq_mode)
-			{
-				g_op_size = 4;
-				oappend("DWORD PTR ");
-			}
-			else
-			{
-				g_op_size = 2;
-				oappend("WORD PTR ");
-			}
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		break;
-	case z_mode:
-		if ((rex & REX_W) || (sizeflag & DFLAG))
-			*obufp++ = 'D';
-		g_op_size = 2;
-		oappend("WORD PTR ");
-		if (!(rex & REX_W))
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		break;
-	case a_mode:
-		if (sizeflag & DFLAG)
-		{
-			g_op_size = 8;
-			oappend("QWORD PTR ");
-		}
-		else
-		{
-			g_op_size = 4;
-			oappend("DWORD PTR ");
-		}
-		used_prefixes |= (prefixes & PREFIX_DATA);
-		break;
-	case d_mode:
-	case d_scalar_mode:
-	case d_scalar_swap_mode:
-	case d_swap_mode:
-	case dqd_mode:
-		g_op_size = 4;
-		oappend("DWORD PTR ");
-		break;
-	case q_mode:
-	case q_scalar_mode:
-	case q_scalar_swap_mode:
-	case q_swap_mode:
-		g_op_size = 8;
-		oappend("QWORD PTR ");
-		break;
-	case m_mode:
-		if (address_mode == mode_64bit)
-		{
-			g_op_size = 8;
-			oappend("QWORD PTR ");
-		}
-		else
-		{
-			g_op_size = 4;
-			oappend("DWORD PTR ");
-		}
-		break;
-	case f_mode:
-		if (sizeflag & DFLAG)
-		{
-			g_op_size = 4;
-			oappend("FWORD PTR ");
-		}
-		else
-		{
-			g_op_size = 4;
-			oappend("DWORD PTR ");
-		}
-		used_prefixes |= (prefixes & PREFIX_DATA);
-		break;
-	case t_mode:
-		oappend("TBYTE PTR ");
-		break;
-	case x_mode:
-	case x_swap_mode:
-		if (need_vex) {
-			switch (vex.length) {
-			case 128:
-				oappend("XMMWORD PTR ");
-				break;
-			case 256:
-				oappend("YMMWORD PTR ");
-				break;
-			default:
-				abort();
-			}
-		} else
-			oappend("XMMWORD PTR ");
-		break;
-	case xmm_mode:
-		oappend("XMMWORD PTR ");
-		break;
-	case xmmq_mode:
-		if (!need_vex)
-			abort();
-
-		switch (vex.length) {
-		case 128:
-			g_op_size = 8;
-			oappend("QWORD PTR ");
-			break;
-		case 256:
-			oappend("XMMWORD PTR ");
-			break;
-		default:
-			abort();
-		}
-		break;
-	case ymmq_mode:
-		if (!need_vex)
-			abort();
-
-		switch (vex.length) {
-		case 128:
-			g_op_size = 8;
-			oappend("QWORD PTR ");
-			break;
-		case 256:
-			oappend("YMMWORD PTR ");
-			break;
-		default:
-			abort();
-		}
-		break;
-	case o_mode:
-		oappend("OWORD PTR ");
-		break;
-	case vex_w_dq_mode:
-	case vex_scalar_w_dq_mode:
-		if (!need_vex)
-			abort();
-
-		if (vex.w)
-		{
-			g_op_size = 8;
-			oappend("QWORD PTR ");
-		}
-		else
-		{
-			g_op_size = 4;
-			oappend("DWORD PTR ");
-		}
-		break;
-	default:
-		break;
-	}
-}
-
-static void OP_E_register(int bytemode, int sizeflag) {
-	int reg = modrm.rm;
-	const char **names;
-	int reg_size;
-
-	USED_REX(REX_B);
-	if ((rex & REX_B))
-		reg += 8;
-
-	if ((sizeflag & SUFFIX_ALWAYS)
-			&& (bytemode == b_swap_mode || bytemode == v_swap_mode))
-		swap_operand();
-
-	switch (bytemode) {
-	case b_mode:
-	case b_swap_mode:
-		USED_REX(0);
-		if (rex)
-			names = names8rex;
-		else
-			names = names8;
-		reg_size = 1;
-		break;
-	case w_mode:
-		names = names16;
-		reg_size = 2;
-		break;
-	case d_mode:
-		names = names32;
-		reg_size = 4;
-		break;
-	case q_mode:
-		names = names64;
-		reg_size = 8;
-		break;
-	case m_mode:
-		names = address_mode == mode_64bit ? names64 : names32;
-		reg_size = address_mode == mode_64bit ? 8 : 4;
-		break;
-	case stack_v_mode:
-		if (address_mode == mode_64bit && (sizeflag & DFLAG)) {
-			names = names64;
-			reg_size = 8;
-			break;
-		}
-		bytemode = v_mode;
-		/* FALLTHRU */
-	case v_mode:
-	case v_swap_mode:
-	case dq_mode:
-	case dqb_mode:
-	case dqd_mode:
-	case dqw_mode:
-		USED_REX(REX_W);
-		if (rex & REX_W)
-		{
-			names = names64;
-			reg_size = 8;
-		}
-		else {
-			if ((sizeflag & DFLAG)
-					|| (bytemode != v_mode && bytemode != v_swap_mode))
-			{
-				names = names32;
-				reg_size = 4;
-			}
-			else
-			{
-				names = names16;
-				reg_size = 2;
-			}
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		break;
-	case 0:
-		return;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		return;
-	}
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_REGISTER;
-	g_operands[g_num_operand].reg.name = names[reg];
-	g_operands[g_num_operand].reg.size = reg_size;
-	g_operands[g_num_operand].reg.index = reg;
-	g_num_operand++;
-
-	oappend(names[reg]);
-}
-
-static void OP_E_memory(int bytemode, int sizeflag) {
-	__int64 disp = 0;
-	int add = (rex & REX_B) ? 8 : 0;
-	int riprel = 0;
-
-	USED_REX(REX_B);
-	if (intel_syntax)
-		intel_operand_size(bytemode, sizeflag);
-	append_seg();
-
-	if ((sizeflag & AFLAG) || address_mode == mode_64bit) {
-		/* 32/64 bit address mode */
-		int havedisp;
-		int havesib;
-		int havebase;
-		int haveindex;
-		int needindex;
-		int base, rbase;
-		int vindex = 0;
-		int scale = 0;
-
-		havesib = 0;
-		havebase = 1;
-		haveindex = 0;
-		base = modrm.rm;
-
-		if (base == 4) {
-			havesib = 1;
-			vindex = sib.index;
-			scale = sib.scale;
-			base = sib.base;
-			USED_REX(REX_X);
-			if (rex & REX_X)
-				vindex += 8;
-			haveindex = vindex != 4;
-			codep++;
-		}
-		rbase = base + add;
-
-		switch (modrm.mod) {
-		case 0:
-			if (base == 5) {
-				havebase = 0;
-				if (address_mode == mode_64bit && !havesib)
-					riprel = 1;
-				disp = get32s();
-			}
-			break;
-		case 1:
-			FETCH_DATA(the_info, codep + 1);
-			disp = *codep++;
-			if ((disp & 0x80) != 0)
-				disp -= 0x100;
-			break;
-		case 2:
-			disp = get32s();
-			break;
-		}
-
-		/* In 32bit mode, we need index register to tell [offset] from
-		 [eiz*1 + offset].  */
-		needindex = (havesib && !havebase && !haveindex
-				&& address_mode == mode_32bit);
-		havedisp = (havebase || needindex
-				|| (havesib && (haveindex || scale != 0)));
-
-		if (!intel_syntax)
-			if (modrm.mod != 0 || base == 5) {
-				if (havedisp || riprel)
-					print_displacement(scratchbuf, disp);
-				else
-					print_operand_value(scratchbuf, 1, disp);
-				oappend(scratchbuf);
-				if (riprel) {
-					set_op(disp, 1);
-					oappend(sizeflag & AFLAG ? "(%rip)" : "(%eip)");
-				}
-			}
-		/* myan */
-		g_operands[g_num_operand].type = CA_OP_MEMORY;
-
-		if (modrm.mod != 0 || base == 5)
-		{
-			if (havedisp || riprel)
-				g_operands[g_num_operand].mem.disp.immediate = disp;
-			if (riprel)
-			{
-				g_operands[g_num_operand].mem.base_reg.name = sizeflag & AFLAG ? "%rip" : "%eip";
-				g_operands[g_num_operand].mem.base_reg.index = RIP;
-				g_operands[g_num_operand].mem.base_reg.size = 8;
-			}
-		}
-
-		if (havedisp)
-		{
-			if (havebase)
-			{
-				if (address_mode == mode_64bit && (sizeflag & AFLAG))
-				{
-					g_operands[g_num_operand].mem.base_reg.name = names64[rbase];
-					g_operands[g_num_operand].mem.base_reg.size = 8;
-				}
-				else
-				{
-					g_operands[g_num_operand].mem.base_reg.name = names32[rbase];
-					g_operands[g_num_operand].mem.base_reg.size = 4;
-				}
-				g_operands[g_num_operand].mem.base_reg.index = rbase;
-			}
-
-			if (havesib)
-			{
-				g_operands[g_num_operand].mem.scale = scale;
-				if (scale != 0 || needindex || haveindex
-						|| (havebase && base != ESP_REG_NUM))
-				{
-					if (haveindex)
-					{
-						if (address_mode == mode_64bit	&& (sizeflag & AFLAG))
-						{
-							g_operands[g_num_operand].mem.index_reg.name = names64[vindex];
-							g_operands[g_num_operand].mem.index_reg.size = 8;
-						}
-						else
-						{
-							g_operands[g_num_operand].mem.index_reg.name = names32[vindex];
-							g_operands[g_num_operand].mem.index_reg.size = 4;
-						}
-						g_operands[g_num_operand].mem.index_reg.index = vindex;
-					}
-					else
-					{
-						if (address_mode == mode_64bit&& (sizeflag & AFLAG))
-						{
-							g_operands[g_num_operand].mem.index_reg.name = index64;
-							g_operands[g_num_operand].mem.index_reg.size = 8;
-						}
-						else
-						{
-							g_operands[g_num_operand].mem.index_reg.name = index32;
-							g_operands[g_num_operand].mem.index_reg.size = 4;
-						}
-						g_operands[g_num_operand].mem.index_reg.index = RAX; // FIXME
-					}
-				}
-			}
-		}
-
-		g_num_operand++;
-		/* myan */
-
-		if (havebase || haveindex || riprel)
-			used_prefixes |= PREFIX_ADDR;
-
-		if (havedisp || (intel_syntax && riprel)) {
-			*obufp++ = open_char;
-			if (intel_syntax && riprel) {
-				set_op(disp, 1);
-				oappend(sizeflag & AFLAG ? "rip" : "eip");
-			}
-			*obufp = '\0';
-			if (havebase)
-				oappend(
-						address_mode == mode_64bit && (sizeflag & AFLAG) ?
-								names64[rbase] : names32[rbase]);
-			if (havesib) {
-				/* ESP/RSP won't allow index.  If base isn't ESP/RSP,
-				 print index to tell base + index from base.  */
-				if (scale != 0 || needindex || haveindex
-						|| (havebase && base != ESP_REG_NUM)) {
-					if (!intel_syntax || havebase) {
-						*obufp++ = separator_char;
-						*obufp = '\0';
-					}
-					if (haveindex)
-						oappend(
-								address_mode == mode_64bit
-										&& (sizeflag & AFLAG) ?
-										names64[vindex] : names32[vindex]);
-					else
-						oappend(
-								address_mode == mode_64bit
-										&& (sizeflag & AFLAG) ?
-										index64 : index32);
-
-					*obufp++ = scale_char;
-					*obufp = '\0';
-					sprintf(scratchbuf, "%d", 1 << scale);
-					oappend(scratchbuf);
-				}
-			}
-			if (intel_syntax && (disp || modrm.mod != 0 || base == 5)) {
-				if (!havedisp || disp >= 0) {
-					*obufp++ = '+';
-					*obufp = '\0';
-				} else if (modrm.mod != 1 && disp != -disp) {
-					*obufp++ = '-';
-					*obufp = '\0';
-					disp = -disp;
-				}
-
-				if (havedisp)
-					print_displacement(scratchbuf, disp);
-				else
-					print_operand_value(scratchbuf, 1, disp);
-				oappend(scratchbuf);
-			}
-
-			*obufp++ = close_char;
-			*obufp = '\0';
-		} else if (intel_syntax) {
-			if (modrm.mod != 0 || base == 5) {
-				if (prefixes
-						& (PREFIX_CS | PREFIX_SS | PREFIX_DS | PREFIX_ES
-								| PREFIX_FS | PREFIX_GS))
-					;
-				else {
-					oappend(names_seg[ds_reg - es_reg]);
-					oappend(":");
-				}
-				print_operand_value(scratchbuf, 1, disp);
-				oappend(scratchbuf);
-			}
-		}
-	} else {
-		/* 16 bit address mode */
-		used_prefixes |= prefixes & PREFIX_ADDR;
-		switch (modrm.mod) {
-		case 0:
-			if (modrm.rm == 6) {
-				disp = get16();
-				if ((disp & 0x8000) != 0)
-					disp -= 0x10000;
-			}
-			break;
-		case 1:
-			FETCH_DATA(the_info, codep + 1);
-			disp = *codep++;
-			if ((disp & 0x80) != 0)
-				disp -= 0x100;
-			break;
-		case 2:
-			disp = get16();
-			if ((disp & 0x8000) != 0)
-				disp -= 0x10000;
-			break;
-		}
-
-		if (!intel_syntax)
-			if (modrm.mod != 0 || modrm.rm == 6) {
-				print_displacement(scratchbuf, disp);
-				oappend(scratchbuf);
-			}
-
-		if (modrm.mod != 0 || modrm.rm != 6) {
-			*obufp++ = open_char;
-			*obufp = '\0';
-			oappend(index16[modrm.rm]);
-			if (intel_syntax && (disp || modrm.mod != 0 || modrm.rm == 6)) {
-				if (disp >= 0) {
-					*obufp++ = '+';
-					*obufp = '\0';
-				} else if (modrm.mod != 1) {
-					*obufp++ = '-';
-					*obufp = '\0';
-					disp = -disp;
-				}
-
-				print_displacement(scratchbuf, disp);
-				oappend(scratchbuf);
-			}
-
-			*obufp++ = close_char;
-			*obufp = '\0';
-		} else if (intel_syntax) {
-			if (prefixes
-					& (PREFIX_CS | PREFIX_SS | PREFIX_DS | PREFIX_ES | PREFIX_FS
-							| PREFIX_GS))
-				;
-			else {
-				oappend(names_seg[ds_reg - es_reg]);
-				oappend(":");
-			}
-			print_operand_value(scratchbuf, 1, disp & 0xffff);
-			oappend(scratchbuf);
-		}
-	}
-}
-
-static void OP_E(int bytemode, int sizeflag) {
-	/* Skip mod/rm byte.  */
-	MODRM_CHECK;
-	codep++;
-
-	if (modrm.mod == 3)
-		OP_E_register(bytemode, sizeflag);
-	else
-		OP_E_memory(bytemode, sizeflag);
-}
-
-static void OP_G(int bytemode, int sizeflag) {
-	const char* name = NULL;
-	int add = 0;
-	int reg_size;
-	USED_REX(REX_R);
-	if (rex & REX_R)
-		add += 8;
-	switch (bytemode) {
-	case b_mode:
-		USED_REX(0);
-		if (rex)
-		{
-			name = names8rex[modrm.reg + add];
-			oappend(names8rex[modrm.reg + add]);
-		}
-		else
-		{
-			name = names8[modrm.reg + add];
-			oappend(names8[modrm.reg + add]);
-		}
-		reg_size = 1;
-		break;
-	case w_mode:
-		name = names16[modrm.reg + add];
-		oappend(names16[modrm.reg + add]);
-		reg_size = 2;
-		break;
-	case d_mode:
-		name = names32[modrm.reg + add];
-		oappend(names32[modrm.reg + add]);
-		reg_size = 4;
-		break;
-	case q_mode:
-		name = names64[modrm.reg + add];
-		oappend(names64[modrm.reg + add]);
-		reg_size = 8;
-		break;
-	case v_mode:
-	case dq_mode:
-	case dqb_mode:
-	case dqd_mode:
-	case dqw_mode:
-		USED_REX(REX_W);
-		if (rex & REX_W)
-		{
-			name = names64[modrm.reg + add];
-			oappend(names64[modrm.reg + add]);
-			reg_size = 8;
-		}
-		else {
-			if ((sizeflag & DFLAG) || bytemode != v_mode)
-			{
-				name = names32[modrm.reg + add];
-				oappend(names32[modrm.reg + add]);
-				reg_size = 4;
-			}
-			else
-			{
-				name = names16[modrm.reg + add];
-				oappend(names16[modrm.reg + add]);
-				reg_size = 2;
-			}
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		break;
-	case m_mode:
-		if (address_mode == mode_64bit)
-		{
-			name = names64[modrm.reg + add];
-			oappend(names64[modrm.reg + add]);
-			reg_size = 8;
-		}
-		else
-		{
-			name = names32[modrm.reg + add];
-			oappend(names32[modrm.reg + add]);
-			reg_size = 4;
-		}
-		break;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		break;
-	}
-	/* myan */
-	if (name)
-	{
-		g_operands[g_num_operand].type = CA_OP_REGISTER;
-		g_operands[g_num_operand].reg.name = name;
-		g_operands[g_num_operand].reg.size = reg_size;
-		g_operands[g_num_operand].reg.index = modrm.reg + add;
-		g_num_operand++;
-	}
-}
-
-static ULONG64 get64(void) {
-	ULONG64 x;
-#ifdef BFD64
-	unsigned int a;
-	unsigned int b;
-
-	FETCH_DATA(the_info, codep + 8);
-	a = *codep++ & 0xff;
-	a |= (*codep++ & 0xff) << 8;
-	a |= (*codep++ & 0xff) << 16;
-	a |= (*codep++ & 0xff) << 24;
-	b = *codep++ & 0xff;
-	b |= (*codep++ & 0xff) << 8;
-	b |= (*codep++ & 0xff) << 16;
-	b |= (*codep++ & 0xff) << 24;
-	x = a + ((ULONG64) b << 32);
-#else
-	abort ();
-	x = 0;
-#endif
-	return x;
-}
-
-static ULONG64 get32(void) {
-	ULONG64 x = 0;
-
-	FETCH_DATA(the_info, codep + 4);
-	x = *codep++ & (ULONG64) 0xff;
-	x |= (*codep++ & (ULONG64) 0xff) << 8;
-	x |= (*codep++ & (ULONG64) 0xff) << 16;
-	x |= (*codep++ & (ULONG64) 0xff) << 24;
-	return x;
-}
-
-static ULONG64 get32s(void) {
-	ULONG64 x = 0;
-
-	FETCH_DATA(the_info, codep + 4);
-	x = *codep++ & (ULONG64) 0xff;
-	x |= (*codep++ & (ULONG64) 0xff) << 8;
-	x |= (*codep++ & (ULONG64) 0xff) << 16;
-	x |= (*codep++ & (ULONG64) 0xff) << 24;
-
-	x = (x ^ ((ULONG64) 1 << 31)) - ((ULONG64) 1 << 31);
-
-	return x;
-}
-
-static int get16(void) {
-	int x = 0;
-
-	FETCH_DATA(the_info, codep + 2);
-	x = *codep++ & 0xff;
-	x |= (*codep++ & 0xff) << 8;
-	return x;
-}
-
-static void set_op(ULONG64 op, int riprel) {
-	op_index[op_ad] = op_ad;
-	if (address_mode == mode_64bit) {
-		op_address[op_ad] = op;
-		op_riprel[op_ad] = riprel;
-	} else {
-		/* Mask to get a 32-bit address.  */
-		op_address[op_ad] = op & 0xffffffff;
-		op_riprel[op_ad] = riprel & 0xffffffff;
-	}
-}
-
-static void OP_REG(int code, int sizeflag) {
-	const char *s;
-	int add;
-	int reg_size, reg_index;
-	USED_REX(REX_B);
-	if (rex & REX_B)
-		add = 8;
-	else
-		add = 0;
-
-	switch (code) {
-	case enum_ax_reg:
-	case cx_reg:
-	case dx_reg:
-	case bx_reg:
-	case sp_reg:
-	case bp_reg:
-	case si_reg:
-	case di_reg:
-		s = names16[code - enum_ax_reg + add];
-		reg_size = 2;
-		reg_index = code - enum_ax_reg + add;
-		break;
-	case es_reg:
-	case ss_reg:
-	case cs_reg:
-	case ds_reg:
-	case fs_reg:
-	case gs_reg:
-		s = names_seg[code - es_reg + add];
-		reg_size = 4;
-		reg_index = code - es_reg + add;
-		break;
-	case al_reg:
-	case ah_reg:
-	case cl_reg:
-	case ch_reg:
-	case dl_reg:
-	case dh_reg:
-	case bl_reg:
-	case bh_reg:
-		USED_REX(0);
-		if (rex)
-		{
-			s = names8rex[code - al_reg + add];
-			reg_index = code - al_reg + add;
-		}
-		else
-		{
-			s = names8[code - al_reg];
-			reg_index = code - al_reg;
-		}
-		reg_size = 1;
-		break;
-	case rAX_reg:
-	case rCX_reg:
-	case rDX_reg:
-	case rBX_reg:
-	case rSP_reg:
-	case rBP_reg:
-	case rSI_reg:
-	case rDI_reg:
-		if (address_mode == mode_64bit && (sizeflag & DFLAG)) {
-			s = names64[code - rAX_reg + add];
-			reg_size = 8;
-			reg_index = code - rAX_reg + add;
-			break;
-		}
-		code += eAX_reg - rAX_reg;
-		/* Fall through.  */
-	case eAX_reg:
-	case eCX_reg:
-	case eDX_reg:
-	case eBX_reg:
-	case eSP_reg:
-	case eBP_reg:
-	case eSI_reg:
-	case eDI_reg:
-		USED_REX(REX_W);
-		if (rex & REX_W)
-		{
-			s = names64[code - eAX_reg + add];
-			reg_size = 8;
-			reg_index = code - eAX_reg + add;
-		}
-		else {
-			if (sizeflag & DFLAG)
-			{
-				s = names32[code - eAX_reg + add];
-				reg_size = 4;
-				reg_index = code - eAX_reg + add;
-			}
-			else
-			{
-				s = names16[code - eAX_reg + add];
-				reg_size = 2;
-				reg_index = code - eAX_reg + add;
-			}
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		break;
-	default:
-		s = INTERNAL_DISASSEMBLER_ERROR;
-		break;
-	}
-	oappend(s);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_REGISTER;
-	g_operands[g_num_operand].reg.name = s;
-	g_operands[g_num_operand].reg.size = reg_size;
-	g_operands[g_num_operand].reg.index = reg_index;
-	g_num_operand++;
-}
-
-static void OP_IMREG(int code, int sizeflag) {
-	const char *s;
-	int reg_size, reg_index;
-
-	switch (code) {
-	case indir_dx_reg:
-		if (intel_syntax)
-			s = "dx";
-		else
-			s = "(%dx)";
-		reg_size = 2;
-		reg_index = RDX;
-		break;
-	case enum_ax_reg:
-	case cx_reg:
-	case dx_reg:
-	case bx_reg:
-	case sp_reg:
-	case bp_reg:
-	case si_reg:
-	case di_reg:
-		s = names16[code - enum_ax_reg];
-		reg_size = 2;
-		reg_index = code - enum_ax_reg;
-		break;
-	case es_reg:
-	case ss_reg:
-	case cs_reg:
-	case ds_reg:
-	case fs_reg:
-	case gs_reg:
-		s = names_seg[code - es_reg];
-		reg_size = 4;
-		reg_index = code - es_reg;
-		break;
-	case al_reg:
-	case ah_reg:
-	case cl_reg:
-	case ch_reg:
-	case dl_reg:
-	case dh_reg:
-	case bl_reg:
-	case bh_reg:
-		USED_REX(0);
-		if (rex)
-			s = names8rex[code - al_reg];
-		else
-			s = names8[code - al_reg];
-		reg_size = 1;
-		reg_index = code - al_reg;
-		break;
-	case eAX_reg:
-	case eCX_reg:
-	case eDX_reg:
-	case eBX_reg:
-	case eSP_reg:
-	case eBP_reg:
-	case eSI_reg:
-	case eDI_reg:
-		USED_REX(REX_W);
-		if (rex & REX_W)
-		{
-			s = names64[code - eAX_reg];
-			reg_size = 8;
-		}
-		else {
-			if (sizeflag & DFLAG)
-			{
-				s = names32[code - eAX_reg];
-				reg_size = 4;
-			}
-			else
-			{
-				s = names16[code - eAX_reg];
-				reg_size = 2;
-			}
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		reg_index = code - eAX_reg;
-		break;
-	case z_mode_ax_reg:
-		if ((rex & REX_W) || (sizeflag & DFLAG))
-		{
-			s = *names32;
-			reg_size = 4;
-		}
-		else
-		{
-			s = *names16;
-			reg_size = 2;
-		}
-		if (!(rex & REX_W))
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		reg_index = RAX;
-		break;
-	default:
-		s = INTERNAL_DISASSEMBLER_ERROR;
-		break;
-	}
-	oappend(s);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_REGISTER;
-	g_operands[g_num_operand].reg.name = s;
-	g_operands[g_num_operand].reg.size = reg_size;
-	g_operands[g_num_operand].reg.index = reg_index;
-	g_num_operand++;
-}
-
-static void OP_I(int bytemode, int sizeflag) {
-	ULONG64 op;
-	ULONG64 mask = -1;
-
-	switch (bytemode) {
-	case b_mode:
-		FETCH_DATA(the_info, codep + 1);
-		op = *codep++;
-		mask = 0xff;
-		break;
-	case q_mode:
-		if (address_mode == mode_64bit) {
-			op = get32s();
-			break;
-		}
-		/* Fall through.  */
-	case v_mode:
-		USED_REX(REX_W);
-		if (rex & REX_W)
-			op = get32s();
-		else {
-			if (sizeflag & DFLAG) {
-				op = get32();
-				mask = 0xffffffff;
-			} else {
-				op = get16();
-				mask = 0xfffff;
-			}
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		break;
-	case w_mode:
-		mask = 0xfffff;
-		op = get16();
-		break;
-	case const_1_mode:
-		if (intel_syntax)
-			oappend("1");
-		/* myan */
-		g_operands[g_num_operand].type = CA_OP_IMMEDIATE;
-		g_operands[g_num_operand].immed.immediate = 1;
-		g_num_operand++;
-		return;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		return;
-	}
-
-	op &= mask;
-	scratchbuf[0] = '$';
-	print_operand_value(scratchbuf + 1, 1, op);
-	oappend(scratchbuf + intel_syntax);
-	scratchbuf[0] = '\0';
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_IMMEDIATE;
-	g_operands[g_num_operand].immed.immediate = op;
-	g_num_operand++;
-}
-
-static void OP_I64(int bytemode, int sizeflag) {
-	ULONG64 op;
-	ULONG64 mask = -1;
-
-	if (address_mode != mode_64bit) {
-		OP_I(bytemode, sizeflag);
-		return;
-	}
-
-	switch (bytemode) {
-	case b_mode:
-		FETCH_DATA(the_info, codep + 1);
-		op = *codep++;
-		mask = 0xff;
-		break;
-	case v_mode:
-		USED_REX(REX_W);
-		if (rex & REX_W)
-			op = get64();
-		else {
-			if (sizeflag & DFLAG) {
-				op = get32();
-				mask = 0xffffffff;
-			} else {
-				op = get16();
-				mask = 0xfffff;
-			}
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		break;
-	case w_mode:
-		mask = 0xfffff;
-		op = get16();
-		break;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		return;
-	}
-
-	op &= mask;
-	scratchbuf[0] = '$';
-	print_operand_value(scratchbuf + 1, 1, op);
-	oappend(scratchbuf + intel_syntax);
-	scratchbuf[0] = '\0';
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_IMMEDIATE;
-	g_operands[g_num_operand].immed.immediate = op;
-	g_num_operand++;
-}
-
-static void OP_sI(int bytemode, int sizeflag) {
-	ULONG64 op;
-
-	switch (bytemode) {
-	case b_mode:
-	case b_T_mode:
-		FETCH_DATA(the_info, codep + 1);
-		op = *codep++;
-		if ((op & 0x80) != 0)
-			op -= 0x100;
-		if (bytemode == b_T_mode) {
-			if (address_mode != mode_64bit || !(sizeflag & DFLAG)) {
-				if (sizeflag & DFLAG)
-					op &= 0xffffffff;
-				else
-					op &= 0xffff;
-			}
-		} else {
-			if (!(rex & REX_W)) {
-				if (sizeflag & DFLAG)
-					op &= 0xffffffff;
-				else
-					op &= 0xffff;
-			}
-		}
-		break;
-	case v_mode:
-		if (sizeflag & DFLAG)
-			op = get32s();
-		else
-			op = get16();
-		break;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		return;
-	}
-
-	scratchbuf[0] = '$';
-	print_operand_value(scratchbuf + 1, 1, op);
-	oappend(scratchbuf + intel_syntax);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_IMMEDIATE;
-	g_operands[g_num_operand].immed.immediate = op;
-	g_num_operand++;
-}
-
-static void OP_J(int bytemode, int sizeflag) {
-	ULONG64 disp;
-	ULONG64 mask = -1;
-	ULONG64 segment = 0;
-
-	switch (bytemode) {
-	case b_mode:
-		FETCH_DATA(the_info, codep + 1);
-		disp = *codep++;
-		if ((disp & 0x80) != 0)
-			disp -= 0x100;
-		break;
-	case v_mode:
-		USED_REX(REX_W);
-		if ((sizeflag & DFLAG) || (rex & REX_W))
-			disp = get32s();
-		else {
-			disp = get16();
-			if ((disp & 0x8000) != 0)
-				disp -= 0x10000;
-			/* In 16bit mode, address is wrapped around at 64k within
-			 the same segment.  Otherwise, a data16 prefix on a jump
-			 instruction means that the pc is masked to 16 bits after
-			 the displacement is added!  */
-			mask = 0xffff;
-			if ((prefixes & PREFIX_DATA) == 0)
-				segment = ((start_pc + codep - start_codep)
-						& ~((ULONG64) 0xffff));
-		}
-		if (!(rex & REX_W))
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		break;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		return;
-	}
-	disp = ((start_pc + (codep - start_codep) + disp) & mask) | segment;
-	set_op(disp, 0);
-	print_operand_value(scratchbuf, 1, disp);
-	oappend(scratchbuf);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_IMMEDIATE;
-	g_operands[g_num_operand].immed.immediate = disp;
-	g_num_operand++;
-}
-
-static void OP_SEG(int bytemode, int sizeflag) {
-	if (bytemode == w_mode)
-		oappend(names_seg[modrm.reg]);
-	else
-		OP_E(modrm.mod == 3 ? bytemode : w_mode, sizeflag);
-}
-
-static void OP_DIR(int dummy, int sizeflag) {
-	int seg, offset;
-
-	if (sizeflag & DFLAG) {
-		offset = get32();
-		seg = get16();
-	} else {
-		offset = get16();
-		seg = get16();
-	}
-	used_prefixes |= (prefixes & PREFIX_DATA);
-	if (intel_syntax)
-		sprintf(scratchbuf, "0x%x:0x%x", seg, offset);
-	else
-		sprintf(scratchbuf, "$0x%x,$0x%x", seg, offset);
-	oappend(scratchbuf);
-}
-
-static void OP_OFF(int bytemode, int sizeflag) {
-	ULONG64 off;
-
-	if (intel_syntax && (sizeflag & SUFFIX_ALWAYS))
-		intel_operand_size(bytemode, sizeflag);
-	append_seg();
-
-	if ((sizeflag & AFLAG) || address_mode == mode_64bit)
-		off = get32();
-	else
-		off = get16();
-
-	if (intel_syntax) {
-		if (!(prefixes
-				& (PREFIX_CS | PREFIX_SS | PREFIX_DS | PREFIX_ES | PREFIX_FS
-						| PREFIX_GS))) {
-			oappend(names_seg[ds_reg - es_reg]);
-			oappend(":");
-		}
-	}
-	print_operand_value(scratchbuf, 1, off);
-	oappend(scratchbuf);
-}
-
-static void OP_OFF64(int bytemode, int sizeflag) {
-	ULONG64 off;
-
-	if (address_mode != mode_64bit || (prefixes & PREFIX_ADDR)) {
-		OP_OFF(bytemode, sizeflag);
-		return;
-	}
-
-	if (intel_syntax && (sizeflag & SUFFIX_ALWAYS))
-		intel_operand_size(bytemode, sizeflag);
-	append_seg();
-
-	off = get64();
-
-	if (intel_syntax) {
-		if (!(prefixes
-				& (PREFIX_CS | PREFIX_SS | PREFIX_DS | PREFIX_ES | PREFIX_FS
-						| PREFIX_GS))) {
-			oappend(names_seg[ds_reg - es_reg]);
-			oappend(":");
-		}
-	}
-	print_operand_value(scratchbuf, 1, off);
-	oappend(scratchbuf);
-}
-
-static void ptr_reg(int code, int sizeflag) {
-	const char *s;
-	int reg_size;
-
-	*obufp++ = open_char;
-	used_prefixes |= (prefixes & PREFIX_ADDR);
-	if (address_mode == mode_64bit) {
-		if (!(sizeflag & AFLAG))
-		{
-			s = names32[code - eAX_reg];
-			reg_size = 4;
-		}
-		else
-		{
-			s = names64[code - eAX_reg];
-			reg_size = 8;
-		}
-	} else if (sizeflag & AFLAG)
-	{
-		s = names32[code - eAX_reg];
-		reg_size = 4;
-	}
+	int rc;
+
+	if (!str1 && !str2)
+		rc = 1;
+	else if ( (str1 && !str2) || (!str1 && str2))
+		rc = 0;
 	else
 	{
-		s = names16[code - eAX_reg];
-		reg_size = 2;
-	}
-	oappend(s);
-	*obufp++ = close_char;
-	*obufp = 0;
-	/* myan */
-	g_operands[g_num_operand].mem.base_reg.name = s;
-	g_operands[g_num_operand].mem.base_reg.size = reg_size;
-	g_operands[g_num_operand].mem.base_reg.index = code - eAX_reg;
-}
-
-static void OP_ESreg(int code, int sizeflag) {
-	if (intel_syntax) {
-		switch (codep[-1]) {
-		case 0x6d: /* insw/insl */
-			intel_operand_size(z_mode, sizeflag);
-			break;
-		case 0xa5: /* movsw/movsl/movsq */
-		case 0xa7: /* cmpsw/cmpsl/cmpsq */
-		case 0xab: /* stosw/stosl */
-		case 0xaf: /* scasw/scasl */
-			intel_operand_size(v_mode, sizeflag);
-			break;
-		default:
-			intel_operand_size(b_mode, sizeflag);
-		}
-	}
-	oappend("%es:" + intel_syntax);
-	ptr_reg(code, sizeflag);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_MEMORY;
-	g_num_operand++;
-}
-
-static void OP_DSreg(int code, int sizeflag) {
-	if (intel_syntax) {
-		switch (codep[-1]) {
-		case 0x6f: /* outsw/outsl */
-			intel_operand_size(z_mode, sizeflag);
-			break;
-		case 0xa5: /* movsw/movsl/movsq */
-		case 0xa7: /* cmpsw/cmpsl/cmpsq */
-		case 0xad: /* lodsw/lodsl/lodsq */
-			intel_operand_size(v_mode, sizeflag);
-			break;
-		default:
-			intel_operand_size(b_mode, sizeflag);
-		}
-	}
-	if ((prefixes
-			& (PREFIX_CS | PREFIX_DS | PREFIX_SS | PREFIX_ES | PREFIX_FS
-					| PREFIX_GS)) == 0)
-		prefixes |= PREFIX_DS;
-	append_seg();
-	ptr_reg(code, sizeflag);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_MEMORY;
-	g_num_operand++;
-}
-
-static void OP_C(int dummy, int sizeflag) {
-	int add;
-	if (rex & REX_R) {
-		USED_REX(REX_R);
-		add = 8;
-	} else if (address_mode != mode_64bit && (prefixes & PREFIX_LOCK)) {
-		all_prefixes[last_lock_prefix] = 0;
-		used_prefixes |= PREFIX_LOCK;
-		add = 8;
-	} else
-		add = 0;
-	sprintf(scratchbuf, "%%cr%d", modrm.reg + add);
-	oappend(scratchbuf + intel_syntax);
-}
-
-static void OP_D(int dummy, int sizeflag) {
-	int add;
-	USED_REX(REX_R);
-	if (rex & REX_R)
-		add = 8;
-	else
-		add = 0;
-	if (intel_syntax)
-		sprintf(scratchbuf, "db%d", modrm.reg + add);
-	else
-		sprintf(scratchbuf, "%%db%d", modrm.reg + add);
-	oappend(scratchbuf);
-}
-
-static void OP_T(int dummy, int sizeflag) {
-	sprintf(scratchbuf, "%%tr%d", modrm.reg);
-	oappend(scratchbuf + intel_syntax);
-}
-
-static void OP_R(int bytemode, int sizeflag) {
-	if (modrm.mod == 3)
-		OP_E(bytemode, sizeflag);
-	else
-		BadOp();
-}
-
-static void OP_MMX(int bytemode, int sizeflag) {
-	int reg = modrm.reg;
-	const char **names;
-
-	used_prefixes |= (prefixes & PREFIX_DATA);
-	if (prefixes & PREFIX_DATA) {
-		names = names_xmm;
-		USED_REX(REX_R);
-		if (rex & REX_R)
-			reg += 8;
-	} else
-		names = names_mm;
-	oappend(names[reg]);
-}
-
-static void OP_XMM(int bytemode, int sizeflag) {
-	int reg = modrm.reg;
-	const char **names;
-
-	USED_REX(REX_R);
-	if (rex & REX_R)
-		reg += 8;
-	if (need_vex && bytemode != xmm_mode && bytemode != scalar_mode) {
-		switch (vex.length) {
-		case 128:
-			names = names_xmm;
-			break;
-		case 256:
-			names = names_ymm;
-			break;
-		default:
-			abort();
-		}
-	} else
-		names = names_xmm;
-	oappend(names[reg]);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_REGISTER;
-	g_operands[g_num_operand].reg.name = names[reg];
-	g_operands[g_num_operand].reg.size = 8;
-	g_operands[g_num_operand].reg.index = RXMM0 + reg;
-	g_num_operand++;
-}
-
-static void OP_EM(int bytemode, int sizeflag) {
-	int reg;
-	const char **names;
-
-	if (modrm.mod != 3) {
-		if (intel_syntax && (bytemode == v_mode || bytemode == v_swap_mode)) {
-			bytemode = (prefixes & PREFIX_DATA) ? x_mode : q_mode;
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		OP_E(bytemode, sizeflag);
-		return;
-	}
-
-	if ((sizeflag & SUFFIX_ALWAYS) && bytemode == v_swap_mode)
-		swap_operand();
-
-	/* Skip mod/rm byte.  */MODRM_CHECK;
-	codep++;
-	used_prefixes |= (prefixes & PREFIX_DATA);
-	reg = modrm.rm;
-	if (prefixes & PREFIX_DATA) {
-		names = names_xmm;
-		USED_REX(REX_B);
-		if (rex & REX_B)
-			reg += 8;
-	} else
-		names = names_mm;
-	oappend(names[reg]);
-}
-
-/* cvt* are the only instructions in sse2 which have
- both SSE and MMX operands and also have 0x66 prefix
- in their opcode. 0x66 was originally used to differentiate
- between SSE and MMX instruction(operands). So we have to handle the
- cvt* separately using OP_EMC and OP_MXC */
-static void OP_EMC(int bytemode, int sizeflag) {
-	if (modrm.mod != 3) {
-		if (intel_syntax && bytemode == v_mode) {
-			bytemode = (prefixes & PREFIX_DATA) ? x_mode : q_mode;
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		OP_E(bytemode, sizeflag);
-		return;
-	}
-
-	/* Skip mod/rm byte.  */MODRM_CHECK;
-	codep++;
-	used_prefixes |= (prefixes & PREFIX_DATA);
-	oappend(names_mm[modrm.rm]);
-}
-
-static void OP_MXC(int bytemode, int sizeflag) {
-	used_prefixes |= (prefixes & PREFIX_DATA);
-	oappend(names_mm[modrm.reg]);
-}
-
-static void OP_EX(int bytemode, int sizeflag) {
-	int reg;
-	const char **names;
-
-	/* Skip mod/rm byte.  */MODRM_CHECK;
-	codep++;
-
-	if (modrm.mod != 3) {
-		OP_E_memory(bytemode, sizeflag);
-		return;
-	}
-
-	reg = modrm.rm;
-	USED_REX(REX_B);
-	if (rex & REX_B)
-		reg += 8;
-
-	if ((sizeflag & SUFFIX_ALWAYS)
-			&& (bytemode == x_swap_mode || bytemode == d_swap_mode
-					|| bytemode == d_scalar_swap_mode || bytemode == q_swap_mode
-					|| bytemode == q_scalar_swap_mode))
-		swap_operand();
-
-	if (need_vex && bytemode != xmm_mode && bytemode != xmmq_mode
-			&& bytemode != d_scalar_mode && bytemode != d_scalar_swap_mode
-			&& bytemode != q_scalar_mode && bytemode != q_scalar_swap_mode
-			&& bytemode != vex_scalar_w_dq_mode) {
-		switch (vex.length) {
-		case 128:
-			names = names_xmm;
-			break;
-		case 256:
-			names = names_ymm;
-			break;
-		default:
-			abort();
-		}
-	} else
-		names = names_xmm;
-	oappend(names[reg]);
-	/* myan */
-	g_operands[g_num_operand].type = CA_OP_REGISTER;
-	g_operands[g_num_operand].reg.name = names[reg];
-	g_operands[g_num_operand].reg.size = 8;
-	g_operands[g_num_operand].reg.index = RXMM0 + reg;
-	g_num_operand++;
-}
-
-static void OP_MS(int bytemode, int sizeflag) {
-	if (modrm.mod == 3)
-		OP_EM(bytemode, sizeflag);
-	else
-		BadOp();
-}
-
-static void OP_XS(int bytemode, int sizeflag) {
-	if (modrm.mod == 3)
-		OP_EX(bytemode, sizeflag);
-	else
-		BadOp();
-}
-
-static void OP_M(int bytemode, int sizeflag) {
-	if (modrm.mod == 3)
-		/* bad bound,lea,lds,les,lfs,lgs,lss,cmpxchg8b,vmptrst modrm */
-		BadOp();
-	else
-		OP_E(bytemode, sizeflag);
-}
-
-static void OP_0f07(int bytemode, int sizeflag) {
-	if (modrm.mod != 3 || modrm.rm != 0)
-		BadOp();
-	else
-		OP_E(bytemode, sizeflag);
-}
-
-/* NOP is an alias of "xchg %ax,%ax" in 16bit mode, "xchg %eax,%eax" in
- 32bit mode and "xchg %rax,%rax" in 64bit mode.  */
-
-static void NOP_Fixup1(int bytemode, int sizeflag) {
-	if ((prefixes & PREFIX_DATA) != 0
-			|| (rex != 0 && rex != 0x48 && address_mode == mode_64bit))
-		OP_REG(bytemode, sizeflag);
-	else
-		strcpy(obuf, "nop");
-}
-
-static void NOP_Fixup2(int bytemode, int sizeflag) {
-	if ((prefixes & PREFIX_DATA) != 0
-			|| (rex != 0 && rex != 0x48 && address_mode == mode_64bit))
-		OP_IMREG(bytemode, sizeflag);
-}
-
-static const char * const Suffix3DNow[] = {
-/* 00 */NULL, NULL, NULL, NULL,
-/* 04 */NULL, NULL, NULL, NULL,
-/* 08 */NULL, NULL, NULL, NULL,
-/* 0C */"pi2fw", "pi2fd", NULL, NULL,
-/* 10 */NULL, NULL, NULL, NULL,
-/* 14 */NULL, NULL, NULL, NULL,
-/* 18 */NULL, NULL, NULL, NULL,
-/* 1C */"pf2iw", "pf2id", NULL, NULL,
-/* 20 */NULL, NULL, NULL, NULL,
-/* 24 */NULL, NULL, NULL, NULL,
-/* 28 */NULL, NULL, NULL, NULL,
-/* 2C */NULL, NULL, NULL, NULL,
-/* 30 */NULL, NULL, NULL, NULL,
-/* 34 */NULL, NULL, NULL, NULL,
-/* 38 */NULL, NULL, NULL, NULL,
-/* 3C */NULL, NULL, NULL, NULL,
-/* 40 */NULL, NULL, NULL, NULL,
-/* 44 */NULL, NULL, NULL, NULL,
-/* 48 */NULL, NULL, NULL, NULL,
-/* 4C */NULL, NULL, NULL, NULL,
-/* 50 */NULL, NULL, NULL, NULL,
-/* 54 */NULL, NULL, NULL, NULL,
-/* 58 */NULL, NULL, NULL, NULL,
-/* 5C */NULL, NULL, NULL, NULL,
-/* 60 */NULL, NULL, NULL, NULL,
-/* 64 */NULL, NULL, NULL, NULL,
-/* 68 */NULL, NULL, NULL, NULL,
-/* 6C */NULL, NULL, NULL, NULL,
-/* 70 */NULL, NULL, NULL, NULL,
-/* 74 */NULL, NULL, NULL, NULL,
-/* 78 */NULL, NULL, NULL, NULL,
-/* 7C */NULL, NULL, NULL, NULL,
-/* 80 */NULL, NULL, NULL, NULL,
-/* 84 */NULL, NULL, NULL, NULL,
-/* 88 */NULL, NULL, "pfnacc", NULL,
-/* 8C */NULL, NULL, "pfpnacc", NULL,
-/* 90 */"pfcmpge", NULL, NULL, NULL,
-/* 94 */"pfmin", NULL, "pfrcp", "pfrsqrt",
-/* 98 */NULL, NULL, "pfsub", NULL,
-/* 9C */NULL, NULL, "pfadd", NULL,
-/* A0 */"pfcmpgt", NULL, NULL, NULL,
-/* A4 */"pfmax", NULL, "pfrcpit1", "pfrsqit1",
-/* A8 */NULL, NULL, "pfsubr", NULL,
-/* AC */NULL, NULL, "pfacc", NULL,
-/* B0 */"pfcmpeq", NULL, NULL, NULL,
-/* B4 */"pfmul", NULL, "pfrcpit2", "pmulhrw",
-/* B8 */NULL, NULL, NULL, "pswapd",
-/* BC */NULL, NULL, NULL, "pavgusb",
-/* C0 */NULL, NULL, NULL, NULL,
-/* C4 */NULL, NULL, NULL, NULL,
-/* C8 */NULL, NULL, NULL, NULL,
-/* CC */NULL, NULL, NULL, NULL,
-/* D0 */NULL, NULL, NULL, NULL,
-/* D4 */NULL, NULL, NULL, NULL,
-/* D8 */NULL, NULL, NULL, NULL,
-/* DC */NULL, NULL, NULL, NULL,
-/* E0 */NULL, NULL, NULL, NULL,
-/* E4 */NULL, NULL, NULL, NULL,
-/* E8 */NULL, NULL, NULL, NULL,
-/* EC */NULL, NULL, NULL, NULL,
-/* F0 */NULL, NULL, NULL, NULL,
-/* F4 */NULL, NULL, NULL, NULL,
-/* F8 */NULL, NULL, NULL, NULL,
-/* FC */NULL, NULL, NULL, NULL, };
-
-static void OP_3DNowSuffix(int bytemode,
-		int sizeflag) {
-	const char *mnemonic;
-
-	FETCH_DATA(the_info, codep + 1);
-	/* AMD 3DNow! instructions are specified by an opcode suffix in the
-	 place where an 8-bit immediate would normally go.  ie. the last
-	 byte of the instruction.  */
-	obufp = mnemonicendp;
-	mnemonic = Suffix3DNow[*codep++ & 0xff];
-	if (mnemonic)
-		oappend(mnemonic);
-	else {
-		/* Since a variable sized modrm/sib chunk is between the start
-		 of the opcode (0x0f0f) and the opcode suffix, we need to do
-		 all the modrm processing first, and don't know until now that
-		 we have a bad opcode.  This necessitates some cleaning up.  */
-		op_out[0][0] = '\0';
-		op_out[1][0] = '\0';
-		BadOp();
-	}
-	mnemonicendp = obufp;
-}
-
-static struct op simd_cmp_op[] = { { STRING_COMMA_LEN ("eq") }, {
-		STRING_COMMA_LEN ("lt") }, { STRING_COMMA_LEN ("le") }, {
-		STRING_COMMA_LEN ("unord") }, { STRING_COMMA_LEN ("neq") }, {
-		STRING_COMMA_LEN ("nlt") }, { STRING_COMMA_LEN ("nle") }, {
-		STRING_COMMA_LEN ("ord") } };
-
-static void CMP_Fixup(int bytemode,
-		int sizeflag) {
-	unsigned int cmp_type;
-
-	FETCH_DATA(the_info, codep + 1);
-	cmp_type = *codep++ & 0xff;
-	if (cmp_type < ARRAY_SIZE (simd_cmp_op)) {
-		char suffix[3];
-		char *p = mnemonicendp - 2;
-		suffix[0] = p[0];
-		suffix[1] = p[1];
-		suffix[2] = '\0';
-		sprintf(p, "%s%s", simd_cmp_op[cmp_type].name, suffix);
-		mnemonicendp += simd_cmp_op[cmp_type].len;
-	} else {
-		/* We have a reserved extension byte.  Output it directly.  */
-		scratchbuf[0] = '$';
-		print_operand_value(scratchbuf + 1, 1, cmp_type);
-		oappend(scratchbuf + intel_syntax);
-		scratchbuf[0] = '\0';
-	}
-}
-
-static void OP_Mwait(int bytemode,
-		int sizeflag) {
-	/* mwait %eax,%ecx  */
-	if (!intel_syntax) {
-		const char **names = (address_mode == mode_64bit ? names64 : names32);
-		strcpy(op_out[0], names[0]);
-		strcpy(op_out[1], names[1]);
-		two_source_ops = 1;
-	}
-	/* Skip mod/rm byte.  */MODRM_CHECK;
-	codep++;
-}
-
-static void OP_Monitor(int bytemode,
-		int sizeflag) {
-	/* monitor %eax,%ecx,%edx"  */
-	if (!intel_syntax) {
-		const char **op1_names;
-		const char **names = (address_mode == mode_64bit ? names64 : names32);
-
-		if (!(prefixes & PREFIX_ADDR))
-			op1_names = (address_mode == mode_16bit ? names16 : names);
-		else {
-			/* Remove "addr16/addr32".  */
-			all_prefixes[last_addr_prefix] = 0;
-			op1_names = (address_mode != mode_32bit ? names32 : names16);
-			used_prefixes |= PREFIX_ADDR;
-		}
-		strcpy(op_out[0], op1_names[0]);
-		strcpy(op_out[1], names[1]);
-		strcpy(op_out[2], names[2]);
-		two_source_ops = 1;
-	}
-	/* Skip mod/rm byte.  */MODRM_CHECK;
-	codep++;
-}
-
-static void BadOp(void) {
-	/* Throw away prefixes and 1st. opcode byte.  */
-	codep = insn_codep + 1;
-	oappend("(bad)");
-}
-
-static void REP_Fixup(int bytemode, int sizeflag) {
-	/* The 0xf3 prefix should be displayed as "rep" for ins, outs, movs,
-	 lods and stos.  */
-	if (prefixes & PREFIX_REPZ)
-		all_prefixes[last_repz_prefix] = REP_PREFIX;
-
-	switch (bytemode) {
-	case al_reg:
-	case eAX_reg:
-	case indir_dx_reg:
-		OP_IMREG(bytemode, sizeflag);
-		break;
-	case eDI_reg:
-		OP_ESreg(bytemode, sizeflag);
-		break;
-	case eSI_reg:
-		OP_DSreg(bytemode, sizeflag);
-		break;
-	default:
-		abort();
-		break;
-	}
-}
-
-static void CMPXCHG8B_Fixup(int bytemode, int sizeflag) {
-	USED_REX(REX_W);
-	if (rex & REX_W) {
-		/* Change cmpxchg8b to cmpxchg16b.  */
-		char *p = mnemonicendp - 2;
-		mnemonicendp = stpcpy(p, "16b");
-		bytemode = o_mode;
-	}
-	OP_M(bytemode, sizeflag);
-}
-
-static void XMM_Fixup(int reg, int sizeflag) {
-	const char **names;
-
-	if (need_vex) {
-		switch (vex.length) {
-		case 128:
-			names = names_xmm;
-			break;
-		case 256:
-			names = names_ymm;
-			break;
-		default:
-			abort();
-		}
-	} else
-		names = names_xmm;
-	oappend(names[reg]);
-}
-
-static void CRC32_Fixup(int bytemode, int sizeflag) {
-	/* Add proper suffix to "crc32".  */
-	char *p = mnemonicendp;
-
-	switch (bytemode) {
-	case b_mode:
-		if (intel_syntax)
-			goto skip;
-
-		*p++ = 'b';
-		break;
-	case v_mode:
-		if (intel_syntax)
-			goto skip;
-
-		USED_REX(REX_W);
-		if (rex & REX_W)
-			*p++ = 'q';
-		else {
-			if (sizeflag & DFLAG)
-				*p++ = 'l';
-			else
-				*p++ = 'w';
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		break;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		break;
-	}
-	mnemonicendp = p;
-	*p = '\0';
-
-	skip: if (modrm.mod == 3) {
-		int add;
-
-		/* Skip mod/rm byte.  */MODRM_CHECK;
-		codep++;
-
-		USED_REX(REX_B);
-		add = (rex & REX_B) ? 8 : 0;
-		if (bytemode == b_mode) {
-			USED_REX(0);
-			if (rex)
-				oappend(names8rex[modrm.rm + add]);
-			else
-				oappend(names8[modrm.rm + add]);
-		} else {
-			USED_REX(REX_W);
-			if (rex & REX_W)
-				oappend(names64[modrm.rm + add]);
-			else if ((prefixes & PREFIX_DATA))
-				oappend(names16[modrm.rm + add]);
-			else
-				oappend(names32[modrm.rm + add]);
-		}
-	} else
-		OP_E(bytemode, sizeflag);
-}
-
-static void FXSAVE_Fixup(int bytemode, int sizeflag) {
-	/* Add proper suffix to "fxsave" and "fxrstor".  */
-	USED_REX(REX_W);
-	if (rex & REX_W) {
-		char *p = mnemonicendp;
-		*p++ = '6';
-		*p++ = '4';
-		*p = '\0';
-		mnemonicendp = p;
-	}
-	OP_M(bytemode, sizeflag);
-}
-
-/* Display the destination register operand for instructions with
- VEX. */
-
-static void OP_VEX(int bytemode, int sizeflag) {
-	int reg;
-	const char **names;
-
-	if (!need_vex)
-		abort();
-
-	if (!need_vex_reg)
-		return;
-
-	reg = vex.register_specifier;
-	if (bytemode == vex_scalar_mode) {
-		oappend(names_xmm[reg]);
-		return;
-	}
-
-	switch (vex.length) {
-	case 128:
-		switch (bytemode) {
-		case vex_mode:
-		case vex128_mode:
-			names = names_xmm;
-			break;
-		case dq_mode:
-			if (vex.w)
-				names = names64;
-			else
-				names = names32;
-			break;
-		default:
-			abort();
-			return;
-		}
-		break;
-	case 256:
-		switch (bytemode) {
-		case vex_mode:
-		case vex256_mode:
-			break;
-		default:
-			abort();
-			return;
-		}
-
-		names = names_ymm;
-		break;
-	default:
-		abort();
-		break;
-	}
-	oappend(names[reg]);
-}
-
-/* Get the VEX immediate byte without moving codep.  */
-
-static unsigned char get_vex_imm8(int sizeflag, int opnum) {
-	int bytes_before_imm = 0;
-
-	if (modrm.mod != 3) {
-		/* There are SIB/displacement bytes.  */
-		if ((sizeflag & AFLAG) || address_mode == mode_64bit) {
-			/* 32/64 bit address mode */
-			int base = modrm.rm;
-
-			/* Check SIB byte.  */
-			if (base == 4) {
-				FETCH_DATA(the_info, codep + 1);
-				base = *codep & 7;
-				/* When decoding the third source, don't increase
-				 bytes_before_imm as this has already been incremented
-				 by one in OP_E_memory while decoding the second
-				 source operand.  */
-				if (opnum == 0)
-					bytes_before_imm++;
-			}
-
-			/* Don't increase bytes_before_imm when decoding the third source,
-			 it has already been incremented by OP_E_memory while decoding
-			 the second source operand.  */
-			if (opnum == 0) {
-				switch (modrm.mod) {
-				case 0:
-					/* When modrm.rm == 5 or modrm.rm == 4 and base in
-					 SIB == 5, there is a 4 byte displacement.  */
-					if (base != 5)
-						/* No displacement. */
-						break;
-				case 2:
-					/* 4 byte displacement.  */
-					bytes_before_imm += 4;
-					break;
-				case 1:
-					/* 1 byte displacement.  */
-					bytes_before_imm++;
-					break;
-				}
-			}
-		} else {
-			/* 16 bit address mode */
-			/* Don't increase bytes_before_imm when decoding the third source,
-			 it has already been incremented by OP_E_memory while decoding
-			 the second source operand.  */
-			if (opnum == 0) {
-				switch (modrm.mod) {
-				case 0:
-					/* When modrm.rm == 6, there is a 2 byte displacement.  */
-					if (modrm.rm != 6)
-						/* No displacement. */
-						break;
-				case 2:
-					/* 2 byte displacement.  */
-					bytes_before_imm += 2;
-					break;
-				case 1:
-					/* 1 byte displacement: when decoding the third source,
-					 don't increase bytes_before_imm as this has already
-					 been incremented by one in OP_E_memory while decoding
-					 the second source operand.  */
-					if (opnum == 0)
-						bytes_before_imm++;
-
-					break;
-				}
-			}
-		}
-	}
-
-	FETCH_DATA(the_info, codep + bytes_before_imm + 1);
-	return codep[bytes_before_imm];
-}
-
-static void OP_EX_VexReg(int bytemode, int sizeflag, int reg) {
-	const char **names;
-
-	if (reg == -1 && modrm.mod != 3) {
-		OP_E_memory(bytemode, sizeflag);
-		return;
-	} else {
-		if (reg == -1) {
-			reg = modrm.rm;
-			USED_REX(REX_B);
-			if (rex & REX_B)
-				reg += 8;
-		} else if (reg > 7 && address_mode != mode_64bit)
-			BadOp();
-	}
-
-	switch (vex.length) {
-	case 128:
-		names = names_xmm;
-		break;
-	case 256:
-		names = names_ymm;
-		break;
-	default:
-		abort();
-	}
-	oappend(names[reg]);
-}
-
-static void OP_EX_VexImmW(int bytemode, int sizeflag) {
-	int reg = -1;
-	static unsigned char vex_imm8;
-
-	if (vex_w_done == 0) {
-		vex_w_done = 1;
-
-		/* Skip mod/rm byte.  */MODRM_CHECK;
-		codep++;
-
-		vex_imm8 = get_vex_imm8(sizeflag, 0);
-
-		if (vex.w)
-			reg = vex_imm8 >> 4;
-
-		OP_EX_VexReg(bytemode, sizeflag, reg);
-	} else if (vex_w_done == 1) {
-		vex_w_done = 2;
-
-		if (!vex.w)
-			reg = vex_imm8 >> 4;
-
-		OP_EX_VexReg(bytemode, sizeflag, reg);
-	} else {
-		/* Output the imm8 directly.  */
-		scratchbuf[0] = '$';
-		print_operand_value(scratchbuf + 1, 1, vex_imm8 & 0xf);
-		oappend(scratchbuf + intel_syntax);
-		scratchbuf[0] = '\0';
-		codep++;
-	}
-}
-
-static void OP_Vex_2src(int bytemode, int sizeflag) {
-	if (modrm.mod == 3) {
-		int reg = modrm.rm;
-		USED_REX(REX_B);
-		if (rex & REX_B)
-			reg += 8;
-		oappend(names_xmm[reg]);
-	} else {
-		if (intel_syntax && (bytemode == v_mode || bytemode == v_swap_mode)) {
-			bytemode = (prefixes & PREFIX_DATA) ? x_mode : q_mode;
-			used_prefixes |= (prefixes & PREFIX_DATA);
-		}
-		OP_E(bytemode, sizeflag);
-	}
-}
-
-static void OP_Vex_2src_1(int bytemode, int sizeflag) {
-	if (modrm.mod == 3) {
-		/* Skip mod/rm byte.   */
-		MODRM_CHECK;
-		codep++;
-	}
-
-	if (vex.w)
-		oappend(names_xmm[vex.register_specifier]);
-	else
-		OP_Vex_2src(bytemode, sizeflag);
-}
-
-static void OP_Vex_2src_2(int bytemode, int sizeflag) {
-	if (vex.w)
-		OP_Vex_2src(bytemode, sizeflag);
-	else
-		oappend(names_xmm[vex.register_specifier]);
-}
-
-static void OP_EX_VexW(int bytemode, int sizeflag) {
-	int reg = -1;
-
-	if (!vex_w_done) {
-		vex_w_done = 1;
-
-		/* Skip mod/rm byte.  */MODRM_CHECK;
-		codep++;
-
-		if (vex.w)
-			reg = get_vex_imm8(sizeflag, 0) >> 4;
-	} else {
-		if (!vex.w)
-			reg = get_vex_imm8(sizeflag, 1) >> 4;
-	}
-
-	OP_EX_VexReg(bytemode, sizeflag, reg);
-}
-
-static void VEXI4_Fixup(int bytemode,
-		int sizeflag) {
-	/* Skip the immediate byte and check for invalid bits.  */
-	FETCH_DATA(the_info, codep + 1);
-	if (*codep++ & 0xf)
-		BadOp();
-}
-
-static void OP_REG_VexI4(int bytemode, int sizeflag) {
-	int reg;
-	const char **names;
-
-	FETCH_DATA(the_info, codep + 1);
-	reg = *codep++;
-
-	if (bytemode != x_mode)
-		abort();
-
-	if (reg & 0xf)
-		BadOp();
-
-	reg >>= 4;
-	if (reg > 7 && address_mode != mode_64bit)
-		BadOp();
-
-	switch (vex.length) {
-	case 128:
-		names = names_xmm;
-		break;
-	case 256:
-		names = names_ymm;
-		break;
-	default:
-		abort();
-	}
-	oappend(names[reg]);
-}
-
-static void OP_XMM_VexW(int bytemode, int sizeflag) {
-	/* Turn off the REX.W bit since it is used for swapping operands
-	 now.  */
-	rex &= ~REX_W;
-	OP_XMM(bytemode, sizeflag);
-}
-
-static void OP_EX_Vex(int bytemode, int sizeflag) {
-	if (modrm.mod != 3) {
-		if (vex.register_specifier != 0)
-			BadOp();
-		need_vex_reg = 0;
-	}
-	OP_EX(bytemode, sizeflag);
-}
-
-static void OP_XMM_Vex(int bytemode, int sizeflag) {
-	if (modrm.mod != 3) {
-		if (vex.register_specifier != 0)
-			BadOp();
-		need_vex_reg = 0;
-	}
-	OP_XMM(bytemode, sizeflag);
-}
-
-static void VZERO_Fixup(int bytemode,
-		int sizeflag) {
-	switch (vex.length) {
-	case 128:
-		mnemonicendp = stpcpy(obuf, "vzeroupper");
-		break;
-	case 256:
-		mnemonicendp = stpcpy(obuf, "vzeroall");
-		break;
-	default:
-		abort();
-	}
-}
-
-static struct op vex_cmp_op[] = { { STRING_COMMA_LEN ("eq") }, {
-		STRING_COMMA_LEN ("lt") }, { STRING_COMMA_LEN ("le") }, {
-		STRING_COMMA_LEN ("unord") }, { STRING_COMMA_LEN ("neq") }, {
-		STRING_COMMA_LEN ("nlt") }, { STRING_COMMA_LEN ("nle") }, {
-		STRING_COMMA_LEN ("ord") }, { STRING_COMMA_LEN ("eq_uq") }, {
-		STRING_COMMA_LEN ("nge") }, { STRING_COMMA_LEN ("ngt") }, {
-		STRING_COMMA_LEN ("false") }, { STRING_COMMA_LEN ("neq_oq") }, {
-		STRING_COMMA_LEN ("ge") }, { STRING_COMMA_LEN ("gt") }, {
-		STRING_COMMA_LEN ("true") }, { STRING_COMMA_LEN ("eq_os") }, {
-		STRING_COMMA_LEN ("lt_oq") }, { STRING_COMMA_LEN ("le_oq") }, {
-		STRING_COMMA_LEN ("unord_s") }, { STRING_COMMA_LEN ("neq_us") }, {
-		STRING_COMMA_LEN ("nlt_uq") }, { STRING_COMMA_LEN ("nle_uq") }, {
-		STRING_COMMA_LEN ("ord_s") }, { STRING_COMMA_LEN ("eq_us") }, {
-		STRING_COMMA_LEN ("nge_uq") }, { STRING_COMMA_LEN ("ngt_uq") }, {
-		STRING_COMMA_LEN ("false_os") }, { STRING_COMMA_LEN ("neq_os") }, {
-		STRING_COMMA_LEN ("ge_oq") }, { STRING_COMMA_LEN ("gt_oq") }, {
-		STRING_COMMA_LEN ("true_us") }, };
-
-static void VCMP_Fixup(int bytemode,
-		int sizeflag) {
-	unsigned int cmp_type;
-
-	FETCH_DATA(the_info, codep + 1);
-	cmp_type = *codep++ & 0xff;
-	if (cmp_type < ARRAY_SIZE (vex_cmp_op)) {
-		char suffix[3];
-		char *p = mnemonicendp - 2;
-		suffix[0] = p[0];
-		suffix[1] = p[1];
-		suffix[2] = '\0';
-		sprintf(p, "%s%s", vex_cmp_op[cmp_type].name, suffix);
-		mnemonicendp += vex_cmp_op[cmp_type].len;
-	} else {
-		/* We have a reserved extension byte.  Output it directly.  */
-		scratchbuf[0] = '$';
-		print_operand_value(scratchbuf + 1, 1, cmp_type);
-		oappend(scratchbuf + intel_syntax);
-		scratchbuf[0] = '\0';
-	}
-}
-
-static const struct op pclmul_op[] = { { STRING_COMMA_LEN ("lql") }, {
-		STRING_COMMA_LEN ("hql") }, { STRING_COMMA_LEN ("lqh") }, {
-		STRING_COMMA_LEN ("hqh") } };
-
-static void PCLMUL_Fixup(int bytemode,
-		int sizeflag) {
-	unsigned int pclmul_type;
-
-	FETCH_DATA(the_info, codep + 1);
-	pclmul_type = *codep++ & 0xff;
-	switch (pclmul_type) {
-	case 0x10:
-		pclmul_type = 2;
-		break;
-	case 0x11:
-		pclmul_type = 3;
-		break;
-	default:
-		break;
-	}
-	if (pclmul_type < ARRAY_SIZE (pclmul_op)) {
-		char suffix[4];
-		char *p = mnemonicendp - 3;
-		suffix[0] = p[0];
-		suffix[1] = p[1];
-		suffix[2] = p[2];
-		suffix[3] = '\0';
-		sprintf(p, "%s%s", pclmul_op[pclmul_type].name, suffix);
-		mnemonicendp += pclmul_op[pclmul_type].len;
-	} else {
-		/* We have a reserved extension byte.  Output it directly.  */
-		scratchbuf[0] = '$';
-		print_operand_value(scratchbuf + 1, 1, pclmul_type);
-		oappend(scratchbuf + intel_syntax);
-		scratchbuf[0] = '\0';
-	}
-}
-
-static void MOVBE_Fixup(int bytemode, int sizeflag) {
-	/* Add proper suffix to "movbe".  */
-	char *p = mnemonicendp;
-
-	switch (bytemode) {
-	case v_mode:
-		if (intel_syntax)
-			goto skip;
-
-		USED_REX(REX_W);
-		if (sizeflag & SUFFIX_ALWAYS) {
-			if (rex & REX_W)
-				*p++ = 'q';
-			else {
-				if (sizeflag & DFLAG)
-					*p++ = 'l';
-				else
-					*p++ = 'w';
-				used_prefixes |= (prefixes & PREFIX_DATA);
-			}
-		}
-		break;
-	default:
-		oappend(INTERNAL_DISASSEMBLER_ERROR);
-		break;
-	}
-	mnemonicendp = p;
-	*p = '\0';
-
-	skip: OP_M(bytemode, sizeflag);
-}
-
-static void OP_LWPCB_E(int bytemode,
-		int sizeflag) {
-	int reg;
-	const char **names;
-
-	/* Skip mod/rm byte.  */MODRM_CHECK;
-	codep++;
-
-	if (vex.w)
-		names = names64;
-	else
-		names = names32;
-
-	reg = modrm.rm;
-	USED_REX(REX_B);
-	if (rex & REX_B)
-		reg += 8;
-
-	oappend(names[reg]);
-}
-
-static void OP_LWP_E(int bytemode,
-		int sizeflag) {
-	const char **names;
-
-	if (vex.w)
-		names = names64;
-	else
-		names = names32;
-
-	oappend(names[vex.register_specifier]);
-}
-
-/*********************************************************************
- * Annotated disassembly instructions
- ********************************************************************/
-struct ca_x86_register
-{
-	const char*  name;			// intel syntax
-	unsigned int index:6;		// internal index (see x_type.h)
-	unsigned int size:5;		// 1/2/4/8/16 bytes
-	unsigned int x64_only:1;	// set if only used by 64bit
-	unsigned int param_x64:4;	// nth (1..6) parameter, 0 means not a param reg
-	unsigned int preserved_x64:1;	// 64bit - preserved across function call
-	unsigned int preserved_x32:1;	// 32bit - preserved across function call
-	unsigned int float_reg:1;	// 1=float 0=integer
-	int gdb_regnum;				// regnum known to gdb
-};
-
-// this name list corresponds to the register index defined in x_type.h
-static struct ca_x86_register g_reg_infos[] = {
-	//name  index  size x64 par64 prsv64 prev32 float regnum
-	{"rax",   RAX,    8,  1,    0,     0,     0,    0,    -1},
-	{"rcx",   RCX,    8,  1,    4,     0,     0,    0,    -1},
-	{"rdx",   RDX,    8,  1,    3,     0,     0,    0,    -1},
-	{"rbx",   RBX,    8,  1,    0,     1,     0,    0,    -1},
-	{"rsp",   RSP,    8,  1,    0,     0,     0,    0,    -1},
-	{"rbp",   RBP,    8,  1,    0,     1,     0,    0,    -1},
-	{"rsi",   RSI,    8,  1,    2,     0,     0,    0,    -1},
-	{"rdi",   RDI,    8,  1,    1,     0,     0,    0,    -1},
-	{"r8",    R8,     8,  1,    5,     0,     0,    0,    -1},
-	{"r9",    R9,     8,  1,    6,     0,     0,    0,    -1},
-	{"r10",   R10,    8,  1,    0,     0,     0,    0,    -1},
-	{"r11",   R11,    8,  1,    0,     0,     0,    0,    -1},
-	{"r12",   R12,    8,  1,    0,     1,     0,    0,    -1},
-	{"r13",   R13,    8,  1,    0,     1,     0,    0,    -1},
-	{"r14",   R14,    8,  1,    0,     1,     0,    0,    -1},
-	{"r15",   R15,    8,  1,    0,     1,     0,    0,    -1},
-	{"rip",   RIP,    8,  1,    0,     0,     0,    0,    -1},
-	//name  index  size x64 par64 prsv64 prev32 float regnum
-	{"eax",   RAX,    4,  0,    0,     0,     0,    0,    -1},
-	{"ecx",   RCX,    4,  0,    4,     0,     0,    0,    -1},
-	{"edx",   RDX,    4,  0,    3,     0,     0,    0,    -1},
-	{"ebx",   RBX,    4,  0,    0,     0,     1,    0,    -1},
-	{"esp",   RSP,    4,  0,    0,     0,     0,    0,    -1},
-	{"ebp",   RBP,    4,  0,    0,     0,     0,    0,    -1},
-	{"esi",   RSI,    4,  0,    2,     0,     1,    0,    -1},
-	{"edi",   RDI,    4,  0,    1,     0,     1,    0,    -1},
-	{"r8d",   R8,     4,  1,    5,     0,     0,    0,    -1},
-	{"r9d",   R9,     4,  1,    6,     0,     0,    0,    -1},
-	{"r10d",  R10,    4,  1,    0,     0,     0,    0,    -1},
-	{"r11d",  R11,    4,  1,    0,     0,     0,    0,    -1},
-	{"r12d",  R12,    4,  1,    0,     0,     0,    0,    -1},
-	{"r13d",  R13,    4,  1,    0,     0,     0,    0,    -1},
-	{"r14d",  R14,    4,  1,    0,     0,     0,    0,    -1},
-	{"r15d",  R15,    4,  1,    0,     0,     0,    0,    -1},
-	//name  index  size x64 par64 prsv64 prev32 float regnum
-	{"di",    RDI,    2,  0,    1,     0,     0,    0,    -1},
-	{"si",    RSI,    2,  0,    2,     0,     0,    0,    -1},
-	{"dx",    RDX,    2,  0,    3,     0,     0,    0,    -1},
-	{"cx",    RCX,    2,  0,    4,     0,     0,    0,    -1},
-	{"r8w",   R8,     2,  0,    5,     0,     0,    0,    -1},
-	{"r9w",   R9,     2,  0,    6,     0,     0,    0,    -1},
-	//  "%r10w", "%r11w", "%r12w", "%r13w", "%r14w", "%r15w",
-	//name  index  size x64 par64 prsv64 prev32 float regnum
-	{"dil",  RDI,    1,  0,    1,     0,     0,    0,    -1},
-	{"sil",  RSI,    1,  0,    2,     0,     0,    0,    -1},
-	{"dl",   RDX,    1,  0,    3,     0,     0,    0,    -1},
-	{"cl",   RCX,    1,  0,    4,     0,     0,    0,    -1},
-	{"r8b",  R8,     1,  0,    5,     0,     0,    0,    -1},
-	{"r9b",  R9,     1,  0,    6,     0,     0,    0,    -1},
-	// "%r10b", "%r11b", "%r12b", "%r13b", "%r14b", "%r15b" };
-	//name    index size x64 par64 prsv64 prev32 float regnum
-	{"xmm0",  RXMM0,  16,  0,    1,     0,     0,    1,    -1},
-	{"xmm1",  RXMM1,  16,  0,    2,     0,     0,    1,    -1},
-	{"xmm2",  RXMM2,  16,  0,    3,     0,     0,    1,    -1},
-	{"xmm3",  RXMM3,  16,  0,    4,     0,     0,    1,    -1},
-	{"xmm4",  RXMM4,  16,  0,    5,     0,     0,    1,    -1},
-	{"xmm5",  RXMM5,  16,  0,    6,     0,     0,    1,    -1},
-	{"xmm6",  RXMM6,  16,  0,    7,     0,     0,    1,    -1},
-	{"xmm7",  RXMM7,  16,  0,    8,     0,     0,    1,    -1},
-	{"xmm8",  RXMM8,  16,  1,    0,     0,     0,    1,    -1},
-	{"xmm9",  RXMM9,  16,  1,    0,     0,     0,    1,    -1},
-	{"xmm10", RXMM10, 16,  1,    0,     0,     0,    1,    -1},
-	{"xmm11", RXMM11, 16,  1,    0,     0,     0,    1,    -1},
-	{"xmm12", RXMM12, 16,  1,    0,     0,     0,    1,    -1},
-	{"xmm13", RXMM13, 16,  1,    0,     0,     0,    1,    -1},
-	{"xmm14", RXMM14, 16,  1,    0,     0,     0,    1,    -1},
-	{"xmm15", RXMM15, 16,  1,    0,     0,     0,    1,    -1}
-	//name      index size x64 par64 prsv64 prev32 float regnum
-	//{"st(0)", RXMM0,   8,  0,    0,     0,     0,    1,    -1}
-	//"st(1-7)"
-};
-#define NUM_KNOWN_REGS (sizeof(g_reg_infos)/sizeof(g_reg_infos[0]))
-
-/*
- *
- */
-static int dump_insns(struct disassemble_info* di, ULONG64 low, ULONG64 high, ULONG64 offset, ULONG64 intr)
-{
-	int num_displayed = 0;
-	ULONG64 pc;
-
-	for (pc = low; pc < high;)
-	{
-		num_displayed++;
-		if (!g_dis_silent)
-		{
-			if (pc == intr)
-				dprintf("==> ");
-			dprintf("%p <+0x%02lx>:    ", pc, pc - low + offset);
-		}
-		pc += print_insn(pc, di);
-	}
-	return num_displayed;
-}
-
-static int
-dis_asm_read_memory (ULONG64 memaddr,
-		unsigned char *myaddr,
-		unsigned int length,
-		struct disassemble_info *dinfo)
-{
-	ULONG cb;
-	if (!ReadMemory(memaddr, myaddr, length, &cb) || cb != length)
-		return -1;
-	return 0;
-}
-
-static void
-dis_asm_memory_error (int status, ULONG64 memaddr,
-		      struct disassemble_info *info)
-{
-	dprintf("Failed to read memory at %p\n", memaddr);
-}
-
-static int
-fprintf_disasm (void *stream, const char *format, ...)
-{
-  va_list args;
-  va_start (args, format);
-  dprintf(format, args);
-  va_end (args);
-  return 0;
-}
-
-static void dis_print_address
-	(ULONG64 addr, struct disassemble_info *dinfo)
-{
-	dprintf("0x%I64x", addr);
-}
-
-static bool
-validate_and_set_reg_param(const char* cursor)
-{
-	int ptr_bit = g_ptr_bit;
-	int i;
-	for (i = 0; i < NUM_KNOWN_REGS; i++)
-	{
-		if (ptr_bit == 32 && g_reg_infos[i].x64_only)
-			continue;
+		if (strcmp(str1, str2) == 0)
+			rc = 1;
 		else
-		{
-			const char* reg_name = g_reg_infos[i].name;
-			int len = strlen(reg_name);
-			if (strncmp(cursor, reg_name, len) == 0 && *(cursor + len) == '=')
-			{
-				int index = g_reg_infos[i].index;
-				g_regs[index].known = 1;
-				g_regs[index].value = GetExpression ((char*)(cursor + len + 1));
-				return true;
-			}
-		}
+			rc = 0;
 	}
-	return false;
-}
-
-#define MAX_NUM_OPTIONS 32
-// End each option with '\0', return number of options
-static int parse_options(char* arg, char** out)
-{
-	int count = 0;
-	char* cursor = arg;
-	char* end    = arg + strlen(arg);
-	while (cursor < end && *cursor)
-	{
-		if (*cursor == ' ' || *cursor == '\t')
-			cursor++;
-		else
-		{
-			char* next = cursor + 1;
-			// push this option to the back of the array
-			out[count] = cursor;
-			count++;
-			if (count > MAX_NUM_OPTIONS)
-			{
-				dprintf ("Warning: Too many options > %d\n", MAX_NUM_OPTIONS);
-				return count;
-			}
-			// end this option with '\0'
-			// find the end of this argument
-			while (*next && *next != ' ' && *next != '\t')
-				next++;
-			*next = '\0';
-			cursor = next + 1;
-		}
-	}
-	return count;
-}
-
-/*
- * A parameter passed thourgh register but has a stack replica
- */
-static void set_parameter_reg(ULONG64 addr, ULONG sz, int reg_index)
-{
-	size_t val = 0;
-	ULONG cb;
-	if (!g_regs[reg_index].known && ReadMemory(addr, &val, sz, &cb) && cb == sz)
-	{
-		g_regs[reg_index].value = val;
-		g_regs[reg_index].known = 1;
-	}
-}
-
-/*
- * Retrun true if the type name sounds like an integer class
- */
-static bool is_integer_class(const char* type_name)
-{
-	if (strstr(type_name, "bool")
-		|| strstr(type_name, "char")
-		|| strstr(type_name, "short")
-		|| strstr(type_name, "int")
-		|| strstr(type_name, "long") )
-		return true;
-	else
-		return false;
-}
-
-/*
- * By VS2005's convention of parameter passing of x86_64 architecture,
- *  the first four integer parameters are passed through registers (rcx, rdx, r8, r9)
- *  the first four float parameters are passed through registers (xmm0-3)
- */
-static void get_function_parameters(DEBUG_STACK_FRAME* framep)
-{
-	char name_buf[NAME_BUF_SZ];
-	// Set scope to selected frame
-	HRESULT hr = gDebugSymbols3->SetScopeFrameByIndex(framep->FrameNumber);
-	if (FAILED(hr))
-		return;
-	// Retrieve COM interface to parameter symbols of this frame/function's scope
-	PDEBUG_SYMBOL_GROUP2 symbolGroup2 = NULL;
-	if (gDebugSymbols3->GetScopeSymbolGroup2(DEBUG_SCOPE_GROUP_ARGUMENTS, NULL, &symbolGroup2) != S_OK)
-		return;
-	// Iterate all parameters
-	// Since symbols in the group are not always follow the order of parameters, we have to sort it.
-	ULONG num_sym;
-	if (symbolGroup2->GetNumberSymbols(&num_sym) != S_OK)
-		return;
-	std::map<ULONG64,ULONG> integer_params_by_addr;
-	ULONG i;
-	for (i = 0; i < num_sym; i++)
-	{
-		DEBUG_SYMBOL_ENTRY entry;
-		hr = symbolGroup2->GetSymbolEntryInformation(i, &entry);
-		if (hr != S_OK)
-			break;
-		// only integer parameter is considered
-		if (entry.Size <= sizeof(size_t))
-		{
-			bool integer_class = false;
-			if (entry.Tag == SymTagPointerType || entry.Tag == SymTagArrayType || entry.Tag == SymTagEnum)
-				integer_class = true;
-			else
-			{
-				hr = symbolGroup2->GetSymbolTypeName(i, name_buf, NAME_BUF_SZ, NULL);
-				if (SUCCEEDED(hr) && is_integer_class(name_buf))
-					integer_class = true;
-			}
-			if (integer_class)
-			{
-				// symbol location
-				ULONG64 location;
-				hr = symbolGroup2->GetSymbolOffset(i, &location);
-				if (FAILED(hr))
-					break;
-				integer_params_by_addr.insert(std::pair<ULONG64,ULONG>(location, entry.Size));
-			}
-		}
-	}
-	// Setup registers used for parameter passing
-	std::map<ULONG64,ULONG>::iterator itr;
-	int param_reg_index[4] = {RCX, RDX, R8, R9};
-	for (itr = integer_params_by_addr.begin(), i = 0;
-			itr != integer_params_by_addr.end() && i < 4;
-			itr++, i++)
-	{
-		set_parameter_reg((*itr).first, (*itr).second, param_reg_index[i]);
-	}
-	// Print out parameters
-	if (!g_dis_silent)
-	{
-		dprintf("\nParameters:\n");
-		for (i = 0; i < num_sym; i++)
-		{
-			// type name is included in the vale text (sometimes ??)
-			hr = symbolGroup2->GetSymbolTypeName(i, name_buf, NAME_BUF_SZ, NULL);
-			if (SUCCEEDED(hr))
-				dprintf("\t%s", name_buf);
-			// symbol name
-			hr = symbolGroup2->GetSymbolName(i, name_buf, NAME_BUF_SZ, NULL);
-			if (FAILED(hr))
-				break;
-			dprintf(" %s", name_buf);
-			hr = symbolGroup2->GetSymbolValueText(i, name_buf, NAME_BUF_SZ, NULL);
-			if (SUCCEEDED(hr))
-				dprintf(" = %s\n", name_buf);
-		}
-		if (i == 0)
-			dprintf(" None");
-		dprintf("\n");
-	}
-}
-
-/*
- * Parse user options and prepare execution context at function entry,
- * then call disassemble function
- * 	Limitation: false report is possible, especially when loop and jump instructions are involved.
- */
-bool decode_func(char* args)
-{
-	HRESULT hr;
-	unsigned int i;
-	ULONG64 intr;
-	DEBUG_STACK_FRAME  current_frame;
-	DEBUG_STACK_FRAME* framep;
-	DEBUG_STACK_FRAME frames[MAX_FRAMES];
-	ULONG total_frames = 0;
-	ULONG frame_lo, frame_hi;
-	bool multi_frame = false;
-	CONTEXT context;
-	int ptr_bit = g_ptr_bit;
-	int ptr_sz  = ptr_bit == 64 ? 8:4;
-
-	// Get selected frame
-	if (gDebugSymbols3->GetScope(&intr, &current_frame, &context, sizeof(context)) != S_OK)
-	{
-		dprintf("Failed to get current debug scope\n");
-		return false;
-	}
-	framep = &current_frame;
-
-	// clean registers' state
-	memset(g_regs, 0, sizeof(g_regs));
-
-	ULONG64 dis_start = 0;
-	ULONG64 dis_end   = 0;
-	// Parse user input options
-	if (args)
-	{
-		char* options[MAX_NUM_OPTIONS];
-		unsigned int num_options = parse_options(args, options);
-		for (i = 0; i < num_options; i++)
-		{
-			char* option = options[i];
-			if (strncmp(option, "from=", 5) == 0)
-			{
-				// disassemble from this address instead of function start
-				dis_start = GetExpression(option+5);
-			}
-			else if (strncmp(option, "to=", 3) == 0)
-			{
-				dis_end = GetExpression(option+3);
-			}
-			else if (strncmp(option, "frame=", 6) == 0)
-			{
-				// frame=n or frame=n-m
-				const char* subexp = option+6;
-				const char* hyphen = strchr(subexp, '-');
-				if (gDebugControl->GetStackTrace(0,	0, 0, frames, MAX_FRAMES, &total_frames) != S_OK )
-					return false;
-				// retrieve frame number
-				if (hyphen && hyphen > subexp)
-				{
-					const char* cursor = subexp;
-#define NUM_BUF_SZ 32
-					char numbuf[NUM_BUF_SZ];
-					int k;
-					for (k = 0; k < NUM_BUF_SZ - 1 && *cursor != '-'; k++)
-						numbuf[k] = *cursor++;
-					numbuf[k] = '\0';
-					frame_lo = atoi(numbuf);
-					frame_hi = atoi(hyphen + 1);
-					// check the frame number
-					if (frame_lo >= total_frames || frame_hi >= total_frames)
-					{
-						dprintf("Valid frame # for current thread is [0 - %d]\n", total_frames - 1);
-						return false;
-					}
-					else if (frame_lo > frame_hi)
-					{
-						dprintf("Invalid option %s (frame number %d is bigger than %d)\n",
-								option, frame_lo, frame_hi);
-						return false;
-					}
-				}
-				else
-				{
-					frame_lo = frame_hi = atoi(option+6);
-					if (frame_lo >= total_frames)
-					{
-						dprintf("Valid frame # for current thread is [0 - %d]\n", total_frames - 1);
-						return false;
-					}
-				}
-				framep = &frames[frame_hi];
-				multi_frame = true;
-			}
-			else if (strchr(option, '='))
-			{
-				// Take register entry value, such as rdi=0x12345678
-				if (!validate_and_set_reg_param(option))
-					dprintf ("Error: unsupported register: %s\n", option);
-			}
-			else
-				dprintf ("Unknown command argument: %s\n", option);
-		}
-	}
-
-	// if user chooses starting point other than function entry
-	// user input register values take effect when disassembling passes the chosen starting instruction
-	struct ca_reg_value user_input_regs[TOTAL_REGS];
-	if (dis_start)
-	{
-		memcpy(user_input_regs, g_regs, sizeof(g_regs));
-		memset(g_regs, 0, sizeof(g_regs));
-	}
-
-	struct disassemble_info di;
-	di.fprintf_func = fprintf_disasm;
-	di.stream = NULL;
-	di.disassembler_options = "intel"; //att_flavor;
-	di.read_memory_func  = dis_asm_read_memory;
-	di.memory_error_func = dis_asm_memory_error;
-	di.print_address_func = dis_print_address;
-
-	// disassemble one frame or multiple frames
-	do
-	{
-		intr = framep->InstructionOffset;
-		// Get function name
-		char funcname[NAME_BUF_SZ];
-		ULONG name_sz;
-		ULONG64 displacement = 0;
-		hr = gDebugSymbols3->GetNameByOffset(intr, funcname, NAME_BUF_SZ, &name_sz, &displacement);
-		if (FAILED(hr))
-		{
-			dprintf("Failed to get current function name\n");
-			return false;
-		}
-
-		// Get function's symbol entry
-		DEBUG_MODULE_AND_ID id;
-		ULONG64 displacement2;
-		ULONG num_entry;
-		DEBUG_SYMBOL_ENTRY sym_entry;
-		if (gDebugSymbols3->GetSymbolEntriesByOffset(intr - displacement, 0, &id, &displacement2, 1, &num_entry) != S_OK
-				|| gDebugSymbols3->GetSymbolEntryInformation(&id, &sym_entry) != S_OK)
-		{
-			dprintf("Failed to get the symbol entry of the current function\n");
-			return false;
-		}
-		ULONG64 func_start = sym_entry.Offset;
-		ULONG64 func_end   = func_start + sym_entry.Size;
-
-		bool dis_in_two_steps = false;
-		g_dis_silent = false;
-		// For single frame, or the 1st frame of multi-frame disassembling
-		// validate user-input start/end instruction addresses
-		if (!multi_frame || framep->FrameNumber == frame_hi)
-		{
-			if (dis_start && dis_end && dis_start > dis_end)
-			{
-				dprintf ("Error: input start address 0x%lx is larger than end address 0x%lx\n", dis_start, dis_end);
-				return false;
-			}
-			if (dis_start)
-			{
-				if (dis_start < func_start || dis_start > func_end)
-				{
-					dprintf ("Error: input start address 0x%lx is out of the function range\n", dis_start);
-					return false;
-				}
-				else if (dis_start == func_start)
-					dis_start = 0;
-				else
-				{
-					// If user chooses to disassemble from a spot inside the function, we still
-					// do the disassembling from the function start silently until the chosen spot
-					dis_in_two_steps = true;
-					g_dis_silent = true;
-				}
-			}
-			if (dis_end)
-			{
-				if (dis_end < func_start || dis_end > func_end)
-				{
-					dprintf ("Error: input end address 0x%lx is out of the function range\n", dis_end);
-					return false;
-				}
-			}
-			else
-				dis_end = intr;
-		}
-		else
-			dis_end = intr;
-
-		// rsp & rip
-		g_regs[RSP].value = framep->FrameOffset + ptr_sz;
-		g_regs[RSP].known = 1;
-		g_regs[RSP].saved_value = g_regs[RSP].value;
-		g_regs[RSP].saved = 1;
-
-		g_regs[RIP].value = func_start;
-		g_regs[RIP].known = 1;
-
-		if (multi_frame)
-			dprintf("\n------------------------------ Frame %d ------------------------------\n", framep->FrameNumber);
-
-		// parameters at function entry
-		get_function_parameters(framep);
-
-		// display the registers at function entry
-		unsigned int count;
-		if (!g_dis_silent)
-		{
-			dprintf("The following registers are assumed at the beginning: ");
-			count = 0;
-			for (i=0; i<TOTAL_REGS; i++)
-			{
-				if (g_regs[i].known)
-				{
-					if (count > 0)
-						dprintf(", ");
-					dprintf("%s=0x%I64x", g_reg_infos[i].name, g_regs[i].value);
-					count++;
-				}
-			}
-			if (count == 0)
-				dprintf("none");
-			dprintf("\n");
-		}
-
-		//dprintf("ip=%p fp=%p sp=%p return_ip=%p\n", intr, frame.FrameOffset, frame.StackOffset, frame.ReturnOffset);
-		//dprintf("params[4]={%p %p %p %p}\n", frame.Params[0], frame.Params[1], frame.Params[2], frame.Params[3]);
-		dprintf("Dump of assembler code for function %s:\n", funcname);
-		if (dis_in_two_steps)
-		{
-			// First disassemble silently the first part of the function from beginning
-			dump_insns (&di, func_start, dis_start, 0, intr);
-			// update register values with user inputs
-			for (i = 0; i < TOTAL_REGS; i++)
-			{
-				if (user_input_regs[i].known)
-				{
-					g_regs[i].known = 1;
-					g_regs[i].value = user_input_regs[i].value;
-				}
-			}
-			// Then continue disassembling from the user-chosen start point
-			dis_in_two_steps = false;
-			g_dis_silent = false;
-			dump_insns (&di, dis_start, dis_end, dis_start - func_start, intr);
-		}
-		else
-			dump_insns (&di, func_start, dis_end, 0, intr);
-		dprintf("End of assembler dump.\n");
-		// display registers at the call site if this is not the innermost function
-		if (framep->FrameNumber > 0 && dis_end == intr)
-		{
-			dprintf("\nThe following registers are known at the call: ");
-			count = 0;
-			for (i=0; i<TOTAL_REGS; i++)
-			{
-				if (g_regs[i].known)
-				{
-					if (count > 0)
-						dprintf(", ");
-					dprintf("%s=0x%I64x", g_reg_infos[i].name, g_regs[i].value);
-					count++;
-				}
-			}
-			if (count == 0)
-				dprintf("none");
-			dprintf("\n");
-		}
-
-		// next frame
-		if (multi_frame && framep->FrameNumber > frame_lo)
-			framep--;
-		else
-			break;
-	} while (1);
-
-	return true;
+	return rc;
 }

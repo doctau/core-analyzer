@@ -57,9 +57,14 @@ void* ca_set_find(struct CA_SET* iset, void* val)
 		return NULL;
 }
 
-void  ca_set_insert(struct CA_SET* iset, void* val)
+CA_BOOL ca_set_insert(struct CA_SET* iset, void* val)
 {
-	iset->m_set->insert (val);
+	std::pair<std::set<void*,CA_CompareFunctionType>::iterator,bool> ret;
+	ret = iset->m_set->insert (val);
+	if (ret.second == false)
+		return CA_FALSE;
+	else
+		return CA_TRUE;
 }
 
 void  ca_set_traverse_start(struct CA_SET* iset)
@@ -129,12 +134,18 @@ void  ca_list_push_back(struct CA_LIST* ilist, void* val)
 	ilist->m_list->push_back(val);
 }
 
-void ca_list_pop_front(struct CA_LIST* ilist)
+void* ca_list_pop_front(struct CA_LIST* ilist)
 {
-	ilist->m_list->pop_front();
+	if (!ilist->m_list->empty())
+	{
+		void* val = ilist->m_list->front();
+		ilist->m_list->pop_front();
+		return val;
+	}
+	return NULL;
 }
 
-struct CA_LIST* ca_list_new()
+struct CA_LIST* ca_list_new(void)
 {
 	return new CA_LIST;
 }
@@ -167,13 +178,83 @@ void* ca_list_find(struct CA_LIST* ilist, void* value)
 
 #else
 
-struct CA_LIST_NODE
+/*
+ * SET
+ */
+#ifdef CA_USE_SPLAY_TREE
+/*
+ * gdb uses splay tree
+ */
+struct CA_SET
 {
-	struct CA_LIST_NODE* next;
-	void* value;
+	splay_tree tree;
+	splay_tree_node _itr;
 };
 
-struct CA_SET
+struct CA_SET* ca_set_new(CA_CompareFunctionType comp)
+{
+	struct CA_SET* aset = (struct CA_SET*) malloc (sizeof(struct CA_SET));
+	aset->tree = splay_tree_new(comp, NULL, NULL);
+	return aset;
+}
+
+void ca_set_delete(struct CA_SET* iset)
+{
+	splay_tree_delete(iset->tree);
+	free(iset);
+}
+
+void  ca_set_clear(struct CA_SET* iset)
+{
+	splay_tree_node node = splay_tree_min (iset->tree);
+	while (node)
+	{
+		splay_tree_remove(iset->tree, node->key);
+		node = splay_tree_min (iset->tree);
+	}
+}
+
+void* ca_set_find(struct CA_SET* iset, void* key)
+{
+	splay_tree_node node = splay_tree_lookup (iset->tree, (splay_tree_key)key);
+	if (!node)
+		return NULL;
+	else
+		return (void*)node->value;
+}
+
+CA_BOOL ca_set_insert_key_and_val(struct CA_SET* iset, void* key, void* val)
+{
+	if (!splay_tree_lookup (iset->tree, (splay_tree_key)key))
+	{
+		splay_tree_insert (iset->tree, (splay_tree_key)key, (splay_tree_value) val);
+		return CA_TRUE;
+	}
+	else
+		return CA_FALSE;
+}
+
+void  ca_set_traverse_start(struct CA_SET* iset)
+{
+	iset->_itr = splay_tree_min (iset->tree);
+}
+
+void* ca_set_traverse_next(struct CA_SET* iset)
+{
+	if (iset->_itr)
+	{
+		void* result = (void*) iset->_itr->value;
+		iset->_itr = splay_tree_successor (iset->tree, iset->_itr->key);
+		return result;
+	}
+	return NULL;
+}
+
+#else
+/*
+ * A temporary implementation for C client
+ */
+/*struct CA_SET
 {
 	CA_CompareFunctionType compfunc;
 	size_t _size;
@@ -181,20 +262,6 @@ struct CA_SET
 	struct CA_LIST_NODE* _itr;
 };
 
-struct CA_LIST
-{
-	size_t _size;
-	struct CA_LIST_NODE* _head;
-	struct CA_LIST_NODE* _itr;
-};
-
-/*
- * FIXME A temporary implementation for C client, i.e. gdb
- */
-
-/*
- * SET
- */
 struct CA_SET* ca_set_new(CA_CompareFunctionType comp)
 {
 	struct CA_SET* aset = (struct CA_SET*) malloc (sizeof(struct CA_SET));
@@ -237,7 +304,7 @@ void* ca_set_find(struct CA_SET* iset, void* val)
 	return NULL;
 }
 
-void  ca_set_insert(struct CA_SET* iset, void* val)
+CA_BOOL ca_set_insert(struct CA_SET* iset, void* val)
 {
 	if (!ca_set_find(iset, val))
 	{
@@ -246,7 +313,10 @@ void  ca_set_insert(struct CA_SET* iset, void* val)
 		node->next = iset->_head;
 		iset->_head = node;
 		iset->_size++;
+		return CA_TRUE;
 	}
+	else
+		return CA_FALSE;
 }
 
 void  ca_set_traverse_start(struct CA_SET* iset)
@@ -264,10 +334,25 @@ void* ca_set_traverse_next(struct CA_SET* iset)
 	}
 	return NULL;
 }
+*/
+#endif
 
 /*
  * LIST
  */
+struct CA_LIST_NODE
+{
+	struct CA_LIST_NODE* next;
+	void* value;
+};
+
+struct CA_LIST
+{
+	size_t _size;
+	struct CA_LIST_NODE* _head;
+	struct CA_LIST_NODE* _itr;
+};
+
 void  ca_list_traverse_start(struct CA_LIST* ilist)
 {
 	ilist->_itr = ilist->_head;
@@ -338,16 +423,21 @@ void  ca_list_push_back(struct CA_LIST* ilist, void* val)
 	ilist->_size++;
 }
 
-void ca_list_pop_front(struct CA_LIST* ilist)
+void* ca_list_pop_front(struct CA_LIST* ilist)
 {
 	if (ilist->_head)
 	{
+		struct CA_LIST_NODE* node = ilist->_head;
+		void* val = node->value;
 		ilist->_head = ilist->_head->next;
 		ilist->_size--;
+		free (node);
+		return val;
 	}
+	return NULL;
 }
 
-struct CA_LIST* ca_list_new()
+struct CA_LIST* ca_list_new(void)
 {
 	struct CA_LIST* alist = (struct CA_LIST*) malloc (sizeof(struct CA_LIST));
 	alist->_size = 0;

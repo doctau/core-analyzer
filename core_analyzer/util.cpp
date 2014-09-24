@@ -35,6 +35,9 @@
 
 #include "cmd_impl.h"
 #include "util.h"
+#include "stl_container.h"
+#include "heap.h"
+#include "search.h"
 
 const int min_chars = MIN_CHARS_OF_STRING;
 
@@ -499,4 +502,40 @@ CA_BOOL known_global_sym(const struct object_reference* ref, address_t* sym_addr
 CA_BOOL known_stack_sym(const struct object_reference* ref, address_t* sym_addr, size_t* sym_sz)
 {
 	return CA_FALSE;
+}
+
+#define DEFAULT_WIDTH 40
+static unsigned long pb_total;
+static int screen_width;
+static int pb_cur_pos;
+void init_progress_bar(unsigned long total)
+{
+	pb_total = total;
+	screen_width = DEFAULT_WIDTH;
+	pb_cur_pos = 0;
+}
+
+void set_current_progress(unsigned long val)
+{
+	int pos = val * screen_width / pb_total;
+	while (pos > pb_cur_pos)
+	{
+		CA_PRINT(".");
+		pb_cur_pos++;
+	}
+	fflush (stdout);
+}
+
+void end_progress_bar(void)
+{
+	CA_PRINT("\n");
+}
+
+address_t ca_eval_address(const char* expr)
+{
+	return atol(expr);
+}
+
+void calc_heap_usage(char *exp)
+{
 }
