@@ -63,6 +63,8 @@ union ca_malloc_chunk
 	(ptr_bit==64?prev_inuse((mchunkptr)p):prev_inuse((mchunkptr_32)p))
 #define ca_chunk_fd(ptr_bit,p) \
 	(ptr_bit==64?(address_t)((mchunkptr)p)->fd:(address_t)((mchunkptr_32)p)->fd)
+#define ca_chunk_bk(ptr_bit,p) \
+	(ptr_bit==64?(address_t)((mchunkptr)p)->bk:(address_t)((mchunkptr_32)p)->bk)
 
 struct heap_info {
   char* ar_ptr;				/* Arena for this heap. */
@@ -297,7 +299,21 @@ CA_BOOL heap_walk(address_t heapaddr, CA_BOOL verbose)
 	{
 		heap = search_sorted_heaps(heapaddr);
 		if (heap)
+		{
+			struct ca_arena* arena = heap->mArena;
+			address_t heap_begin = heap->mStartAddr - size_t_sz;
+			address_t heap_end   = heap->mEndAddr;
+			if (arena->mType == ENUM_HEAP_MAIN)
+				CA_PRINT("\tMain arena");
+			else if (arena->mType == ENUM_HEAP_DYNAMIC)
+				CA_PRINT("\tDynamic arena");
+			else if (arena->mType == ENUM_HEAP_MMAP_BLOCK)
+				CA_PRINT("\tmmap block");
+			if (arena->mArenaAddr)
+				CA_PRINT(" ("PRINT_FORMAT_POINTER"): ["PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"]\n",
+					arena->mArenaAddr, heap_begin, heap_end);
 			return traverse_heap_blocks(heap, CA_TRUE, NULL, NULL, NULL, NULL);
+		}
 		else
 		{
 			CA_PRINT("Failed to find heap region that contains address "PRINT_FORMAT_POINTER"\n", heapaddr);
@@ -1663,6 +1679,176 @@ static CA_BOOL fill_heap_block(struct ca_heap* heap, address_t addr, struct heap
 }
 
 /*
+ * Bin and Fastbin are places to hold size-indexed link list of free memory blocks
+ * Return false if the link list is damaged, a common consequence of memory corruption
+ *
+ * Implemented by Dave George
+ */
+static CA_BOOL check_bin_and_fastbin(struct ca_arena* arena)
+{
+	CA_BOOL rc = CA_TRUE;
+	unsigned int ptr_bit = g_ptr_bit;
+	address_t amask = ptr_bit == 64 ? 7 : 3;
+
+	// check fastbins
+	int bi;
+	int fbi;
+	size_t mchunk_sz = ptr_bit == 64 ? sizeof(struct malloc_chunk) : sizeof(struct malloc_chunk_32);
+	CA_BOOL error_found;
+
+	if (arena->mType == ENUM_HEAP_MMAP_BLOCK)
+		return CA_TRUE;
+
+	for (fbi = 0; fbi < arena->mpState.nfastbins; fbi++)
+	{
+		error_found = CA_FALSE;
+		address_t chunk_vaddr = (address_t)arena->mpState.fastbins[fbi];
+		address_t chunk_prev_vaddr = 0;
+		while (chunk_vaddr)
+		{
+			union ca_malloc_chunk fast_chunk;
+			if (chunk_vaddr & amask)
+			{
+				CA_PRINT("\nError: chunk at "PRINT_FORMAT_POINTER" in fastbin[%d] is misaligned\n",
+						chunk_vaddr, fbi); /*T*/
+				error_found = CA_TRUE;
+			}
+			else if (!read_memory_wrapper(NULL, chunk_vaddr, &fast_chunk, mchunk_sz))
+			{
+				CA_PRINT("\nFailed to get the chunk at "PRINT_FORMAT_POINTER" in fastbin[%d]\n",
+						chunk_vaddr, fbi); /*T*/
+				error_found = CA_TRUE;
+			}
+			if (error_found)
+			{
+				if (chunk_prev_vaddr)
+				{
+					if (read_memory_wrapper(NULL, chunk_prev_vaddr, &fast_chunk, mchunk_sz))
+						CA_PRINT("\tChunk address comes from previous fastbin chunk at "PRINT_FORMAT_POINTER" with fd="PRINT_FORMAT_POINTER"\n",
+								chunk_prev_vaddr, ca_chunk_fd(ptr_bit, &fast_chunk));
+				}
+				else
+					CA_PRINT("\tChunk address is the first chunk of this fastbin\n");
+				rc = CA_FALSE;
+				break;
+			}
+			//if (bDebug)
+			//{
+			//	CA_PRINT("Fastbin[%d] Chunk at "PRINT_FORMAT_POINTER", its size tag is "PRINT_FORMAT_POINTER", fd="PRINT_FORMAT_POINTER"\n",
+			//			fbi, chunk_vaddr, ptr_bit==64 ? fast_chunk.chunk.size : fast_chunk.chunk_32.size, ca_chunk_fd(ptr_bit, &fast_chunk));
+			//}
+			chunk_prev_vaddr = chunk_vaddr;
+			chunk_vaddr = ca_chunk_fd(ptr_bit, &fast_chunk);
+		}
+	}
+
+	// check bins
+	for (bi = 1; bi < NBINS; bi++)
+	{
+		address_t chunk_vaddr = (address_t)arena->mpState.bins[bi];
+		address_t chunk_next_vaddr = (address_t)arena->mpState.bins[bi+1];
+		union ca_malloc_chunk chunk;
+		union ca_malloc_chunk chunk_first;
+
+		error_found = CA_FALSE;
+		//if (bDebug)
+		//{
+		//	if (bi < 2)
+		//	{
+		//		CA_PRINT("Bin[%d]="PRINT_FORMAT_POINTER"\n", bi, chunk_vaddr);
+		//	}
+		//}
+		if (bi >= 2)
+		{
+			// List is empty
+			if (chunk_vaddr == chunk_next_vaddr)
+			{
+				bi++;
+				continue;
+			}
+			//if (bDebug)
+			//{
+			//	CA_PRINT("Bin[%d]="PRINT_FORMAT_POINTER", Bin[%d]="PRINT_FORMAT_POINTER"\n", bi, chunk_vaddr, bi+1, chunk_next_vaddr);
+			//}
+		}
+		if (!read_memory_wrapper(NULL, chunk_vaddr, &chunk_first, mchunk_sz))
+		{
+			CA_PRINT("Failed to get the first chunk at "PRINT_FORMAT_POINTER" in bin[%d]\n",
+					chunk_vaddr, bi); /*T*/
+			rc = CA_FALSE;
+		}
+		else
+		{
+			address_t chunk_first_vaddr = chunk_vaddr;
+			address_t chunk_prev_vaddr = 0;
+			while (chunk_vaddr)
+			{
+				//if (bDebug)
+				//{
+				//	CA_PRINT("Bin[%d] Chunk at "PRINT_FORMAT_POINTER", its size tag is "PRINT_FORMAT_POINTER", fd="PRINT_FORMAT_POINTER", bk="PRINT_FORMAT_POINTER"\n",
+				//			bi, chunk_vaddr, ptr_bit==64 ? chunk.chunk.size : chunk.chunk_32.size, ca_chunk_fd(ptr_bit, &chunk), ca_chunk_bk(ptr_bit, &chunk));
+				//}
+				if (chunk_vaddr & amask)
+				{
+					CA_PRINT("\nError: chunk at "PRINT_FORMAT_POINTER" in bin[%d] is misaligned\n",
+							chunk_vaddr, bi); /*T*/
+					error_found = CA_TRUE;
+				}
+				else if (!read_memory_wrapper(NULL, chunk_vaddr, &chunk, mchunk_sz))
+				{
+					CA_PRINT("\nFailed to get the chunk at "PRINT_FORMAT_POINTER" in bin[%d]\n",
+							chunk_vaddr, bi); /*T*/
+					error_found = CA_TRUE;
+				}
+				else if (chunk_prev_vaddr && ca_chunk_bk(ptr_bit, &chunk) != chunk_prev_vaddr)
+				{
+					CA_PRINT("\nError: chunk at "PRINT_FORMAT_POINTER" witch bk="PRINT_FORMAT_POINTER" that does not point to previous chunk\n",
+							chunk_vaddr, ca_chunk_bk(ptr_bit, &chunk));
+					error_found = CA_TRUE;
+				}
+				else if (ca_chunk_fd(ptr_bit, &chunk) == chunk_first_vaddr)
+				{
+					if (ca_chunk_bk(ptr_bit, &chunk_first) != chunk_vaddr)
+					{
+						CA_PRINT("\nError: bk="PRINT_FORMAT_POINTER" of first chunk does not point to last chunk="PRINT_FORMAT_POINTER"\n",
+								ca_chunk_bk(ptr_bit, &chunk_first), chunk_vaddr);
+						error_found = CA_TRUE;
+					}
+					if (ca_chunk_fd(ptr_bit, &chunk) != chunk_first_vaddr)
+					{
+						CA_PRINT("\nError: fd="PRINT_FORMAT_POINTER" of last chunk does not point to first chunk="PRINT_FORMAT_POINTER"\n",
+								ca_chunk_fd(ptr_bit, &chunk), chunk_first_vaddr);
+						error_found = CA_TRUE;
+					}
+				}
+				if (error_found)
+				{
+					if (chunk_prev_vaddr)
+					{
+						if (read_memory_wrapper(NULL, chunk_prev_vaddr, &chunk, mchunk_sz))
+							CA_PRINT("\tChunk address comes from previous bin[%d] chunk at "PRINT_FORMAT_POINTER" with {fd="PRINT_FORMAT_POINTER", bk="PRINT_FORMAT_POINTER"}\n",
+									bi, chunk_prev_vaddr, ca_chunk_fd(ptr_bit, &chunk), ca_chunk_bk(ptr_bit, &chunk));
+					}
+					else
+						CA_PRINT("\tChunk address is the first chunk of the bin[%d]\n", bi);
+					rc = CA_FALSE;
+					break;
+				}
+				chunk_prev_vaddr = chunk_vaddr;
+				chunk_vaddr = ca_chunk_fd(ptr_bit, &chunk);
+				if (chunk_vaddr == chunk_first_vaddr)
+				{
+					chunk_vaddr = 0;
+				}
+			}
+		}
+		if (bi > 1)
+			bi++;
+	}
+	return rc;
+}
+
+/*
  * Display all blocks in a heap
  */
 static CA_BOOL traverse_heap_blocks(struct ca_heap* heap,
@@ -1683,19 +1869,6 @@ static CA_BOOL traverse_heap_blocks(struct ca_heap* heap,
 	address_t heap_begin = heap->mStartAddr - size_t_sz;
 	address_t heap_end   = heap->mEndAddr;
 	struct ca_arena* arena = heap->mArena;
-
-	if (bDisplayBlocks)
-	{
-		if (arena->mType == ENUM_HEAP_MAIN)
-			CA_PRINT("\tMain arena");
-		else if (arena->mType == ENUM_HEAP_DYNAMIC)
-			CA_PRINT("\tDynamic arena");
-		else if (arena->mType == ENUM_HEAP_MMAP_BLOCK)
-			CA_PRINT("\tmmap block");
-		if (arena->mArenaAddr)
-			CA_PRINT(" ("PRINT_FORMAT_POINTER"): ["PRINT_FORMAT_POINTER" - "PRINT_FORMAT_POINTER"]\n",
-				arena->mArenaAddr, heap_begin, heap_end);
-	}
 
 	// Arena walk starting with the first chunk
 	cursor = heap_begin;
@@ -1793,6 +1966,10 @@ static CA_BOOL traverse_heap_blocks(struct ca_heap* heap,
 		else
 			cursor += chunksz;
 	} // arena walk loop
+
+	// check free block link list in fastbins and bins
+	if (!check_bin_and_fastbin(arena))
+		return CA_FALSE;
 
 	if (bDisplayBlocks)
 	{
