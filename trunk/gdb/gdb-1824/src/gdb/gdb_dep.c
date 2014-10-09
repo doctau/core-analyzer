@@ -1126,7 +1126,7 @@ static struct minimal_symbol* get_global_minimal_sym(const struct object_referen
 	if (msymbol)
 	{
 		struct obj_section *verify_sect = find_pc_sect_in_ordered_sections (SYMBOL_VALUE_ADDRESS (msymbol), NULL);
-		if (ref->vaddr >= verify_sect->addr && ref->vaddr < verify_sect->endaddr)
+		if (verify_sect && ref->vaddr >= verify_sect->addr && ref->vaddr < verify_sect->endaddr)
 		{
 			if (sym_addr && sym_sz)
 			{
@@ -2582,19 +2582,33 @@ void calc_heap_usage(char *exp)
 				{
 					unsigned long aggr_count = 0;
 					size_t aggr_size = 0;
-					if (calc_aggregate_size(&ref, var_len, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count))
+
+					CA_PRINT("Heap memory consumed by ");
+					print_ref(&ref, 0, CA_FALSE, CA_FALSE);
+					// Include all reachable blocks
+					if (calc_aggregate_size(&ref, var_len, CA_TRUE, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count))
 					{
-						print_ref(&ref, 0, CA_FALSE, CA_FALSE);
+						CA_PRINT("All reachable:\n");
 						CA_PRINT("    |--> ");
 						print_size(aggr_size);
 						CA_PRINT(" (%ld blocks)\n", aggr_count);
 					}
 					else
 						CA_PRINT("Failed to calculate heap usage\n");
+					// Directly referenced heap blocks only
+					if (calc_aggregate_size(&ref, var_len, CA_FALSE, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count))
+					{
+						CA_PRINT("Directly referenced:\n");
+						CA_PRINT("    |--> ");
+						print_size(aggr_size);
+						CA_PRINT(" (%ld blocks)\n", aggr_count);
+					}
 					// remember to cleanup
 					free_inuse_heap_blocks (inuse_blocks, num_inuse_blocks);
 				}
 			}
+			else
+				printf_filtered("Input expression doesn't reference any heap memory\n");
 		}
 		else
 			printf_filtered("Input expression doesn't reference any heap memory(type_len=%ld)\n", var_len);

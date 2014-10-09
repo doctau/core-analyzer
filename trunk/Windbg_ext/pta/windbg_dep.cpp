@@ -2170,17 +2170,31 @@ void calc_heap_usage(char *expr)
 		{
 			unsigned long aggr_count = 0;
 			size_t aggr_size = 0;
-			if (calc_aggregate_size(&ref, var_len, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count))
+
+			CA_PRINT("Heap memory consumed by ");
+			print_ref(&ref, 0, CA_FALSE, CA_FALSE);
+			// Include all reachable blocks
+			if (calc_aggregate_size(&ref, var_len, CA_TRUE, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count))
 			{
-				print_ref(&ref, 0, CA_FALSE, CA_FALSE);
+				CA_PRINT("All reachable:\n");
 				CA_PRINT("    |--> ");
 				print_size(aggr_size);
 				CA_PRINT(" (%ld blocks)\n", aggr_count);
 			}
 			else
 				CA_PRINT("Failed to calculate heap usage\n");
+			// Directly referenced heap blocks only
+			if (calc_aggregate_size(&ref, var_len, CA_FALSE, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count))
+			{
+				CA_PRINT("Directly referenced:\n");
+				CA_PRINT("    |--> ");
+				print_size(aggr_size);
+				CA_PRINT(" (%ld blocks)\n", aggr_count);
+			}
 			// remember to cleanup
 			free_inuse_heap_blocks (inuse_blocks, num_inuse_blocks);
 		}
 	}
+	else
+		CA_PRINT("Input expression doesn't reference any heap memory\n");
 }
