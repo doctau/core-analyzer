@@ -59,11 +59,12 @@ extern struct inuse_block* find_inuse_block(address_t, struct inuse_block*, unsi
 extern CA_BOOL display_heap_leak_candidates(void);
 
 extern CA_BOOL biggest_blocks(unsigned int num);
-extern CA_BOOL biggest_heap_owners_generic(unsigned int num);
+extern CA_BOOL biggest_heap_owners_generic(unsigned int num, CA_BOOL all_reachable_blocks);
 
 extern CA_BOOL
 calc_aggregate_size(const struct object_reference *ref,
 					size_t var_len,
+					CA_BOOL all_reachable_blocks,
 					struct inuse_block *inuse_blocks,
 					unsigned long num_inuse_blocks,
 					size_t *aggr_size,

@@ -18,6 +18,8 @@ struct heap_owner
 	unsigned long aggr_count;
 };
 
+#define LINE_BUF_SZ 1024
+
 // Forward declaration
 static CA_BOOL
 mark_blocks_referenced_by_globals_locals(struct inuse_block*, unsigned long, unsigned int*);
@@ -101,6 +103,7 @@ CA_BOOL heap_command_impl(char* args)
 	CA_BOOL cluster_blocks = CA_FALSE;
 	CA_BOOL top_block = CA_FALSE;
 	CA_BOOL top_user = CA_FALSE;
+	CA_BOOL all_reachable_blocks = CA_FALSE;	// experimental option
 	char* expr = NULL;
 
 	// Parse user input options
@@ -173,6 +176,8 @@ CA_BOOL heap_command_impl(char* args)
 						return CA_FALSE;
 					}
 				}
+				else if (strcmp(option, "/all") == 0 || strcmp(option, "/a") == 0)
+					all_reachable_blocks = CA_TRUE;
 				else
 				{
 					CA_PRINT("Invalid option: [%s]\n", option);
@@ -244,7 +249,7 @@ CA_BOOL heap_command_impl(char* args)
 		if (n == 0)
 			CA_PRINT("A number is expected\n");
 		else if (top_user)
-			biggest_heap_owners_generic(n);
+			biggest_heap_owners_generic(n, all_reachable_blocks);
 		else
 			biggest_blocks(n);
 	}
@@ -640,13 +645,13 @@ static inline unsigned int is_queued(unsigned int* bitmap, unsigned long index)
 #define is_visited(bitmap,index)   (bitmap[(index) >> 4] & (VISITED << (((index) & 0xf) << 1)))
 #define set_queued_and_visited(bitmap,index)   bitmap[(index) >> 4] |= ((QUEUED | VISITED) << (((index) & 0xf) << 1))
 
+static const size_t GB = 1024*1024*1024;
+static const size_t MB = 1024*1024;
+static const size_t KB = 1024;
+
 // A utility function
 void print_size(size_t sz)
 {
-	const size_t GB = 1024*1024*1024;
-	const size_t MB = 1024*1024;
-	const size_t KB = 1024;
-
 	if (sz > GB)
 		CA_PRINT("%.1fGB", (double)sz/(double)GB);
 	else if (sz > MB)
@@ -655,6 +660,18 @@ void print_size(size_t sz)
 		CA_PRINT(PRINT_FORMAT_SIZE"KB", sz/KB);
 	else
 		CA_PRINT(PRINT_FORMAT_SIZE, sz);
+}
+
+static void fprint_size(char* buf, size_t sz)
+{
+	if (sz > GB)
+		sprintf(buf, "%.1fGB", (double)sz/(double)GB);
+	else if (sz > MB)
+		sprintf(buf, PRINT_FORMAT_SIZE"MB", sz/MB);
+	else if (sz > KB)
+		sprintf(buf, PRINT_FORMAT_SIZE"KB", sz/KB);
+	else
+		sprintf(buf, PRINT_FORMAT_SIZE, sz);
 }
 
 // Find the top n memory blocks in term of size
@@ -700,7 +717,7 @@ CA_BOOL biggest_blocks(unsigned int num)
 /*
  * Find/display global/local variables which own the most heap memory in bytes
  */
-CA_BOOL biggest_heap_owners_generic(unsigned int num)
+CA_BOOL biggest_heap_owners_generic(unsigned int num, CA_BOOL all_reachable_blocks)
 {
 	CA_BOOL rc = CA_FALSE;
 	unsigned int i;
@@ -716,6 +733,13 @@ CA_BOOL biggest_heap_owners_generic(unsigned int num)
 
 	struct inuse_block *inuse_blocks = NULL;
 	unsigned long num_inuse_blocks;
+	unsigned long inuse_index;
+
+	struct inuse_block *blk;
+	struct object_reference ref;
+	size_t aggr_size;
+	unsigned long aggr_count;
+	address_t start, end, cursor;
 
 	// Allocate an array for the biggest num of owners
 	if (num == 0)
@@ -756,13 +780,7 @@ CA_BOOL biggest_heap_owners_generic(unsigned int num)
 		segment = &g_segments[i];
 		if (segment->m_type == ENUM_STACK || segment->m_type == ENUM_MODULE_DATA)
 		{
-			size_t aggr_size;
-			unsigned long aggr_count;
-			address_t start, end, cursor;
 			int tid;
-			struct inuse_block *blk;
-			struct object_reference ref;
-
 			// check registers if it is a thread's stack segment
 			if (segment->m_type == ENUM_STACK)
 			{
@@ -792,7 +810,7 @@ CA_BOOL biggest_heap_owners_generic(unsigned int num)
 								ref.where.reg.tid = tid;
 								ref.where.reg.reg_num = k;
 								ref.where.reg.name = NULL;
-								calc_aggregate_size(&ref, ptr_sz, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count);
+								calc_aggregate_size(&ref, ptr_sz, all_reachable_blocks, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count);
 								if (aggr_size > smallest->aggr_size)
 								{
 									struct heap_owner newowner;
@@ -838,7 +856,7 @@ CA_BOOL biggest_heap_owners_generic(unsigned int num)
 				// If the address belongs to a known variable, include all its subfields
 				// FIXME
 				// consider subfields that are of pointer-like types, however, it will miss
-				// references in a buffer
+				// references in an unstructured buffer
 				ref.storage_type = segment->m_type;
 				ref.vaddr = cursor;
 				if (segment->m_type == ENUM_STACK)
@@ -866,7 +884,7 @@ CA_BOOL biggest_heap_owners_generic(unsigned int num)
 				// Query heap for aggregated memory size/count originated from the candidate variable
 				if (val_len >= ptr_sz)
 				{
-					calc_aggregate_size(&ref, val_len, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count);
+					calc_aggregate_size(&ref, val_len, all_reachable_blocks, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count);
 					// update the top list if applies
 					if (aggr_size >= smallest->aggr_size)
 					{
@@ -888,6 +906,32 @@ CA_BOOL biggest_heap_owners_generic(unsigned int num)
 		}
 	}
 	end_progress_bar();
+
+	if (!all_reachable_blocks)
+	{
+		// Big memory blocks may be referenced indirectly by local/global variables
+		// check all in-use blocks
+		for (inuse_index = 0; inuse_index < num_inuse_blocks; inuse_index++)
+		{
+			blk = &inuse_blocks[inuse_index];
+			ref.storage_type = ENUM_HEAP;
+			ref.vaddr = blk->addr;
+			ref.where.heap.addr = blk->addr;
+			ref.where.heap.size = blk->size;
+			ref.where.heap.inuse = 1;
+			calc_aggregate_size(&ref, ptr_sz, CA_FALSE, inuse_blocks, num_inuse_blocks, &aggr_size, &aggr_count);
+			// update the top list if applies
+			if (aggr_size >= smallest->aggr_size)
+			{
+				struct heap_owner newowner;
+				ref.value = 0;
+				newowner.ref = ref;
+				newowner.aggr_size = aggr_size;
+				newowner.aggr_count = aggr_count;
+				add_owner(owners, num, &newowner);
+			}
+		}
+	}
 
 	// Print the result
 	for (i = 0; i < num; i++)
@@ -923,6 +967,7 @@ clean_out:
 CA_BOOL
 calc_aggregate_size(const struct object_reference *ref,
 					size_t var_len,
+					CA_BOOL all_reachable_blocks,
 					struct inuse_block *inuse_blocks,
 					unsigned long num_inuse_blocks,
 					size_t *total_size,
@@ -933,6 +978,7 @@ calc_aggregate_size(const struct object_reference *ref,
 	size_t aggr_size = 0;
 	unsigned long aggr_count = 0;
 	struct inuse_block *blk;
+	size_t bitmap_sz = ((num_inuse_blocks+15)*2/32) * sizeof(unsigned int);
 
 	static unsigned int* qv_bitmap = NULL;	// Bit flags of whether a block is queued/visited
 	static unsigned long bitmap_capacity = 0;	// in terms of number of blocks handled
@@ -947,15 +993,16 @@ calc_aggregate_size(const struct object_reference *ref,
 		if (qv_bitmap)
 			free (qv_bitmap);
 		// Each block uses two bits(queued/visited)
-		qv_bitmap = (unsigned int*) calloc((num_inuse_blocks+15)*2/32, sizeof(unsigned int));
+		qv_bitmap = (unsigned int*) malloc(bitmap_sz);
 		if (!qv_bitmap)
 		{
+			bitmap_capacity = 0;
 			CA_PRINT("Out of Memory\n");
 			return CA_FALSE;
 		}
+		bitmap_capacity = num_inuse_blocks;
 	}
-	else
-		memset(qv_bitmap, 0, ((num_inuse_blocks+15)*2/32) * sizeof(unsigned int));
+	memset(qv_bitmap, 0, bitmap_sz);
 
 	// Input is a pointer to an in-use memory block
 	if (ref->storage_type == ENUM_REGISTER || ref->storage_type == ENUM_HEAP)
@@ -966,7 +1013,7 @@ calc_aggregate_size(const struct object_reference *ref,
 		if (blk)
 		{
 			// cached result is available, return now
-			if (blk->reachable.aggr_size)
+			if (all_reachable_blocks && blk->reachable.aggr_size)
 			{
 				*total_size  = blk->reachable.aggr_size;
 				*total_count = blk->reachable.aggr_count;
@@ -988,7 +1035,7 @@ calc_aggregate_size(const struct object_reference *ref,
 	// input reference is an object with given size, e.g. a local/global variable
 	else
 	{
-		if (var_len == ptr_sz)
+		if (all_reachable_blocks && var_len == ptr_sz)
 		{
 			// input is of pointer size, which is candidate for cache value
 			if(read_memory_wrapper(NULL, ref->vaddr, (void*)&addr, ptr_sz))
@@ -1020,17 +1067,26 @@ calc_aggregate_size(const struct object_reference *ref,
 		if(!read_memory_wrapper(NULL, cursor, (void*)&addr, ptr_sz))
 			break;
 		blk = find_inuse_block(addr, inuse_blocks, num_inuse_blocks);
-		if (blk)
+		if (blk && !is_queued_or_visited(qv_bitmap, blk - inuse_blocks))
 		{
-			unsigned long sub_count = 0;
-			aggr_size += heap_aggregate_size(blk, inuse_blocks, num_inuse_blocks, qv_bitmap, &sub_count);
-			aggr_count += sub_count;
+			if (all_reachable_blocks)
+			{
+				unsigned long sub_count = 0;
+				aggr_size += heap_aggregate_size(blk, inuse_blocks, num_inuse_blocks, qv_bitmap, &sub_count);
+				aggr_count += sub_count;
+			}
+			else
+			{
+				aggr_size += blk->size;
+				aggr_count++;
+				set_visited(qv_bitmap, blk - inuse_blocks);
+			}
 		}
 		cursor += ptr_sz;
 	}
 
 	// can we cache the result?
-	if (aggr_size)
+	if (all_reachable_blocks && aggr_size)
 	{
 		if (ref->storage_type == ENUM_REGISTER || ref->storage_type == ENUM_HEAP)
 		{
@@ -1253,6 +1309,22 @@ void add_block_mem_histogram(size_t size, CA_BOOL inuse, unsigned int num_block)
 	}
 }
 
+static void fill_space_til_pos(char* buf, size_t to_pos)
+{
+	size_t len = strlen(buf);
+	if (len < to_pos - 1)
+	{
+		while (len < to_pos - 1)
+			buf[len++] = ' ';
+		buf[len] = '\0';
+	}
+	else
+	{
+		buf[len] = ' ';
+		buf[len+1] = '\0';
+	}
+}
+
 /*
  * Helper functions
  */
@@ -1265,8 +1337,21 @@ static void display_histogram(const char* prefix,
 	unsigned int n;
 	unsigned long total_cnt, total_cnt2;
 	size_t total_bytes;
+	char linebuf[LINE_BUF_SZ];
+	int pos = 0;
+	const int second_col_pos = 16;
+	const int third_col_pos = 28;
 
-	CA_PRINT("%sSize-Range    Count    Total-Bytes\n", prefix);
+	// title
+	sprintf(linebuf, "%sSize-Range", prefix);
+	fill_space_til_pos(linebuf, strlen(prefix)+second_col_pos);
+	pos = strlen(linebuf);
+	sprintf(linebuf + pos, "Count");
+	fill_space_til_pos(linebuf, strlen(prefix)+third_col_pos);
+	pos = strlen(linebuf);
+	sprintf(linebuf + pos, "Total-Bytes");
+	CA_PRINT("%s\n", linebuf);
+
 	total_cnt = 0;
 	total_bytes = 0;
 	for (n = 0; n <= nbuckets; n++)
@@ -1280,34 +1365,61 @@ static void display_histogram(const char* prefix,
 	{
 		if (block_cnt[n] > 0)
 		{
-			CA_PRINT("%s", prefix);
+			sprintf(linebuf, "%s", prefix);
+			pos = strlen(linebuf);
+
 			// bucket size range
 			if (n == 0)
 			{
-				CA_PRINT("0 - ");
-				print_size(bucket_sizes[n]);
+				strcat(linebuf, "0 - ");
+				pos = strlen(linebuf);
+				fprint_size(linebuf + pos, bucket_sizes[n]);
+				pos = strlen(linebuf);
 			}
 			else if (n == nbuckets)
 			{
-				print_size(bucket_sizes[n-1]);
-				CA_PRINT(" -    ");
+				fprint_size(linebuf + pos, bucket_sizes[n-1]);
+				pos = strlen(linebuf);
+				strcat(linebuf, " -    ");
+				pos = strlen(linebuf);
 			}
 			else
 			{
-				print_size(bucket_sizes[n-1]);
-				CA_PRINT(" - ");
-				print_size(bucket_sizes[n]);
+				fprint_size(linebuf + pos, bucket_sizes[n-1]);
+				pos = strlen(linebuf);
+				strcat(linebuf, " - ");
+				pos = strlen(linebuf);
+				fprint_size(linebuf + pos, bucket_sizes[n]);
+				pos = strlen(linebuf);
 			}
+			fill_space_til_pos(linebuf, strlen(prefix)+second_col_pos);
+			pos = strlen(linebuf);
 
-			// count and total bytes and percentage
-			CA_PRINT("    %ld(%ld%%)    ",
+			// count
+			sprintf(linebuf + pos, "%ld(%ld%%)",
 					block_cnt[n], block_cnt[n] * 100 / total_cnt);
-			print_size(block_bytes[n]);
-			CA_PRINT("(%ld%%)\n", block_bytes[n] * 100 / total_bytes);
+			fill_space_til_pos(linebuf, strlen(prefix)+third_col_pos);
+			pos = strlen(linebuf);
+
+			// total bytes
+			fprint_size(linebuf + pos, block_bytes[n]);
+			pos = strlen(linebuf);
+			sprintf(linebuf + pos, "(%ld%%)", block_bytes[n] * 100 / total_bytes);
+
+			// output
+			CA_PRINT("%s\n", linebuf);
 
 			total_cnt2 += block_cnt[n];
 		}
 	}
+	sprintf(linebuf, "%sTotal", prefix);
+	fill_space_til_pos(linebuf, strlen(prefix)+second_col_pos);
+	pos = strlen(linebuf);
+	sprintf(linebuf + pos, "%ld", total_cnt);
+	fill_space_til_pos(linebuf, strlen(prefix)+third_col_pos);
+	pos = strlen(linebuf);
+	fprint_size(linebuf + pos, total_bytes);
+	CA_PRINT("%s\n", linebuf);
 }
 
 // Binary search if addr belongs to one of the blocks

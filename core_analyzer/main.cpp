@@ -246,7 +246,7 @@ int main(int argc, char** argv)
 		else if (opt == 9)
 		{
 			unsigned int num = AskParam("Number of top users(variables) of heap memory", NULL, CA_TRUE);
-			if (!biggest_heap_owners_generic(num))
+			if (!biggest_heap_owners_generic(num, CA_FALSE))
 			{
 				//break;
 			}
