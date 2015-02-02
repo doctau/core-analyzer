@@ -256,7 +256,7 @@ obj(PDEBUG_CLIENT4 Client, PCSTR args)
 		return E_FAIL;
 	}
 
-	search_cplusplus_objects_with_vptr (args);
+	search_cplusplus_objects_and_references (args);
 
 	leave_command();
     return S_OK;
